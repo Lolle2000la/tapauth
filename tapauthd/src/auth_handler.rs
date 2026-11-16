@@ -400,6 +400,20 @@ impl AuthSession {
         allowed_servers
     }
 
+    /// The response this session answers with.
+    ///
+    /// Every exit of [`Self::handle_authenticate`] carries the same shape — its
+    /// own outcome, a `detail` line for the PAM host, and this session's
+    /// challenge echoed back so the caller can match the answer to its request —
+    /// so the echo is filled in once, here, instead of at each return.
+    fn response(&self, outcome: ipc::PamOutcome, detail: String) -> ipc::PamAuthenticateResponse {
+        ipc::PamAuthenticateResponse {
+            outcome: outcome as i32,
+            detail,
+            challenge: self.challenge.to_vec(),
+        }
+    }
+
     /// Handle PamAuthenticateRequest - creates transports on-demand, runs auth flow
     pub async fn handle_authenticate(
         mut self,
@@ -416,22 +430,17 @@ impl AuthSession {
         self.transports = EnabledTransports::from_config();
         if let Some(reason) = self.transports.refusal() {
             tracing::info!("Refusing the attempt: {}", reason);
-            return Ok(ipc::PamAuthenticateResponse {
-                outcome: ipc::PamOutcome::Ignore as i32,
-                detail: reason.to_string(),
-                challenge: self.challenge.to_vec(),
-            });
+            return Ok(self.response(ipc::PamOutcome::Ignore, reason.to_string()));
         }
 
         // Check if we have any paired devices first — if not, return Ignore
         // silently so PAM falls through to other methods without noisy errors.
         let paired_servers = self.state.paired_servers.clone();
         if paired_servers.is_empty() {
-            return Ok(ipc::PamAuthenticateResponse {
-                outcome: ipc::PamOutcome::Ignore as i32,
-                detail: "No paired devices configured".to_string(),
-                challenge: self.challenge.to_vec(),
-            });
+            return Ok(self.response(
+                ipc::PamOutcome::Ignore,
+                "No paired devices configured".to_string(),
+            ));
         }
 
         // Only check if daemon is unhealthy when paired devices exist.
@@ -443,11 +452,7 @@ impl AuthSession {
                 .get_init_error()
                 .unwrap_or("Keypair unavailable. Please run tapauth-config to regenerate keys.");
 
-            return Ok(ipc::PamAuthenticateResponse {
-                outcome: ipc::PamOutcome::Error as i32,
-                detail: error_detail.to_string(),
-                challenge: self.challenge.to_vec(),
-            });
+            return Ok(self.response(ipc::PamOutcome::Error, error_detail.to_string()));
         }
 
         // Filter servers that are allowed to authenticate this user.
@@ -459,11 +464,10 @@ impl AuthSession {
 
         if allowed_servers.is_empty() {
             tracing::warn!("No paired servers authorized for user: {}", self.username);
-            return Ok(ipc::PamAuthenticateResponse {
-                outcome: ipc::PamOutcome::Ignore as i32,
-                detail: format!("No servers authorized for user {}", self.username),
-                challenge: self.challenge.to_vec(),
-            });
+            return Ok(self.response(
+                ipc::PamOutcome::Ignore,
+                format!("No servers authorized for user {}", self.username),
+            ));
         }
 
         tracing::info!(
@@ -546,29 +550,26 @@ impl AuthSession {
             tokio::time::timeout(timeout_duration, self.try_parallel_authentication(&packet)).await;
 
         match auth_result {
-            Ok(Ok(())) => Ok(ipc::PamAuthenticateResponse {
-                outcome: ipc::PamOutcome::Success as i32,
-                detail: format!("Authenticated user {} successfully", self.username),
-                challenge: self.challenge.to_vec(),
-            }),
+            Ok(Ok(())) => Ok(self.response(
+                ipc::PamOutcome::Success,
+                format!("Authenticated user {} successfully", self.username),
+            )),
             Ok(Err(AuthHandlerError::ExplicitDenial)) => {
                 tracing::warn!(
                     "Authentication explicitly denied by user for: {}",
                     self.username
                 );
-                Ok(ipc::PamAuthenticateResponse {
-                    outcome: ipc::PamOutcome::Denied as i32,
-                    detail: "Authentication explicitly denied by user".to_string(),
-                    challenge: self.challenge.to_vec(),
-                })
+                Ok(self.response(
+                    ipc::PamOutcome::Denied,
+                    "Authentication explicitly denied by user".to_string(),
+                ))
             }
             Ok(Err(e)) => {
                 tracing::error!("Authentication failed: {}", e);
-                Ok(ipc::PamAuthenticateResponse {
-                    outcome: ipc::PamOutcome::Ignore as i32,
-                    detail: format!("Authentication failed: {}", e),
-                    challenge: self.challenge.to_vec(),
-                })
+                Ok(self.response(
+                    ipc::PamOutcome::Ignore,
+                    format!("Authentication failed: {}", e),
+                ))
             }
             Err(_) => {
                 tracing::warn!("Authentication timeout for user {}", self.username);
@@ -584,11 +585,10 @@ impl AuthSession {
                         });
                     }
                 }
-                Ok(ipc::PamAuthenticateResponse {
-                    outcome: ipc::PamOutcome::Timeout as i32,
-                    detail: "Authentication timeout".to_string(),
-                    challenge: self.challenge.to_vec(),
-                })
+                Ok(self.response(
+                    ipc::PamOutcome::Timeout,
+                    "Authentication timeout".to_string(),
+                ))
             }
         }
     }
