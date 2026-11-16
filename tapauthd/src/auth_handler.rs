@@ -28,6 +28,13 @@ use shared::crypto::generate_current_ble_temporal_identifier_with_alg;
 
 use shared::ipc::pb as ipc;
 
+mod response_table;
+
+use response_table::{
+    classify_server_response, server_public_key, servers_authorized_for, ResponseError,
+    ServerResponseVerdict,
+};
+
 #[derive(Debug, thiserror::Error)]
 pub enum AuthHandlerError {
     #[error("Configuration error: {0}")]
@@ -393,6 +400,20 @@ impl AuthSession {
         allowed_servers
     }
 
+    /// The response this session answers with.
+    ///
+    /// Every exit of [`Self::handle_authenticate`] carries the same shape — its
+    /// own outcome, a `detail` line for the PAM host, and this session's
+    /// challenge echoed back so the caller can match the answer to its request —
+    /// so the echo is filled in once, here, instead of at each return.
+    fn response(&self, outcome: ipc::PamOutcome, detail: String) -> ipc::PamAuthenticateResponse {
+        ipc::PamAuthenticateResponse {
+            outcome: outcome as i32,
+            detail,
+            challenge: self.challenge.to_vec(),
+        }
+    }
+
     /// Handle PamAuthenticateRequest - creates transports on-demand, runs auth flow
     pub async fn handle_authenticate(
         mut self,
@@ -409,22 +430,17 @@ impl AuthSession {
         self.transports = EnabledTransports::from_config();
         if let Some(reason) = self.transports.refusal() {
             tracing::info!("Refusing the attempt: {}", reason);
-            return Ok(ipc::PamAuthenticateResponse {
-                outcome: ipc::PamOutcome::Ignore as i32,
-                detail: reason.to_string(),
-                challenge: self.challenge.to_vec(),
-            });
+            return Ok(self.response(ipc::PamOutcome::Ignore, reason.to_string()));
         }
 
         // Check if we have any paired devices first — if not, return Ignore
         // silently so PAM falls through to other methods without noisy errors.
         let paired_servers = self.state.paired_servers.clone();
         if paired_servers.is_empty() {
-            return Ok(ipc::PamAuthenticateResponse {
-                outcome: ipc::PamOutcome::Ignore as i32,
-                detail: "No paired devices configured".to_string(),
-                challenge: self.challenge.to_vec(),
-            });
+            return Ok(self.response(
+                ipc::PamOutcome::Ignore,
+                "No paired devices configured".to_string(),
+            ));
         }
 
         // Only check if daemon is unhealthy when paired devices exist.
@@ -436,11 +452,7 @@ impl AuthSession {
                 .get_init_error()
                 .unwrap_or("Keypair unavailable. Please run tapauth-config to regenerate keys.");
 
-            return Ok(ipc::PamAuthenticateResponse {
-                outcome: ipc::PamOutcome::Error as i32,
-                detail: error_detail.to_string(),
-                challenge: self.challenge.to_vec(),
-            });
+            return Ok(self.response(ipc::PamOutcome::Error, error_detail.to_string()));
         }
 
         // Filter servers that are allowed to authenticate this user.
@@ -452,11 +464,10 @@ impl AuthSession {
 
         if allowed_servers.is_empty() {
             tracing::warn!("No paired servers authorized for user: {}", self.username);
-            return Ok(ipc::PamAuthenticateResponse {
-                outcome: ipc::PamOutcome::Ignore as i32,
-                detail: format!("No servers authorized for user {}", self.username),
-                challenge: self.challenge.to_vec(),
-            });
+            return Ok(self.response(
+                ipc::PamOutcome::Ignore,
+                format!("No servers authorized for user {}", self.username),
+            ));
         }
 
         tracing::info!(
@@ -504,12 +515,14 @@ impl AuthSession {
         // Create the authentication request, carrying the resolved caller
         // context so the phone can show what is being approved.
         let request = create_auth_request_with_context(
-            &self.username,
-            &self.state.hostname,
             &self.challenge,
-            &self.caller.pam_service,
-            &self.caller.process_name,
-            &self.caller.command_preview,
+            ContextFields {
+                username: &self.username,
+                hostname: &self.state.hostname,
+                pam_service: &self.caller.pam_service,
+                process_name: &self.caller.process_name,
+                command_preview: &self.caller.command_preview,
+            },
             self.tty_present,
         )?;
         let mut wrapper = wrap_auth_request(request);
@@ -537,29 +550,26 @@ impl AuthSession {
             tokio::time::timeout(timeout_duration, self.try_parallel_authentication(&packet)).await;
 
         match auth_result {
-            Ok(Ok(())) => Ok(ipc::PamAuthenticateResponse {
-                outcome: ipc::PamOutcome::Success as i32,
-                detail: format!("Authenticated user {} successfully", self.username),
-                challenge: self.challenge.to_vec(),
-            }),
+            Ok(Ok(())) => Ok(self.response(
+                ipc::PamOutcome::Success,
+                format!("Authenticated user {} successfully", self.username),
+            )),
             Ok(Err(AuthHandlerError::ExplicitDenial)) => {
                 tracing::warn!(
                     "Authentication explicitly denied by user for: {}",
                     self.username
                 );
-                Ok(ipc::PamAuthenticateResponse {
-                    outcome: ipc::PamOutcome::Denied as i32,
-                    detail: "Authentication explicitly denied by user".to_string(),
-                    challenge: self.challenge.to_vec(),
-                })
+                Ok(self.response(
+                    ipc::PamOutcome::Denied,
+                    "Authentication explicitly denied by user".to_string(),
+                ))
             }
             Ok(Err(e)) => {
                 tracing::error!("Authentication failed: {}", e);
-                Ok(ipc::PamAuthenticateResponse {
-                    outcome: ipc::PamOutcome::Ignore as i32,
-                    detail: format!("Authentication failed: {}", e),
-                    challenge: self.challenge.to_vec(),
-                })
+                Ok(self.response(
+                    ipc::PamOutcome::Ignore,
+                    format!("Authentication failed: {}", e),
+                ))
             }
             Err(_) => {
                 tracing::warn!("Authentication timeout for user {}", self.username);
@@ -575,11 +585,10 @@ impl AuthSession {
                         });
                     }
                 }
-                Ok(ipc::PamAuthenticateResponse {
-                    outcome: ipc::PamOutcome::Timeout as i32,
-                    detail: "Authentication timeout".to_string(),
-                    challenge: self.challenge.to_vec(),
-                })
+                Ok(self.response(
+                    ipc::PamOutcome::Timeout,
+                    "Authentication timeout".to_string(),
+                ))
             }
         }
     }
@@ -1313,153 +1322,6 @@ impl AuthSession {
     }
 }
 
-/// The paired servers that may answer for `username`.
-///
-/// This is the single place the `allowed_users` filter is applied; everything
-/// that verifies a Server response consumes its output rather than
-/// `DaemonState::paired_servers`.
-fn servers_authorized_for(
-    paired_servers: &HashMap<String, PairedServer>,
-    username: &str,
-) -> Vec<PairedServer> {
-    paired_servers
-        .values()
-        .filter(|server| server.is_user_allowed(username))
-        .cloned()
-        .collect()
-}
-
-/// What a decrypted Server response means for this authentication session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ServerResponseVerdict {
-    /// A Server authorized for this user signed a matching `AuthenticationGrant`.
-    Grant,
-    /// A Server authorized for this user signed a matching `AuthenticationDenial`.
-    Denial,
-    /// Not an answer this client may act on: nobody signed it that is allowed to
-    /// answer for this user, or the challenge does not match, or it is not a
-    /// grant/denial at all.
-    Unattributed,
-}
-
-/// The signature check a row runs: [`verify_auth_grant`] or [`verify_auth_denial`],
-/// which share a signature and differ only in the inner payload they accept.
-type PayloadVerifier = fn(&WrapperMessage, &[u8; 32], &[u8; 32], i32) -> Result<(), ProtocolError>;
-
-/// One row of the response table: the payload type it answers for, the verifier
-/// it runs against every `allowed_servers` entry, and the verdict it produces
-/// when that verifier accepts.
-struct ResponseRow {
-    payload_type: PayloadType,
-    verify: PayloadVerifier,
-    verdict: ServerResponseVerdict,
-}
-
-/// The Server answers a client may act on, keyed on payload type, first match
-/// wins.
-///
-/// Only a payload type with a row here can produce a verdict other than
-/// [`ServerResponseVerdict::Unattributed`], and a row is only reached after the
-/// enclosing checks in [`AuthSession::wait_for_response`] have attributed the
-/// signature to a Server authorized for this user. A new Server answer is one
-/// row plus one case in `covering_cases` (the covering test fails without it),
-/// never another `else if` beside the allowlist check.
-static RESPONSE_ROWS: [ResponseRow; 2] = [
-    ResponseRow {
-        payload_type: PayloadType::AuthGrant,
-        verify: verify_auth_grant,
-        verdict: ServerResponseVerdict::Grant,
-    },
-    ResponseRow {
-        payload_type: PayloadType::AuthDenial,
-        verify: verify_auth_denial,
-        verdict: ServerResponseVerdict::Denial,
-    },
-];
-
-/// The row answering `payload_type`, or `None` when no row does — a payload type
-/// the protocol does not define, or one that is not a decision at all
-/// (`AuthRequest`, `GrantConfirmation`, `AuthCancel`, `Unspecified`).
-fn response_row(payload_type: i32) -> Option<&'static ResponseRow> {
-    RESPONSE_ROWS
-        .iter()
-        .find(|row| row.payload_type as i32 == payload_type)
-}
-
-/// The explicit refusal of a payload type no row answers for.
-///
-/// This is the outcome the dispatch used to reach by falling out of its `if`
-/// chain. It stays [`ServerResponseVerdict::Unattributed`] — not a verdict of its
-/// own — so an unrecognised type is neither a grant nor a denial here, and
-/// `process_auth_response` keeps answering it with `ResponseError::InvalidMessage`
-/// and its "Unexpected message type" debug line.
-fn refuse_unrecognised_payload_type() -> ServerResponseVerdict {
-    ServerResponseVerdict::Unattributed
-}
-
-/// Whether any Server authorized for this session accepts `wrapper` under `verify`.
-///
-/// Each candidate is checked with *its own* negotiated signature algorithm, so a
-/// Server cannot claim an algorithm the pairing did not agree on.
-fn any_authorized_server_verifies(
-    allowed_servers: &[PairedServer],
-    challenge: &[u8; 32],
-    wrapper: &WrapperMessage,
-    verify: PayloadVerifier,
-) -> bool {
-    allowed_servers.iter().any(|server| {
-        server_public_key(server).is_some_and(|public_key| {
-            verify(
-                wrapper,
-                challenge,
-                &public_key,
-                server.signature_algorithm as i32,
-            )
-            .is_ok()
-        })
-    })
-}
-
-/// Decide what a decrypted Server response means for this session.
-///
-/// Pure — no I/O and no clock — so the authorization decision can be tested
-/// directly. Every check runs against `allowed_servers` only: a Server paired for
-/// a different account is not in that slice, so its grant cannot authenticate
-/// this user and its denial cannot cancel the prompt for it.
-fn classify_server_response(
-    allowed_servers: &[PairedServer],
-    challenge: &[u8; 32],
-    wrapper: &WrapperMessage,
-) -> ServerResponseVerdict {
-    let row = match response_row(wrapper.payload_type) {
-        Some(row) => row,
-        None => return refuse_unrecognised_payload_type(),
-    };
-
-    if any_authorized_server_verifies(allowed_servers, challenge, wrapper, row.verify) {
-        row.verdict
-    } else {
-        ServerResponseVerdict::Unattributed
-    }
-}
-
-/// Decode a paired server's Ed25519 public key.
-fn server_public_key(server: &PairedServer) -> Option<[u8; 32]> {
-    let bytes = hex::decode(&server.public_key).ok()?;
-    if bytes.len() != 32 {
-        return None;
-    }
-    let mut public_key = [0u8; 32];
-    public_key.copy_from_slice(&bytes);
-    Some(public_key)
-}
-
-/// Error type for response processing
-enum ResponseError {
-    /// Invalid message that should be ignored (wait for another response)
-    InvalidMessage,
-}
-
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -1468,6 +1330,7 @@ enum ResponseError {
     clippy::indexing_slicing
 )]
 mod tests {
+    use super::response_table::{refuse_unrecognised_payload_type, response_row, RESPONSE_ROWS};
     use super::*;
     use shared::protocol::pb::SignatureAlgorithm;
     use std::sync::atomic::{AtomicUsize, Ordering};
