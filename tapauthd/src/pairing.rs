@@ -527,12 +527,38 @@ pub(crate) async fn bind_pairing_socket() -> std::io::Result<UdpSocket> {
 
 /// What [`open_transports`] produced.
 pub(crate) struct PairingPorts {
-    /// The bound pairing socket; `None` when the network transport is off.
+    /// The bound pairing socket; `None` when the network transport is off. This is
+    /// the fact that decides whether the session has a UDP endpoint at all.
     pub udp: Option<UdpSocket>,
-    /// Its port, or `0` when there is no socket.
+    /// The port `udp` was bound to; only meaningful when `udp` is `Some`.
     pub local_port: u16,
     /// Keeps the pairing firewall rule alive for the life of the session.
     pub firewall_guard: Option<Arc<FirewallGuard>>,
+}
+
+impl PairingPorts {
+    /// The QR endpoint of a session with these transports.
+    ///
+    /// The socket is the authority: a session without one publishes **no**
+    /// `p`/`ip4`/`ip6` at all and lets the phone use BLE, because a port without a
+    /// socket is a port nothing can send to. Both facts live in this struct, so the
+    /// decision cannot be made from a port value that means "none".
+    ///
+    /// See `a_disabled_network_transport_advertises_no_udp_endpoint_in_the_qr`.
+    pub(crate) fn endpoint(
+        &self,
+        ipv4: Option<Ipv4Addr>,
+        ipv6: Option<Ipv6Addr>,
+    ) -> PairingEndpoint {
+        if self.udp.is_none() {
+            return PairingEndpoint::default();
+        }
+        PairingEndpoint {
+            udp_port: Some(self.local_port),
+            ipv4,
+            ipv6,
+        }
+    }
 }
 
 /// Why the pairing transports could not be opened.
@@ -589,31 +615,6 @@ where
         local_port,
         firewall_guard,
     })
-}
-
-/// The QR endpoint of a session, from the two facts that decide it: the
-/// configuration (whether the network transport is on at all) and the ports that
-/// were actually opened.
-///
-/// The QR endpoint follows the transports rather than the bound socket: a
-/// session with no network transport has no reachable UDP endpoint, so it must
-/// publish **no** `p`/`ip4`/`ip6` at all and let the phone use BLE. Deriving it
-/// from `ports` alone would publish a port nothing can send to — the one
-/// `open_transports` reports when it binds nothing.
-pub(crate) fn pairing_endpoint(
-    transports: EnabledTransports,
-    ports: &PairingPorts,
-    ipv4: Option<Ipv4Addr>,
-    ipv6: Option<Ipv6Addr>,
-) -> PairingEndpoint {
-    if !transports.network {
-        return PairingEndpoint::default();
-    }
-    PairingEndpoint {
-        udp_port: Some(ports.local_port),
-        ipv4,
-        ipv6,
-    }
 }
 
 /// Start the handshake machine for a session with this QR endpoint.
@@ -2813,9 +2814,7 @@ mod tests {
         let (_, started) = start_session_state(
             Ed25519KeyPair::from_signing_key_bytes(&DESKTOP_SEED).unwrap(),
             "thinkpad",
-            pairing_endpoint(
-                EnabledTransports::new(false, true),
-                &ports,
+            ports.endpoint(
                 Some(Ipv4Addr::new(192, 168, 1, 5)),
                 Some(Ipv6Addr::LOCALHOST),
             ),
@@ -2852,12 +2851,7 @@ mod tests {
         let (_, started) = start_session_state(
             Ed25519KeyPair::from_signing_key_bytes(&DESKTOP_SEED).unwrap(),
             "thinkpad",
-            pairing_endpoint(
-                EnabledTransports::new(true, true),
-                &ports,
-                Some(Ipv4Addr::new(192, 168, 1, 5)),
-                None,
-            ),
+            ports.endpoint(Some(Ipv4Addr::new(192, 168, 1, 5)), None),
             None,
         )
         .unwrap();
@@ -2879,16 +2873,12 @@ mod tests {
         let (_, started) = start_session_state(
             Ed25519KeyPair::from_signing_key_bytes(&DESKTOP_SEED).unwrap(),
             "thinkpad",
-            pairing_endpoint(
-                EnabledTransports::new(false, true),
-                &PairingPorts {
-                    udp: None,
-                    local_port: 0,
-                    firewall_guard: None,
-                },
-                None,
-                None,
-            ),
+            PairingPorts {
+                udp: None,
+                local_port: 0,
+                firewall_guard: None,
+            }
+            .endpoint(None, None),
             None,
         )
         .unwrap();

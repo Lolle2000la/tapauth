@@ -1,4 +1,5 @@
-use super::transcript::{complete_signature_message, context_with_hash, truncate_utf8};
+use super::fields::truncate_utf8;
+use super::transcript::{complete_signature_message, context_with_hash};
 use super::wire::PairingEndpoint;
 use super::*;
 use crate::crypto::{
@@ -45,7 +46,7 @@ fn start_desktop_with_pins(
 /// Rebuild a desktop state that is byte-identical in its key material and
 /// session id, so a test can vary exactly one transcript field.
 fn seeded_desktop(session_id: [u8; PAIRING_SESSION_ID_LEN]) -> ClientPairingState {
-    ClientPairingState::build(
+    ClientPairingState::build_with_material(
         session_id,
         X25519KeyPair::from_secret_bytes([0x11; 32]),
         desktop_identity(),
@@ -63,7 +64,7 @@ fn seeded_desktop(session_id: [u8; PAIRING_SESSION_ID_LEN]) -> ClientPairingStat
 /// The phone counterpart of [`seeded_desktop`]: a fixed `X_S`, so `Z`, `H` and
 /// the SAS are the same on every run.
 fn seeded_phone(session_id: [u8; PAIRING_SESSION_ID_LEN]) -> ServerPairingSession {
-    ServerPairingSession::build(
+    ServerPairingSession::build_with_material(
         session_id,
         X25519KeyPair::from_secret_bytes([0x22; 32]),
         phone_identity(),
@@ -885,7 +886,7 @@ fn pair_with_pins(
 ) {
     // Fixed key material: the negotiation outcome, not the keys, is the subject.
     let session_id = [0x7Eu8; PAIRING_SESSION_ID_LEN];
-    let (mut desktop, started) = ClientPairingState::build(
+    let (mut desktop, started) = ClientPairingState::build_with_material(
         session_id,
         X25519KeyPair::from_secret_bytes([0x11; 32]),
         desktop_identity(),
@@ -1006,7 +1007,7 @@ fn pinned_symmetric_algorithm_absent_from_the_peer_is_refused() {
 
     // The refusal leaves the desktop state untouched: no response, no keys.
     let session_id = [0x7Fu8; PAIRING_SESSION_ID_LEN];
-    let (mut desktop, _started) = ClientPairingState::build(
+    let (mut desktop, _started) = ClientPairingState::build_with_material(
         session_id,
         X25519KeyPair::from_secret_bytes([0x11; 32]),
         desktop_identity(),
@@ -1316,10 +1317,10 @@ fn conclude_leaves_no_live_state_behind() {
     let negotiated = desktop.negotiated();
 
     // While live, the gate hands the state out.
-    assert!(desktop.live().is_ok());
-    assert!(desktop.live_mut().is_ok());
-    assert!(phone.live().is_ok());
-    assert!(phone.live_mut().is_ok());
+    assert!(desktop.live_gate().is_ok());
+    assert!(desktop.live_gate_mut().is_ok());
+    assert!(phone.live_gate().is_ok());
+    assert!(phone.live_gate_mut().is_ok());
 
     desktop.conclude();
     phone.conclude();
@@ -1327,19 +1328,22 @@ fn conclude_leaves_no_live_state_behind() {
     // The live phase is gone, not merely flagged: the state that held the keys,
     // `H` and the ephemeral secret was dropped, so the gate that guards every
     // field has nothing to hand out.
-    assert!(desktop.live.is_none(), "the desktop state must be taken");
-    assert!(phone.live.is_none(), "the phone state must be taken");
+    assert!(!desktop.is_live(), "the desktop state must be taken");
+    assert!(!phone.is_live(), "the phone state must be taken");
     assert!(matches!(
-        desktop.live(),
+        desktop.live_gate(),
         Err(ProtocolError::SessionConcluded)
     ));
     assert!(matches!(
-        desktop.live_mut(),
+        desktop.live_gate_mut(),
         Err(ProtocolError::SessionConcluded)
     ));
-    assert!(matches!(phone.live(), Err(ProtocolError::SessionConcluded)));
     assert!(matches!(
-        phone.live_mut(),
+        phone.live_gate(),
+        Err(ProtocolError::SessionConcluded)
+    ));
+    assert!(matches!(
+        phone.live_gate_mut(),
         Err(ProtocolError::SessionConcluded)
     ));
     assert!(!desktop.ephemeral_keypair_present());
@@ -1404,8 +1408,8 @@ fn conclude_leaves_no_live_state_behind() {
     // A second conclusion finds nothing left to take.
     desktop.conclude();
     phone.conclude();
-    assert!(desktop.live.is_none());
-    assert!(phone.live.is_none());
+    assert!(!desktop.is_live());
+    assert!(!phone.is_live());
 }
 
 /// The phone verifies exactly one response, and only after it built the

@@ -119,8 +119,9 @@
 //!   conflicting one.
 //! * Re-encryption: `PairingConfirmClient`/`PairingConfirmServer` carry a fresh
 //!   random nonce per encryption, so a retransmission must reuse the previously
-//!   created message rather than re-encrypt (see the "no re-encryption" note on
-//!   the create methods).
+//!   created message rather than re-encrypt (see the "Each call draws a fresh
+//!   nonce" note on [`ClientPairingState::create_confirm_client`] and
+//!   [`ServerPairingSession::create_confirm_server`]).
 //!
 //! ## Module layout
 //!
@@ -129,18 +130,23 @@
 //!
 //! * `negotiation.rs` — the `SUPPORTED_*` slices, [`NegotiatedAlgorithms`],
 //!   [`PinnedAlgorithms`] and the intersection that picks a suite.
-//! * `wire.rs` — the envelope codec ([`encode_pairing_packet`] /
-//!   [`decode_pairing_packet`] / [`pairing_session_id`]), [`PairingEndpoint`] and
-//!   [`StartedPairing`].
+//! * `wire.rs` — the envelope (`validate_envelope`) and the codec over it
+//!   ([`encode_pairing_packet`] / [`decode_pairing_packet`] /
+//!   [`pairing_session_id`]), plus [`PairingEndpoint`] and [`StartedPairing`].
 //! * `client.rs` — [`ClientPairingState`], the desktop half.
 //! * `server.rs` — [`ServerPairingSession`], the phone half.
-//! * `transcript.rs` — what only the handshake needs, from `validate_envelope`
-//!   through `verify_abort_tag`.
+//! * `transcript.rs` — the handshake's signature payloads (`context_with_hash`,
+//!   `complete_signature_message`), the session values both roles hand out
+//!   together (`session_material`) and the abort's direction tag
+//!   (`verify_abort_tag`).
+//! * `fields.rs` — the per-field helpers both roles apply before a value enters
+//!   the transcript: the device-name truncation and the 32-byte key parse.
 //!
 //! The constants below are the wire vocabulary every one of them names, so they
 //! stay here.
 
 mod client;
+mod fields;
 mod negotiation;
 mod server;
 mod transcript;

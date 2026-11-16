@@ -1,8 +1,20 @@
-use super::transcript::validate_envelope;
 use super::PAIRING_SESSION_ID_LEN;
-use crate::protocol::messages::ProtocolError;
+use crate::protocol::messages::{ProtocolError, PROTOCOL_VERSION_V2};
 use crate::protocol::pb::PairingPacket;
 use prost::Message as ProstMessage;
+
+/// Envelope rules shared by the encoder, the decoder and the session-id accessor:
+/// the v2 framing and a full-length session id, both checked before anything reads
+/// the body.
+fn validate_envelope(packet: &PairingPacket) -> Result<(), ProtocolError> {
+    if packet.version != PROTOCOL_VERSION_V2 {
+        return Err(ProtocolError::InvalidMessageFormat);
+    }
+    if packet.session_id.len() != PAIRING_SESSION_ID_LEN {
+        return Err(ProtocolError::InvalidMessageFormat);
+    }
+    Ok(())
+}
 
 /// Encode a [`PairingPacket`] for a UDP datagram payload or a BLE GATT value.
 ///

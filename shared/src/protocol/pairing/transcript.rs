@@ -1,37 +1,11 @@
-use super::{NegotiatedAlgorithms, PAIRING_SESSION_ID_LEN};
+//! The handshake's signature payloads and the abort's direction tag: what a
+//! pairing transcript is made of, as opposed to the envelope ([`super::wire`])
+//! that carries it or the single fields ([`super::fields`]) it is built from.
+
+use super::NegotiatedAlgorithms;
 use crate::crypto::{verify_pairing_abort_tag, PairingSessionKeys};
-use crate::protocol::messages::{ProtocolError, PROTOCOL_VERSION_V2};
-use crate::protocol::pb::{PairingAbort, PairingPacket};
-
-// ---------------------------------------------------------------------------
-// Private helpers
-// ---------------------------------------------------------------------------
-
-/// Envelope rules shared by the encoder, the decoder and the session-id accessor.
-pub(super) fn validate_envelope(packet: &PairingPacket) -> Result<(), ProtocolError> {
-    if packet.version != PROTOCOL_VERSION_V2 {
-        return Err(ProtocolError::InvalidMessageFormat);
-    }
-    if packet.session_id.len() != PAIRING_SESSION_ID_LEN {
-        return Err(ProtocolError::InvalidMessageFormat);
-    }
-    Ok(())
-}
-
-/// Truncate a device name to `max_bytes` on a UTF-8 char boundary.
-pub(super) fn truncate_utf8(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_string();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    match value.get(..end) {
-        Some(truncated) => truncated.to_string(),
-        None => String::new(),
-    }
-}
+use crate::protocol::messages::ProtocolError;
+use crate::protocol::pb::PairingAbort;
 
 /// `context || H` — the signature payload of `PairingResponse` and the AEAD AAD of
 /// both confirmation messages.
@@ -53,16 +27,6 @@ pub(super) fn complete_signature_message(
     data.extend_from_slice(transcript_hash);
     data.extend_from_slice(csk);
     data
-}
-
-/// Parse a 32-byte protobuf `bytes` field, distinguishing "absent" from "wrong length".
-pub(super) fn key_32(bytes: &[u8], field: &'static str) -> Result<[u8; 32], ProtocolError> {
-    if bytes.is_empty() {
-        return Err(ProtocolError::MissingField(field));
-    }
-    bytes
-        .try_into()
-        .map_err(|_| ProtocolError::InvalidMessageFormat)
 }
 
 /// The three session values both state machines hand out together.

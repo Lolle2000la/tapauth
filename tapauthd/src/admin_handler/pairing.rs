@@ -113,7 +113,7 @@ pub(super) async fn handle_start_pairing(
     let (state, started) = match crate::pairing::start_session_state(
         keypair,
         &daemon.hostname,
-        crate::pairing::pairing_endpoint(transports, &ports, ipv4, ipv6),
+        ports.endpoint(ipv4, ipv6),
         crate::pairing::pinned_algorithms(daemon),
     ) {
         Ok(pair) => pair,

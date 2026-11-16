@@ -1,6 +1,6 @@
+use super::fields::{key_32, truncate_utf8};
 use super::transcript::{
-    complete_signature_message, context_with_hash, key_32, session_material, truncate_utf8,
-    verify_abort_tag,
+    complete_signature_message, context_with_hash, session_material, verify_abort_tag,
 };
 use super::*;
 use crate::crypto::{
@@ -29,8 +29,9 @@ pub struct ServerPairingSession {
     session_id: [u8; PAIRING_SESSION_ID_LEN],
     negotiated: Option<NegotiatedAlgorithms>,
     /// The live handshake state; `None` once [`ServerPairingSession::conclude`] took
-    /// it.
-    pub(super) live: Option<LiveServerPairing>,
+    /// it. Private: only [`ServerPairingSession::live`]/[`ServerPairingSession::live_mut`]
+    /// name it, so no sibling module can reach the keys behind the gate.
+    live: Option<LiveServerPairing>,
 }
 
 /// Everything a phone-side pairing owns while it is live.
@@ -67,12 +68,12 @@ impl ServerPairingSession {
     ///
     /// The same structural gate as [`ClientPairingState::live`]: the fields it
     /// guards cannot be named without it.
-    pub(super) fn live(&self) -> Result<&LiveServerPairing, ProtocolError> {
+    fn live(&self) -> Result<&LiveServerPairing, ProtocolError> {
         self.live.as_ref().ok_or(ProtocolError::SessionConcluded)
     }
 
     /// The mutable counterpart of [`ServerPairingSession::live`].
-    pub(super) fn live_mut(&mut self) -> Result<&mut LiveServerPairing, ProtocolError> {
+    fn live_mut(&mut self) -> Result<&mut LiveServerPairing, ProtocolError> {
         self.live.as_mut().ok_or(ProtocolError::SessionConcluded)
     }
 
@@ -94,9 +95,10 @@ impl ServerPairingSession {
 
     /// Assemble the session around an already-chosen ephemeral `X_S`.
     ///
-    /// Split out of [`ServerPairingSession::new`] so a test can pin `X_S` and get a
-    /// deterministic `Z`, `H` and SAS (see `transcript_hash_binds_every_negotiated_field`).
-    pub(super) fn build(
+    /// Split out of [`ServerPairingSession::new`], and private on purpose: a sibling
+    /// module must not be able to build a live session around key material of its own
+    /// choosing. The test seam is [`ServerPairingSession::build_with_material`].
+    fn build(
         session_id: [u8; PAIRING_SESSION_ID_LEN],
         x25519_keypair: X25519KeyPair,
         server_identity: Ed25519KeyPair,
@@ -322,6 +324,50 @@ impl ServerPairingSession {
         // now report `SessionConcluded` for every caller. A second call finds `None`
         // and is a no-op.
         drop(self.live.take());
+    }
+
+    /// Assemble a session around an already-chosen ephemeral `X_S`.
+    ///
+    /// Test seam onto the private [`ServerPairingSession::build`]: a test pins
+    /// `X_S` and gets a deterministic `Z`, `H` and SAS (see
+    /// `transcript_hash_binds_every_negotiated_field`).
+    #[cfg(test)]
+    pub(super) fn build_with_material(
+        session_id: [u8; PAIRING_SESSION_ID_LEN],
+        x25519_keypair: X25519KeyPair,
+        server_identity: Ed25519KeyPair,
+        server_device_name: &str,
+    ) -> Self {
+        Self::build(
+            session_id,
+            x25519_keypair,
+            server_identity,
+            server_device_name,
+        )
+    }
+
+    /// Whether the live handshake state is still held.
+    ///
+    /// Test hook: the field is private, so this reports the phase transition the
+    /// conclusion test asserts without handing a sibling module the keys.
+    #[cfg(test)]
+    pub(super) fn is_live(&self) -> bool {
+        self.live.is_some()
+    }
+
+    /// The liveness gate, reduced to its answer.
+    ///
+    /// Test hook, so the conclusion test can assert the `SessionConcluded` answer
+    /// without receiving the state the gate guards.
+    #[cfg(test)]
+    pub(super) fn live_gate(&self) -> Result<(), ProtocolError> {
+        self.live().map(|_| ())
+    }
+
+    /// The mutable counterpart of [`ServerPairingSession::live_gate`].
+    #[cfg(test)]
+    pub(super) fn live_gate_mut(&mut self) -> Result<(), ProtocolError> {
+        self.live_mut().map(|_| ())
     }
 
     /// Whether the ephemeral `x_S` is still held.

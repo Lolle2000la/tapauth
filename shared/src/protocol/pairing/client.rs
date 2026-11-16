@@ -1,7 +1,7 @@
+use super::fields::{key_32, truncate_utf8};
 use super::negotiation::{hash_algorithms, negotiate, signature_algorithms, symmetric_algorithms};
 use super::transcript::{
-    complete_signature_message, context_with_hash, key_32, session_material, truncate_utf8,
-    verify_abort_tag,
+    complete_signature_message, context_with_hash, session_material, verify_abort_tag,
 };
 use super::wire::PairingEndpoint;
 use super::*;
@@ -45,8 +45,9 @@ pub struct ClientPairingState {
     response: Option<PairingResponse>,
     negotiated: Option<NegotiatedAlgorithms>,
     /// The live handshake state; `None` once [`ClientPairingState::conclude`] took
-    /// it.
-    pub(super) live: Option<LiveClientPairing>,
+    /// it. Private: only [`ClientPairingState::live`]/[`ClientPairingState::live_mut`]
+    /// name it, so no sibling module can reach the keys behind the gate.
+    live: Option<LiveClientPairing>,
 }
 
 /// Everything a desktop pairing owns while it is live.
@@ -81,12 +82,12 @@ impl ClientPairingState {
     /// `Ed_S`. A protocol entry point written without it does not compile, so the
     /// mistake class — a 13th method that forgot the check and ran against
     /// zeroized key material — is unrepresentable rather than documented.
-    pub(super) fn live(&self) -> Result<&LiveClientPairing, ProtocolError> {
+    fn live(&self) -> Result<&LiveClientPairing, ProtocolError> {
         self.live.as_ref().ok_or(ProtocolError::SessionConcluded)
     }
 
     /// The mutable counterpart of [`ClientPairingState::live`].
-    pub(super) fn live_mut(&mut self) -> Result<&mut LiveClientPairing, ProtocolError> {
+    fn live_mut(&mut self) -> Result<&mut LiveClientPairing, ProtocolError> {
         self.live.as_mut().ok_or(ProtocolError::SessionConcluded)
     }
 
@@ -122,9 +123,10 @@ impl ClientPairingState {
 
     /// Assemble the state and its [`StartedPairing`] from already-chosen material.
     ///
-    /// Split out of [`ClientPairingState::start`] so a test can re-create a state
-    /// with the *same* `x_C`/`Ed_C`/`sid` and vary one transcript field at a time.
-    pub(super) fn build(
+    /// Split out of [`ClientPairingState::start`], and private on purpose: a sibling
+    /// module must not be able to build a live state around key material of its own
+    /// choosing. The test seam is [`ClientPairingState::build_with_material`].
+    fn build(
         session_id: [u8; PAIRING_SESSION_ID_LEN],
         x25519_keypair: X25519KeyPair,
         client_identity: Ed25519KeyPair,
@@ -311,6 +313,54 @@ impl ClientPairingState {
         // report `SessionConcluded` for every caller. A second call finds `None` and
         // is a no-op.
         drop(self.live.take());
+    }
+
+    /// Assemble a state around already-chosen material.
+    ///
+    /// Test seam onto the private [`ClientPairingState::build`]: a test re-creates a
+    /// state with the *same* `x_C`/`Ed_C`/`sid` and varies one transcript field at a
+    /// time.
+    #[cfg(test)]
+    pub(super) fn build_with_material(
+        session_id: [u8; PAIRING_SESSION_ID_LEN],
+        x25519_keypair: X25519KeyPair,
+        client_identity: Ed25519KeyPair,
+        client_device_name: &str,
+        endpoint: PairingEndpoint,
+        pinned: Option<PinnedAlgorithms>,
+    ) -> (Self, StartedPairing) {
+        Self::build(
+            session_id,
+            x25519_keypair,
+            client_identity,
+            client_device_name,
+            endpoint,
+            pinned,
+        )
+    }
+
+    /// Whether the live handshake state is still held.
+    ///
+    /// Test hook: the field is private, so this reports the phase transition the
+    /// conclusion test asserts without handing a sibling module the keys.
+    #[cfg(test)]
+    pub(super) fn is_live(&self) -> bool {
+        self.live.is_some()
+    }
+
+    /// The liveness gate, reduced to its answer.
+    ///
+    /// Test hook, so the conclusion test can assert the `SessionConcluded` answer
+    /// without receiving the state the gate guards.
+    #[cfg(test)]
+    pub(super) fn live_gate(&self) -> Result<(), ProtocolError> {
+        self.live().map(|_| ())
+    }
+
+    /// The mutable counterpart of [`ClientPairingState::live_gate`].
+    #[cfg(test)]
+    pub(super) fn live_gate_mut(&mut self) -> Result<(), ProtocolError> {
+        self.live_mut().map(|_| ())
     }
 
     /// Whether the ephemeral `x_C` is still held.
