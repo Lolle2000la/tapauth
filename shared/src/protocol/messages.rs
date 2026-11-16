@@ -296,7 +296,30 @@ pub fn create_auth_request_with_challenge(
     hostname: &str,
     challenge: &[u8],
 ) -> Result<AuthenticationRequest, ProtocolError> {
-    create_auth_request_with_context(username, hostname, challenge, "", "", "", false)
+    create_auth_request_with_context(
+        challenge,
+        ContextFields {
+            username,
+            hostname,
+            pam_service: "",
+            process_name: "",
+            command_preview: "",
+        },
+        false,
+    )
+}
+
+/// The five caller-context strings an [`AuthenticationRequest`] carries, named.
+///
+/// The struct exists so the values cannot be transposed: five of the builder's
+/// parameters were exactly these five strings, which made a wrong order compile.
+/// A named field has no position to get wrong.
+pub struct ContextFields<'a> {
+    pub username: &'a str,
+    pub hostname: &'a str,
+    pub pam_service: &'a str,
+    pub process_name: &'a str,
+    pub command_preview: &'a str,
 }
 
 /// Create an AuthenticationRequest carrying sanitized call-site context.
@@ -311,13 +334,13 @@ pub fn create_auth_request_with_challenge(
 /// account the Server (phone) shows and the one the Client authorizes, so a truncated
 /// value would name a different account than the one being authenticated, while a
 /// long hostname is only display text.
+///
+/// The five bounded values arrive as [`ContextFields`], so their order cannot be
+/// transposed: the function takes the challenge, the fields and `tty_present`, and
+/// nothing else.
 pub fn create_auth_request_with_context(
-    username: &str,
-    hostname: &str,
     challenge: &[u8],
-    pam_service: &str,
-    process_name: &str,
-    command_preview: &str,
+    fields: ContextFields<'_>,
     tty_present: bool,
 ) -> Result<AuthenticationRequest, ProtocolError> {
     if challenge.len() != 32 {
@@ -328,11 +351,12 @@ pub fn create_auth_request_with_context(
     // is the whole list of what *this builder* asks `sanitize_context_string` to cut —
     // `tapauthd/src/caller_context.rs` cuts the same three fields on its own, and a row
     // edited here does not reach it.
-    let username = bound_context_value(ContextField::Username, username)?;
-    let hostname = bound_context_value(ContextField::Hostname, hostname)?;
-    let pam_service = bound_context_value(ContextField::PamService, pam_service)?;
-    let process_name = bound_context_value(ContextField::ProcessName, process_name)?;
-    let command_preview = bound_context_value(ContextField::CommandPreview, command_preview)?;
+    let username = bound_context_value(ContextField::Username, fields.username)?;
+    let hostname = bound_context_value(ContextField::Hostname, fields.hostname)?;
+    let pam_service = bound_context_value(ContextField::PamService, fields.pam_service)?;
+    let process_name = bound_context_value(ContextField::ProcessName, fields.process_name)?;
+    let command_preview =
+        bound_context_value(ContextField::CommandPreview, fields.command_preview)?;
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -815,12 +839,14 @@ mod tests {
         let long_preview = "y".repeat(400);
 
         let request = create_auth_request_with_context(
-            "user",
-            "host",
             &[1u8; 32],
-            "  sudo\u{0} ",
-            "sudo",
-            &long_preview,
+            ContextFields {
+                username: "user",
+                hostname: "host",
+                pam_service: "  sudo\u{0} ",
+                process_name: "sudo",
+                command_preview: &long_preview,
+            },
             true,
         )
         .unwrap();
@@ -956,19 +982,59 @@ mod tests {
         let challenge = [0x2Au8; 32];
         match field {
             ContextField::Username => create_auth_request_with_context(
-                value, "host", &challenge, "sudo", "sudo", "apt", false,
+                &challenge,
+                ContextFields {
+                    username: value,
+                    hostname: "host",
+                    pam_service: "sudo",
+                    process_name: "sudo",
+                    command_preview: "apt",
+                },
+                false,
             ),
             ContextField::Hostname => create_auth_request_with_context(
-                "luca", value, &challenge, "sudo", "sudo", "apt", false,
+                &challenge,
+                ContextFields {
+                    username: "luca",
+                    hostname: value,
+                    pam_service: "sudo",
+                    process_name: "sudo",
+                    command_preview: "apt",
+                },
+                false,
             ),
             ContextField::PamService => create_auth_request_with_context(
-                "luca", "host", &challenge, value, "sudo", "apt", false,
+                &challenge,
+                ContextFields {
+                    username: "luca",
+                    hostname: "host",
+                    pam_service: value,
+                    process_name: "sudo",
+                    command_preview: "apt",
+                },
+                false,
             ),
             ContextField::ProcessName => create_auth_request_with_context(
-                "luca", "host", &challenge, "sudo", value, "apt", false,
+                &challenge,
+                ContextFields {
+                    username: "luca",
+                    hostname: "host",
+                    pam_service: "sudo",
+                    process_name: value,
+                    command_preview: "apt",
+                },
+                false,
             ),
             ContextField::CommandPreview => create_auth_request_with_context(
-                "luca", "host", &challenge, "sudo", "sudo", value, false,
+                &challenge,
+                ContextFields {
+                    username: "luca",
+                    hostname: "host",
+                    pam_service: "sudo",
+                    process_name: "sudo",
+                    command_preview: value,
+                },
+                false,
             ),
         }
     }
@@ -1046,7 +1112,17 @@ mod tests {
         // authorizing (and displaying) a different account than the one asking.
         let long_username = "u".repeat(200);
         assert!(matches!(
-            create_auth_request_with_context(&long_username, "host", &[1u8; 32], "", "", "", false),
+            create_auth_request_with_context(
+                &[1u8; 32],
+                ContextFields {
+                    username: &long_username,
+                    hostname: "host",
+                    pam_service: "",
+                    process_name: "",
+                    command_preview: "",
+                },
+                false,
+            ),
             Err(ProtocolError::InvalidMessageFormat)
         ));
         // Just over the cap is already refused; exactly at the cap is accepted.
@@ -1077,12 +1153,14 @@ mod tests {
         // budget, and the signed packet still fits the BLE GATT attribute.
         let long_hostname = "h".repeat(200);
         let request = create_auth_request_with_context(
-            "luca",
-            &long_hostname,
             &[0x5Au8; 32],
-            "sudo",
-            "sudo",
-            &"c".repeat(COMMAND_PREVIEW_MAX_BYTES),
+            ContextFields {
+                username: "luca",
+                hostname: &long_hostname,
+                pam_service: "sudo",
+                process_name: "sudo",
+                command_preview: &"c".repeat(COMMAND_PREVIEW_MAX_BYTES),
+            },
             true,
         )
         .unwrap();

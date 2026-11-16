@@ -504,12 +504,14 @@ impl AuthSession {
         // Create the authentication request, carrying the resolved caller
         // context so the phone can show what is being approved.
         let request = create_auth_request_with_context(
-            &self.username,
-            &self.state.hostname,
             &self.challenge,
-            &self.caller.pam_service,
-            &self.caller.process_name,
-            &self.caller.command_preview,
+            ContextFields {
+                username: &self.username,
+                hostname: &self.state.hostname,
+                pam_service: &self.caller.pam_service,
+                process_name: &self.caller.process_name,
+                command_preview: &self.caller.command_preview,
+            },
             self.tty_present,
         )?;
         let mut wrapper = wrap_auth_request(request);

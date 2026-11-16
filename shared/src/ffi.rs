@@ -918,7 +918,7 @@ mod tests {
     use crate::crypto::{encrypted_packet_aad, generate_temporal_id_with_alg, ClientSymmetricKey};
     use crate::protocol::messages::{
         create_auth_request_with_context, sign_wrapper_message, verify_and_decode_payload,
-        DecodedPayload, PROTOCOL_VERSION_V2,
+        ContextFields, DecodedPayload, PROTOCOL_VERSION_V2,
     };
     use crate::protocol::packet::{
         create_encrypted_packet_with_csk_nonce, decrypt_encrypted_packet_with_csk_nonce,
@@ -945,12 +945,14 @@ mod tests {
 
     fn context_request(challenge: [u8; 32]) -> AuthenticationRequest {
         create_auth_request_with_context(
-            "luca",
-            "thinkpad",
             &challenge,
-            "sudo",
-            "sudo",
-            "apt upgrade",
+            ContextFields {
+                username: "luca",
+                hostname: "thinkpad",
+                pam_service: "sudo",
+                process_name: "sudo",
+                command_preview: "apt upgrade",
+            },
             true,
         )
         .unwrap()

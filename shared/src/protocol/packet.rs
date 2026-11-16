@@ -195,7 +195,7 @@ mod tests {
     use crate::crypto::Ed25519KeyPair;
     use crate::protocol::messages::{
         create_auth_request_with_challenge, create_auth_request_with_context, sign_wrapper_message,
-        verify_and_decode_payload, DecodedPayload, COMMAND_PREVIEW_MAX_BYTES,
+        verify_and_decode_payload, ContextFields, DecodedPayload, COMMAND_PREVIEW_MAX_BYTES,
         PAM_SERVICE_MAX_BYTES, PROCESS_NAME_MAX_BYTES,
     };
 
@@ -445,12 +445,14 @@ mod tests {
         let command_preview = "c".repeat(COMMAND_PREVIEW_MAX_BYTES);
 
         let request = create_auth_request_with_context(
-            &username,
-            &hostname,
             &[0x5Au8; 32],
-            &pam_service,
-            &process_name,
-            &command_preview,
+            ContextFields {
+                username: &username,
+                hostname: &hostname,
+                pam_service: &pam_service,
+                process_name: &process_name,
+                command_preview: &command_preview,
+            },
             true,
         )
         .unwrap();
