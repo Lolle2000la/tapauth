@@ -772,15 +772,12 @@ async fn run_session(
         link,
         phase,
         commands,
-        peer: None,
-        response_frame: None,
+        accepted: None,
         confirm_frame: None,
         provisioning: None,
         completion: None,
         cancel_reply: None,
         terminal: None,
-        server_public_key: None,
-        server_device_name: String::new(),
     };
 
     // This is the *runtime* predicate (did the socket bind, did the advertisement
@@ -942,20 +939,66 @@ async fn recv_datagram(
     }
 }
 
+/// A `PairingInit` this session accepted, as one value.
+///
+/// These fields belong together and nothing but [`Session::on_init`] ever wrote
+/// them: the peer the phone reached us on, the encoded `PairingResponse` that
+/// answers its retries, the phone's `Ed_S` and the phone's display name. Holding
+/// them in one `Option` makes "the init has been accepted" a single bit instead
+/// of a relation four fields must keep, and [`AcceptedInit::new`] is the only way
+/// to build one.
+struct AcceptedInit {
+    /// The transport that won the race, and the phone's current address on it.
+    /// Re-pointed — never cleared — by a retried init and by a keepalive, so a
+    /// NAT that remapped the phone's source port still reaches it.
+    peer: Peer,
+    /// The encoded `PairingResponse`, re-sent verbatim on every init retry.
+    response_frame: Vec<u8>,
+    /// `Ed_S`, captured from the accepted `PairingInit`.
+    server_public_key: [u8; 32],
+    /// The phone's display name, captured from the accepted `PairingInit`.
+    device_name: String,
+}
+
+impl AcceptedInit {
+    /// Accept an init that names its phone.
+    ///
+    /// `None` when the name is empty: there is no way back from that, because a
+    /// phone persisted with no name is indistinguishable downstream from one
+    /// whose name was lost, so the init is refused instead of half-accepted.
+    fn new(
+        peer: Peer,
+        response_frame: Vec<u8>,
+        server_public_key: [u8; 32],
+        device_name: String,
+    ) -> Option<Self> {
+        if device_name.is_empty() {
+            return None;
+        }
+        Some(Self {
+            peer,
+            response_frame,
+            server_public_key,
+            device_name,
+        })
+    }
+}
+
 /// One pairing session: its transports, its handshake machine, and the IPC
 /// callers waiting on it.
 ///
-/// The `Option` fields are not eight independent phases. They hold one atomic
-/// triple, one provisioning pair and two bookkeeping slots, and the relations
-/// below are the contract the handlers rely on. Each names the place that writes
-/// it, so a reader of [`Session::finish`]/[`Session::end`]/`on_*` finds the
-/// whole state machine here instead of reconstructing it:
+/// The `Option` fields are not independent phases. They hold one accepted init,
+/// one provisioning pair and two bookkeeping slots, and the relations below are
+/// the contract the handlers rely on. Each names the place that writes it, so a
+/// reader of [`Session::finish`]/[`Session::end`]/`on_*` finds the whole state
+/// machine here instead of reconstructing it:
 ///
-/// * **The accepted-init triple** — `peer.is_some() ⟺ response_frame.is_some()
-///   ⟺ server_public_key.is_some()`: written together in [`Session::on_init`]
-///   with no `await` between the writes, and never cleared (`peer` is
-///   re-pointed by that method's refresh arm and by [`Session::on_keepalive`],
-///   never reset to `None`). "The init has been accepted" is one bit, not three.
+/// * **The accepted init** — `accepted.is_some()` *is* "a `PairingInit` was
+///   accepted": its peer, cached response, `Ed_S` and phone name are one
+///   [`AcceptedInit`], built in one expression by [`Session::on_init`]. Its peer
+///   is re-pointed by that method's refresh arm and by [`Session::on_keepalive`],
+///   never cleared. A name cannot go missing from it: [`AcceptedInit::new`]
+///   refuses an empty one, so no `CompletedPairing` can carry a nameless phone.
 /// * **Provisioning** — `confirm_frame.is_some() ⟺ provisioning.is_some()`: two
 ///   adjacent writes in [`Session::on_complete`], no `await` between them.
 /// * `completion.is_some() ⟹ provisioning.is_some()`: a pending
@@ -967,10 +1010,6 @@ async fn recv_datagram(
 ///   `Flow::Continue` after calling it**. That is what makes [`Session::finish`]
 ///   the only publisher of a terminal phase: the recorded one cannot be
 ///   superseded while the session is still running.
-/// * The ninth, implicit one: `server_device_name` uses `""` as the sentinel for
-///   "not known yet" and has no guard anywhere. It is not an `Option`, so no
-///   `is_some` protects a read — a lost write silently pairs a phone with an
-///   empty name.
 struct Session {
     state: ClientPairingState,
     session_id: [u8; PAIRING_SESSION_ID_LEN],
@@ -982,10 +1021,10 @@ struct Session {
     link: PairingLink,
     phase: watch::Sender<SessionPhase>,
     commands: mpsc::Receiver<SessionCommand>,
-    /// The transport that won the race, and the phone's current address on it.
-    peer: Option<Peer>,
-    /// The encoded `PairingResponse`, re-sent verbatim on every init retry.
-    response_frame: Option<Vec<u8>>,
+    /// The accepted `PairingInit`, or `None` before one has been accepted. It is
+    /// also the session's locked peer: the transport in it is the one that won
+    /// the race.
+    accepted: Option<AcceptedInit>,
     /// The encoded `PairingConfirmClient`, re-sent verbatim while provisioning.
     confirm_frame: Option<Vec<u8>>,
     provisioning: Option<Provisioning>,
@@ -996,13 +1035,15 @@ struct Session {
     /// The terminal phase to publish, recorded by [`Session::end`] and published
     /// by [`Session::finish`] once the session is actually gone.
     terminal: Option<SessionPhase>,
-    /// `Ed_S`, captured from the accepted `PairingInit`.
-    server_public_key: Option<[u8; 32]>,
-    /// The phone's display name, captured from the accepted `PairingInit`.
-    server_device_name: String,
 }
 
 impl Session {
+    /// The peer this session is locked to, or `None` before a `PairingInit` was
+    /// accepted.
+    fn peer(&self) -> Option<Peer> {
+        self.accepted.as_ref().map(|accepted| accepted.peer)
+    }
+
     async fn run(&mut self) {
         let deadline = tokio::time::sleep(SESSION_DEADLINE);
         tokio::pin!(deadline);
@@ -1147,13 +1188,10 @@ impl Session {
     fn end(&mut self, phase: SessionPhase, failure: Option<PairingError>) -> Flow {
         // The relations documented on `Session`, checked at the point every
         // ending handler passes through: a later edit that resets one member of a
-        // pair (say `peer` on timeout) fails here instead of silently leaving the
-        // session addressable but keyless — a phone that is never answered.
-        debug_assert_eq!(
-            self.peer.is_some(),
-            self.response_frame.is_some() && self.server_public_key.is_some(),
-            "the accepted-init triple must be all-or-nothing"
-        );
+        // pair fails here instead of silently leaving the session in a state no
+        // handler can finish — a phone that is never answered. The accepted init
+        // is one value now, so the type keeps its own relation; the provisioning
+        // pair is still two fields.
         debug_assert!(
             self.completion.is_none() || self.provisioning.is_some(),
             "a CompletePairing reply may only exist while its provisioning does"
@@ -1188,7 +1226,7 @@ impl Session {
                 // registered GATT application and only dropped by `stop()`, so
                 // this is reached only if the app is unregistered behind us.
                 tracing::warn!("BLE pairing link closed by the phone");
-                if self.peer.map(Peer::kind) == Some(TransportKind::Ble) {
+                if self.peer().map(Peer::kind) == Some(TransportKind::Ble) {
                     // The locked transport is gone: nothing can carry the rest of
                     // the handshake. Over UDP pairing simply continues.
                     return self.end(
@@ -1243,12 +1281,13 @@ impl Session {
     // ---- handshake -------------------------------------------------------
 
     async fn on_init(&mut self, init: PairingInit, source: Peer) -> Flow {
-        match init_disposition(self.peer.map(Peer::kind), source.kind()) {
+        let locked = self.peer().map(Peer::kind);
+        match init_disposition(locked, source.kind()) {
             InitDisposition::Ignore => {
                 tracing::debug!(
                     "Ignoring PairingInit over {:?}: the session is locked to {:?}",
                     source.kind(),
-                    self.peer.map(Peer::kind)
+                    locked
                 );
                 return Flow::Continue;
             }
@@ -1276,12 +1315,18 @@ impl Session {
                     );
                     return Flow::Continue;
                 }
-                self.peer = Some(source);
+                if let Some(accepted) = self.accepted.as_mut() {
+                    accepted.peer = source;
+                }
                 tracing::debug!(
                     "PairingInit retried over {:?}; re-sending the cached PairingResponse",
                     source.kind()
                 );
-                if let Some(frame) = self.response_frame.clone() {
+                let cached = self
+                    .accepted
+                    .as_ref()
+                    .map(|accepted| accepted.response_frame.clone());
+                if let Some(frame) = cached {
                     self.send(frame, source).await;
                 }
                 return Flow::Continue;
@@ -1330,23 +1375,30 @@ impl Session {
             }
         };
 
-        self.response_frame = Some(frame);
-        self.server_public_key = Some(server_public_key);
-        self.server_device_name = init.server_device_name;
-        self.peer = Some(source);
+        // One value for the whole of "accepted", so there is no window in which
+        // the peer, the cached response and the phone's identity disagree.
+        let Some(accepted) =
+            AcceptedInit::new(source, frame, server_public_key, init.server_device_name)
+        else {
+            tracing::warn!("Rejecting PairingInit: the phone sent no device name");
+            return self
+                .reject_init(PairingAbortReason::ProtocolError, source)
+                .await;
+        };
+        let sas = self.state.sas().map(str::to_string);
+        let cached = accepted.response_frame.clone();
+        self.accepted = Some(accepted);
 
-        if let Some(sas) = self.state.sas() {
+        if let Some(sas) = sas {
             tracing::info!(
                 "PairingInit accepted over {:?} (phone {}); SAS ready for display",
                 source.kind(),
                 hex::encode(server_public_key)
             );
-            self.publish(SessionPhase::AwaitingSas(sas.to_string()));
+            self.publish(SessionPhase::AwaitingSas(sas));
         }
 
-        if let Some(frame) = self.response_frame.clone() {
-            self.send(frame, source).await;
-        }
+        self.send(cached, source).await;
         Flow::Continue
     }
 
@@ -1363,7 +1415,7 @@ impl Session {
     }
 
     async fn on_keepalive(&mut self, source: Peer) -> Flow {
-        if self.peer.map(Peer::kind) != Some(source.kind()) {
+        if self.peer().map(Peer::kind) != Some(source.kind()) {
             tracing::trace!(
                 "Ignoring PairingKeepalive over {:?}: not the locked transport",
                 source.kind()
@@ -1372,10 +1424,16 @@ impl Session {
         }
         // Keepalives refresh peer_addr (the phone's NAT port may have changed) and
         // request an immediate retransmission of whatever is in flight.
-        self.peer = Some(source);
+        if let Some(accepted) = self.accepted.as_mut() {
+            accepted.peer = source;
+        }
         if self.provisioning.is_some() {
             self.pump_provisioning(true).await;
-        } else if let Some(frame) = self.response_frame.clone() {
+        } else if let Some(frame) = self
+            .accepted
+            .as_ref()
+            .map(|accepted| accepted.response_frame.clone())
+        {
             self.send(frame, source).await;
         }
         Flow::Continue
@@ -1409,8 +1467,7 @@ impl Session {
             return Flow::Continue;
         }
 
-        let (Some(server_public_key), Some(negotiated)) =
-            (self.server_public_key, self.state.negotiated())
+        let (Some(accepted), Some(negotiated)) = (self.accepted.as_ref(), self.state.negotiated())
         else {
             tracing::warn!("Pairing proved out without a recorded phone identity key");
             return self.end(
@@ -1420,12 +1477,17 @@ impl Session {
                 )),
             );
         };
+        // The accepted init is the only source of the two fields the admin handler
+        // persists, and `AcceptedInit::new` refused to hold an empty name, so the
+        // published `CompletedPairing` always names the phone.
+        let server_public_key = accepted.server_public_key;
+        let server_device_name = accepted.device_name.clone();
 
         // The CSK is provisioned and proven: drop the session keys (and H) now.
         self.state.conclude();
         self.completion = Some(Ok(CompletedPairing {
             server_public_key,
-            server_device_name: self.server_device_name.clone(),
+            server_device_name,
             negotiated,
         }));
         tracing::info!(
@@ -1468,7 +1530,7 @@ impl Session {
             "Pairing session expired after {}s",
             SESSION_DEADLINE.as_secs()
         );
-        if let Some(peer) = self.peer {
+        if let Some(peer) = self.peer() {
             self.send_abort(peer, PairingAbortReason::SessionExpired)
                 .await;
         }
@@ -1492,7 +1554,7 @@ impl Session {
             let _ = request.reply.send(Err(PairingError::AlreadyCompleting));
             return Flow::Continue;
         }
-        let Some(peer) = self.peer else {
+        let Some(peer) = self.peer() else {
             let _ = request.reply.send(Err(PairingError::NotInitiated));
             return Flow::Continue;
         };
@@ -1539,7 +1601,7 @@ impl Session {
     async fn on_cancel(&mut self, reply: oneshot::Sender<()>) -> Flow {
         self.cancel_reply = Some(reply);
         let reason = PairingAbortReason::UserRejectedSas;
-        match self.peer {
+        match self.peer() {
             Some(peer) => {
                 tracing::info!(
                     "Cancelling the pairing session: sending {} to the phone",
@@ -1567,7 +1629,7 @@ impl Session {
         if !transmit_due(last_sent, now, keepalive_received) {
             return;
         }
-        let (Some(frame), Some(peer)) = (self.confirm_frame.clone(), self.peer) else {
+        let (Some(frame), Some(peer)) = (self.confirm_frame.clone(), self.peer()) else {
             return;
         };
         self.send(frame, peer).await;
@@ -2081,10 +2143,11 @@ mod tests {
     ///
     /// The peer is locked to a loopback address. In a live session that can only
     /// happen once a `PairingInit` has been accepted, so the other two members of
-    /// that triple are set with it (`Session`'s invariants): a session with a
+    /// that value are set with it (`Session`'s invariants): a session with a
     /// `peer` and no cached response is a state the daemon never reaches. The
     /// cached frame is empty because the fixture never ran the handshake, only
-    /// the handlers.
+    /// the handlers, and the name is a real one because `AcceptedInit` refuses an
+    /// empty one.
     async fn test_session(
         state: ClientPairingState,
         session_id: [u8; PAIRING_SESSION_ID_LEN],
@@ -2102,15 +2165,20 @@ mod tests {
             link: PairingLink::start([0u8; 10], false).await,
             phase,
             commands,
-            peer: Some(Peer::Udp(SocketAddr::from((Ipv4Addr::LOCALHOST, 41_000)))),
-            response_frame: Some(Vec::new()),
+            accepted: Some(
+                AcceptedInit::new(
+                    Peer::Udp(SocketAddr::from((Ipv4Addr::LOCALHOST, 41_000))),
+                    Vec::new(),
+                    [0u8; 32],
+                    "pixel".to_string(),
+                )
+                .expect("the fixture names its phone"),
+            ),
             confirm_frame: None,
             provisioning: None,
             completion: None,
             cancel_reply: None,
             terminal: None,
-            server_public_key: Some([0u8; 32]),
-            server_device_name: String::new(),
         };
         (session, phases)
     }
@@ -2855,7 +2923,7 @@ mod tests {
         let (mut session, _phases) = test_session(desktop, session_id).await;
         let locked = Peer::Udp(SocketAddr::from((Ipv4Addr::LOCALHOST, 41_000)));
         assert_eq!(
-            session.peer,
+            session.peer(),
             Some(locked),
             "the fixture locks the transport"
         );
@@ -2870,7 +2938,7 @@ mod tests {
             Flow::Continue
         ));
         assert_eq!(
-            session.peer,
+            session.peer(),
             Some(locked),
             "a differing init must not redirect the session"
         );
@@ -2882,7 +2950,7 @@ mod tests {
             session.on_init(genuine, elsewhere).await,
             Flow::Continue
         ));
-        assert_eq!(session.peer, Some(elsewhere));
+        assert_eq!(session.peer(), Some(elsewhere));
     }
 
     /// The terminal phase is published only after the link is stopped and the
