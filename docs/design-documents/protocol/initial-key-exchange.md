@@ -105,7 +105,7 @@ Upon scanning the QR code, the Server (Android):
    * `server_x25519_public_key` ($X_S$)
    * `server_ed25519_public_key` ($Ed_S$, the phone's long-term signing key)
    * `server_device_name` (truncated to max 64 UTF-8 bytes)
-   * `supported_symmetric_algorithms`, `supported_hash_algorithms`, `supported_signature_algorithms` — the algorithms this build implements, taken from `SUPPORTED_*` in `shared/src/protocol/pairing.rs` in list order (preferred first). Today that is one element each — `[AES_256_GCM]`, `[SHA256]`, `[ED25519]` — because v2 ships one active primitive per slot; a later release appends the new id (next free tag, never `2`) first in that slice and keeps the baseline, so a Client that implements only the baseline still finds a match. The protocol version is not negotiated: only v2 is accepted (see [`authentication-flow.md`](authentication-flow.md) §2.6).
+   * `supported_symmetric_algorithms`, `supported_hash_algorithms`, `supported_signature_algorithms` — the algorithms this build implements, taken from `SUPPORTED_*` in `shared/src/protocol/pairing/negotiation.rs` in list order (preferred first). Today that is one element each — `[AES_256_GCM]`, `[SHA256]`, `[ED25519]` — because v2 ships one active primitive per slot; a later release appends the new id (next free tag, never `2`) first in that slice and keeps the baseline, so a Client that implements only the baseline still finds a match. The protocol version is not negotiated: only v2 is accepted (see [`authentication-flow.md`](authentication-flow.md) §2.6).
 4. Races the transports:
    * **UDP**: If IP & port are present, sends `PairingInit` every **500ms** (up to 15s) until `PairingResponse` arrives.
    * **BLE**: Computes `pairing_adv_id` from `(sid, pk)` and (after a **250ms** head start for LAN UDP, or immediately if no IP/UDP is available) runs a foreground hardware-filtered `ScanFilter` matching the exact 10-byte `pairing_adv_id`, connects GATT, requests `MTU 517`, subscribes to notifications on `PAIRING_CHAR_UUID`, and writes `PairingInit`.
@@ -127,7 +127,7 @@ Upon receiving `PairingInit` matching `session_id`:
 ### Step 4: Server QR Key Verification, Signature Check & Mutual SAS Comparison
 
 Before displaying the SAS to the user, the Server **must**:
-1. Perform a **constant-time equality check**: `response.client_x25519_public_key == qr.pk` (`ServerPairingSession::verify_response`, `shared/src/protocol/pairing.rs:801`). An active attacker cannot substitute $X_C$ even before SAS verification.
+1. Perform a **constant-time equality check**: `response.client_x25519_public_key == qr.pk` (`ServerPairingSession::verify_response`, `shared/src/protocol/pairing/server.rs`). An active attacker cannot substitute $X_C$ even before SAS verification.
 2. Compute $H$ from its own view of the handshake fields and verify `response.client_signature` over `"tapauth-pair-client-sig-v2" || H` using `response.client_ed25519_public_key`.
 3. Verify the selected algorithms are in its own supported sets.
 4. Compute $Z = \text{X25519}(x_S, X_C)$ (rejecting all-zero output), $\text{PRK}$, $K_{\text{c2s}}$, $K_{\text{s2c}}$, and the 6-digit SAS:
