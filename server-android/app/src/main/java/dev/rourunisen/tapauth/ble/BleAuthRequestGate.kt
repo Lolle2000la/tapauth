@@ -36,24 +36,48 @@ import java.util.concurrent.ConcurrentHashMap
  * still up; if the claim were dropped there, they would fall through to the replay cache, which has
  * already recorded this challenge and answers "replay", and the link would be torn down — exactly
  * the symptom this gate exists to remove. Holding the claim instead makes such a retransmission a
- * silent [Verdict.DUPLICATE_IN_FLIGHT]. Nothing legitimate is swallowed by that: a new
- * authentication always carries a new challenge, and a different peer replaying the captured bytes
- * still falls through to the replay check.
+ * silent [Decision.Duplicate]. Nothing legitimate is swallowed by that: a new authentication always
+ * carries a new challenge, and a different peer replaying the captured bytes still falls through to
+ * the replay check.
+ *
+ * ### The ladder
+ *
+ * [decide] is the one call that answers this question, so the ordering is a property of this file
+ * and not of the service that reacts to it. First match wins:
+ *
+ * 1. [Decision.Claimed] — the transport lock refused the challenge, so another transport (usually
+ *    UDP) already owns it. The claim is consulted first, through the injected [claimTransport],
+ *    because that is the order the service ran the two in; nothing is admitted to [inFlight] and
+ *    the replay cache is never asked.
+ * 2. [Decision.Duplicate] — same peer, same challenge, still in flight. Answered *before* the
+ *    replay cache, which is the whole point: its answer for those bytes is "replay".
+ * 3. [Decision.Replay] — the cache rejected the request. A different peer holding the same bytes
+ *    lands here, which is what keeps a captured request from being replayed from another phone.
+ * 4. [Decision.Process] — fresh; the caller raises the prompt.
+ *
+ * [BleGattService] performs one effect per outcome and decides nothing itself.
  */
 internal class BleAuthRequestGate(
     private val isReplay: (challenge: ByteArray, timestampUnixSeconds: Long) -> Boolean,
     private val elapsedMillis: () -> Long,
 ) {
 
-    enum class Verdict {
-        /** First arrival for this challenge from this peer: process it. */
-        PROCESS,
+    /**
+     * What [decide] answered for one arrival. Exactly one of these is returned, and the caller does
+     * nothing else than perform its effect.
+     */
+    sealed class Decision {
+        /** Another transport owns this challenge: drop the link without touching anything here. */
+        data object Claimed : Decision()
 
         /** Same peer, same challenge, still in flight: ignore without touching the replay cache. */
-        DUPLICATE_IN_FLIGHT,
+        data object Duplicate : Decision()
 
         /** The replay cache rejected the request: reject and disconnect exactly as before. */
-        REPLAY,
+        data object Replay : Decision()
+
+        /** First arrival for this challenge from this peer: process it. */
+        data object Process : Decision()
     }
 
     private class InFlight(val peerAddress: String, val startedAtMillis: Long)
@@ -64,11 +88,22 @@ internal class BleAuthRequestGate(
     val inFlightCount: Int
         get() = inFlight.size
 
-    fun evaluate(
+    /**
+     * Decide what this arrival is: [Decision.Claimed], [Decision.Duplicate], [Decision.Replay] or
+     * [Decision.Process], in that order (see the class documentation).
+     *
+     * [claimTransport] is the transport lock (`TransportLockManager.tryClaimTransport`): it is
+     * consulted first and its `false` ends the decision, so a challenge another transport already
+     * owns never installs a claim here and never reaches the replay cache.
+     */
+    fun decide(
         challenge: ByteArray,
         timestampUnixSeconds: Long,
         peerAddress: String,
-    ): Verdict {
+        claimTransport: () -> Boolean,
+    ): Decision {
+        if (!claimTransport()) return Decision.Claimed
+
         val challengeKey = challenge.toHex()
         pruneExpired()
 
@@ -78,7 +113,7 @@ internal class BleAuthRequestGate(
         val claim = InFlight(peerAddress, elapsedMillis())
         val existing = inFlight.putIfAbsent(challengeKey, claim)
         if (existing != null && existing.peerAddress == peerAddress) {
-            return Verdict.DUPLICATE_IN_FLIGHT
+            return Decision.Duplicate
         }
 
         if (isReplay(challenge, timestampUnixSeconds)) {
@@ -87,10 +122,10 @@ internal class BleAuthRequestGate(
             if (existing == null) {
                 inFlight.remove(challengeKey, claim)
             }
-            return Verdict.REPLAY
+            return Decision.Replay
         }
 
-        return Verdict.PROCESS
+        return Decision.Process
     }
 
     /**

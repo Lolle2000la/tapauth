@@ -10,11 +10,13 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Ordering of the duplicate-in-flight check against the replay cache.
+ * Ordering of the ladder [BleAuthRequestGate.decide] answers: the transport claim, then the
+ * duplicate-in-flight check, then the replay cache.
  *
  * The replay check is the real [ReplayMitigationCache] (fixed clock), not a stub: it is the
  * collaborator that decides "replay" in production. [replayChecks] only counts that the gate
- * consulted it, which is what separates a duplicate that never reached the cache from one that did.
+ * consulted it, which is what separates a duplicate that never reached the cache from one that did,
+ * and [steps] records the order the two collaborators were asked in.
  */
 class BleAuthRequestGateTest {
 
@@ -22,11 +24,18 @@ class BleAuthRequestGateTest {
     private var nowMillis = 1_000_000L
 
     private val replayChecks = AtomicInteger(0)
+
+    /**
+     * Which collaborator was asked, in order: "claim" for the transport lock, "replay" for the
+     * cache.
+     */
+    private val steps = java.util.Collections.synchronizedList(mutableListOf<String>())
     private val replayCache = ReplayMitigationCache { nowSeconds }
 
     private val gate =
         BleAuthRequestGate(
             isReplay = { challenge, timestampUnixSeconds ->
+                steps.add("replay")
                 replayChecks.incrementAndGet()
                 replayCache.isReplay(challenge, timestampUnixSeconds)
             },
@@ -38,23 +47,39 @@ class BleAuthRequestGateTest {
     private val peer = "AA:BB:CC:DD:EE:01"
     private val otherPeer = "AA:BB:CC:DD:EE:02"
 
+    /** The transport lock's answer, recorded so the ladder's first rung is observable. */
+    private fun claimsTransport(granted: Boolean): () -> Boolean = {
+        steps.add("claim")
+        granted
+    }
+
+    /** The collaborator calls recorded since the last read, oldest first. */
+    private fun takenSteps(): List<String> {
+        val taken = synchronized(steps) { steps.toList() }
+        steps.clear()
+        return taken
+    }
+
     @Test
     fun firstArrivalIsProcessed() {
-        val verdict = gate.evaluate(challenge, nowSeconds, peer)
+        val decision = gate.decide(challenge, nowSeconds, peer, claimsTransport(true))
 
-        assertEquals(BleAuthRequestGate.Verdict.PROCESS, verdict)
+        assertEquals(BleAuthRequestGate.Decision.Process, decision)
         assertEquals(1, replayChecks.get())
         assertEquals(1, gate.inFlightCount)
     }
 
     @Test
     fun duplicateFromSamePeerNeverReachesTheReplayCache() {
-        assertEquals(BleAuthRequestGate.Verdict.PROCESS, gate.evaluate(challenge, nowSeconds, peer))
+        assertEquals(
+            BleAuthRequestGate.Decision.Process,
+            gate.decide(challenge, nowSeconds, peer, claimsTransport(true)),
+        )
 
         // The copy that races the initial read, or the re-notification of the same request.
-        val duplicate = gate.evaluate(challenge, nowSeconds, peer)
+        val duplicate = gate.decide(challenge, nowSeconds, peer, claimsTransport(true))
 
-        assertEquals(BleAuthRequestGate.Verdict.DUPLICATE_IN_FLIGHT, duplicate)
+        assertEquals(BleAuthRequestGate.Decision.Duplicate, duplicate)
         assertEquals(
             "the duplicate must not be consulted by the replay cache",
             1,
@@ -67,13 +92,16 @@ class BleAuthRequestGateTest {
 
     @Test
     fun foreignPeerWithTheSameBytesStillReachesTheReplayCache() {
-        assertEquals(BleAuthRequestGate.Verdict.PROCESS, gate.evaluate(challenge, nowSeconds, peer))
+        assertEquals(
+            BleAuthRequestGate.Decision.Process,
+            gate.decide(challenge, nowSeconds, peer, claimsTransport(true)),
+        )
 
         // Another device replaying the captured packet: not a duplicate, so it must be rejected by
         // the replay cache exactly as before (the caller then disconnects it).
-        val replayed = gate.evaluate(challenge, nowSeconds, otherPeer)
+        val replayed = gate.decide(challenge, nowSeconds, otherPeer, claimsTransport(true))
 
-        assertEquals(BleAuthRequestGate.Verdict.REPLAY, replayed)
+        assertEquals(BleAuthRequestGate.Decision.Replay, replayed)
         assertEquals(
             "the foreign replay must be consulted by the replay cache",
             2,
@@ -83,7 +111,10 @@ class BleAuthRequestGateTest {
 
     @Test
     fun concludeLetsTheChallengeReachTheReplayCacheAgain() {
-        assertEquals(BleAuthRequestGate.Verdict.PROCESS, gate.evaluate(challenge, nowSeconds, peer))
+        assertEquals(
+            BleAuthRequestGate.Decision.Process,
+            gate.decide(challenge, nowSeconds, peer, claimsTransport(true)),
+        )
 
         // The authentication concluded (grant sent / denial / cancel / timeout).
         gate.conclude(challenge)
@@ -91,8 +122,8 @@ class BleAuthRequestGateTest {
 
         // The same bytes afterwards are a replay again, not a duplicate in flight.
         assertEquals(
-            BleAuthRequestGate.Verdict.REPLAY,
-            gate.evaluate(challenge, nowSeconds, peer),
+            BleAuthRequestGate.Decision.Replay,
+            gate.decide(challenge, nowSeconds, peer, claimsTransport(true)),
         )
         assertEquals(2, replayChecks.get())
     }
@@ -108,7 +139,10 @@ class BleAuthRequestGateTest {
      */
     @Test
     fun theClaimSurvivesTheGraceWindowSoARepeatInsideItIsADuplicate() {
-        assertEquals(BleAuthRequestGate.Verdict.PROCESS, gate.evaluate(challenge, nowSeconds, peer))
+        assertEquals(
+            BleAuthRequestGate.Decision.Process,
+            gate.decide(challenge, nowSeconds, peer, claimsTransport(true)),
+        )
 
         // The GATT link dropped and the Client reconnected retransmitting the same request. The
         // service deliberately does not touch the gate on a disconnect, so the claim is still here,
@@ -117,8 +151,8 @@ class BleAuthRequestGateTest {
         nowMillis += 1_000L
 
         assertEquals(
-            BleAuthRequestGate.Verdict.DUPLICATE_IN_FLIGHT,
-            gate.evaluate(challenge, nowSeconds, peer),
+            BleAuthRequestGate.Decision.Duplicate,
+            gate.decide(challenge, nowSeconds, peer, claimsTransport(true)),
         )
         assertEquals(
             "a reconnect inside the grace must not reach the replay cache",
@@ -136,10 +170,13 @@ class BleAuthRequestGateTest {
      */
     @Test
     fun concludePeerAtGraceExpiryReleasesOnlyThatPeersChallenges() {
-        assertEquals(BleAuthRequestGate.Verdict.PROCESS, gate.evaluate(challenge, nowSeconds, peer))
         assertEquals(
-            BleAuthRequestGate.Verdict.PROCESS,
-            gate.evaluate(otherChallenge, nowSeconds, otherPeer),
+            BleAuthRequestGate.Decision.Process,
+            gate.decide(challenge, nowSeconds, peer, claimsTransport(true)),
+        )
+        assertEquals(
+            BleAuthRequestGate.Decision.Process,
+            gate.decide(otherChallenge, nowSeconds, otherPeer, claimsTransport(true)),
         )
 
         gate.concludePeer(peer)
@@ -148,28 +185,83 @@ class BleAuthRequestGateTest {
         // The abandoned request is concluded: nothing is held for it any more, so the next arrival
         // is decided by the replay cache again, exactly as for a request whose answer was sent.
         assertEquals(
-            BleAuthRequestGate.Verdict.REPLAY,
-            gate.evaluate(challenge, nowSeconds, peer),
+            BleAuthRequestGate.Decision.Replay,
+            gate.decide(challenge, nowSeconds, peer, claimsTransport(true)),
         )
         assertEquals(
-            BleAuthRequestGate.Verdict.DUPLICATE_IN_FLIGHT,
-            gate.evaluate(otherChallenge, nowSeconds, otherPeer),
+            BleAuthRequestGate.Decision.Duplicate,
+            gate.decide(otherChallenge, nowSeconds, otherPeer, claimsTransport(true)),
         )
         assertEquals("only the released peer's claim may be gone", 1, gate.inFlightCount)
     }
 
     @Test
     fun staleInFlightEntryIsPruned() {
-        assertEquals(BleAuthRequestGate.Verdict.PROCESS, gate.evaluate(challenge, nowSeconds, peer))
+        assertEquals(
+            BleAuthRequestGate.Decision.Process,
+            gate.decide(challenge, nowSeconds, peer, claimsTransport(true)),
+        )
 
         // A link that never reported its disconnect: after the TTL the entry is dropped instead of
         // being held for the lifetime of the process.
         nowMillis += 600_001L
 
         assertEquals(
-            BleAuthRequestGate.Verdict.REPLAY,
-            gate.evaluate(challenge, nowSeconds, peer),
+            BleAuthRequestGate.Decision.Replay,
+            gate.decide(challenge, nowSeconds, peer, claimsTransport(true)),
         )
+        assertEquals(2, replayChecks.get())
+    }
+
+    /**
+     * The four verdicts one challenge can reach, in the order the ladder answers them, with the
+     * collaborators each rung asked.
+     *
+     * A verdict-only test cannot see a reordering: every rung has a different result, so a
+     * duplicate checked after the replay cache still returns "replay" — and the service disconnects
+     * on that, killing the prompt the gate exists to protect. The recorded `[claim, replay]`
+     * sequence is what makes the order observable, so each step asserts both the verdict and what
+     * was consulted to reach it.
+     */
+    @Test
+    fun theLadderIsClaimedThenDuplicateThenReplayThenProcess() {
+        // 1. Another transport owns the challenge: the claim refuses it, and nothing below it runs.
+        assertEquals(
+            BleAuthRequestGate.Decision.Claimed,
+            gate.decide(challenge, nowSeconds, peer, claimsTransport(false)),
+        )
+        assertEquals(listOf("claim"), takenSteps())
+        assertEquals("a claimed challenge must not reach the replay cache", 0, replayChecks.get())
+        assertEquals("a claimed challenge is not ours to hold", 0, gate.inFlightCount)
+
+        // 2. Ours, and fresh: the rung that asks the replay cache and answers Process.
+        assertEquals(
+            BleAuthRequestGate.Decision.Process,
+            gate.decide(challenge, nowSeconds, peer, claimsTransport(true)),
+        )
+        assertEquals(listOf("claim", "replay"), takenSteps())
+        assertEquals(1, gate.inFlightCount)
+
+        // 3. Same peer, same challenge, in flight: a duplicate, decided without the replay cache —
+        // one "replay" step fewer than the rung above, which is the difference the gate exists for.
+        assertEquals(
+            BleAuthRequestGate.Decision.Duplicate,
+            gate.decide(challenge, nowSeconds, peer, claimsTransport(true)),
+        )
+        assertEquals(listOf("claim"), takenSteps())
+        assertEquals(
+            "the duplicate must not be consulted by the replay cache",
+            1,
+            replayChecks.get(),
+        )
+
+        // 4. The prompt concluded, so the same bytes are the replay cache's business again.
+        gate.conclude(challenge)
+        assertEquals(
+            BleAuthRequestGate.Decision.Replay,
+            gate.decide(challenge, nowSeconds, peer, claimsTransport(true)),
+        )
+        assertEquals(listOf("claim", "replay"), takenSteps())
         assertEquals(2, replayChecks.get())
     }
 
@@ -183,7 +275,7 @@ class BleAuthRequestGateTest {
             repeat(threads) {
                 pool.execute {
                     start.await()
-                    verdicts.add(gate.evaluate(challenge, nowSeconds, peer))
+                    verdicts.add(gate.decide(challenge, nowSeconds, peer, claimsTransport(true)))
                 }
             }
             start.countDown()
@@ -197,12 +289,12 @@ class BleAuthRequestGateTest {
         assertEquals(
             "exactly one arrival may be processed",
             1,
-            verdicts.count { it == BleAuthRequestGate.Verdict.PROCESS },
+            verdicts.count { it == BleAuthRequestGate.Decision.Process },
         )
         assertEquals(
             "every other arrival is a duplicate in flight",
             threads - 1,
-            verdicts.count { it == BleAuthRequestGate.Verdict.DUPLICATE_IN_FLIGHT },
+            verdicts.count { it == BleAuthRequestGate.Decision.Duplicate },
         )
         assertEquals("only the winner may reach the replay cache", 1, replayChecks.get())
     }

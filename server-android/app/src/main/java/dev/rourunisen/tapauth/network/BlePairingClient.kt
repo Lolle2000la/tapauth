@@ -50,6 +50,44 @@ import kotlinx.coroutines.withTimeoutOrNull
  * Runtime permissions (`BLUETOOTH_SCAN`/`BLUETOOTH_CONNECT`) are the app's responsibility; when the
  * adapter is off, missing, or a `SecurityException` is raised, the affected call reports failure
  * (`false`/`null`) instead of throwing.
+ *
+ * ### The write → acknowledge → read → decode sequence
+ *
+ * One phase of the protocol is: write a `PairingPacket` ([send]), wait for the desktop's answer as
+ * a notification, and read the characteristic when that notification never comes ([awaitPacket],
+ * through [PairingReadFallback]). The four steps are deliberately not one object: [send] owns the
+ * write and its acknowledgement, [PairingReadFallback] owns the wait and its read fallback, and
+ * decoding belongs to `PairingSession`, which hands the bytes to Rust. Nothing here interprets a
+ * frame. What a reader of those pieces separately would miss:
+ *
+ * - **One write is acknowledged; the rest are fire-and-forget.** `PairingInit` is the only frame
+ *   whose acknowledgement is acted on — `PairingSession.bleCandidate` abandons the BLE leg when
+ *   [send] returns false, because the desktop has to have it before there is an answer to wait for.
+ *   Every later frame is written with its result ignored (`PairingKeepalive`,
+ *   `PairingConfirmServer` — logged and continued — and `PairingAbort`): the desktop is already
+ *   polling the characteristic, so the read fallback is what recovers a dropped one, not a
+ *   retransmission loop in this class.
+ * - **A late notification is queued, not lost.** [deliver] puts every notified frame into
+ *   [packets], which is unbounded, so a frame that arrives before its [awaitPacket] — or between
+ *   two of them — is handed to the next wait. It is never re-requested from the characteristic. The
+ *   queue is not phase-scoped either: a frame left over from a finished phase can surface in a
+ *   later one, which is safe only because `PairingSession` drops frames carrying another pairing's
+ *   `session_id`.
+ * - **The write's acknowledgement and the read fallback are serialized.** Both hold [gattMutex]
+ *   (Android's `BluetoothGatt` drops a concurrent operation), so a fallback read that becomes due
+ *   while a write is outstanding waits for that write's acknowledgement, or for its
+ *   [WRITE_TIMEOUT_MS] to expire. The frame that read would have returned is then delivered by the
+ *   next notification or poll; a poll can only ever return the value the characteristic had
+ *   *before* the notification that raced it, which is why a queued notification wins over a read
+ *   ([PairingReadFallback]).
+ * - **A callback that loses its race is dropped, never inherited.** `writeDeferred`/`readDeferred`
+ *   are single slots, installed before the framework call and cleared in a `finally`; an
+ *   acknowledgement arriving after the timeout completes nothing and cannot satisfy the next write.
+ *   The mutex is what keeps one operation per kind outstanding, so those slots cannot be shared.
+ * - **The write callback is not characteristic-filtered, the read callback is.**
+ *   [PAIRING_CHAR_UUID] is the only characteristic this client ever writes, so no other write's
+ *   acknowledgement can be confused with it; the read callbacks check the UUID anyway because the
+ *   framework reports reads for every characteristic it is asked about.
  */
 class BlePairingClient(private val context: Context) {
 

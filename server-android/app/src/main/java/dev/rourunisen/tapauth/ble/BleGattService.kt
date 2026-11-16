@@ -1268,45 +1268,52 @@ class BleGattService : Service() {
 
             // The verified request carries the raw challenge bytes.
             val challengeBytes = authRequest.challenge
-
-            // Step 5: Transport lock - ensure only one channel handles this request
-            if (
-                !transportLockManager.tryClaimTransport(
-                    challengeBytes,
-                    dev.rourunisen.tapauth.data.TransportType.BLE,
-                )
-            ) {
-                Log.i(
-                    TAG,
-                    "BLE request ignored - challenge already claimed by another transport (likely UDP)",
-                )
-                // IMPORTANT: Disconnect immediately to free resources - UDP is handling this
-                disconnectGatt(gatt)
-                return
-            }
-
-            // Track this connection by challenge for potential cancellation
             val challengeKey = challengeBytes.toHex()
-            activeConnectionsByChallenge[challengeKey] = gatt
-            Log.d(TAG, "Tracking BLE connection for challenge: $challengeKey")
 
-            // Step 6: Duplicate-in-flight check, then replay attack mitigation.
-            //
-            // A same-peer repeat of the challenge already in flight (a notification racing the
-            // initial read, or a re-notification of the same request) must not reach the replay
-            // cache, which would report it as a replay and disconnect a link whose prompt the user
-            // is answering. It never creates a second prompt: when it arrives on a handle the
-            // Client reconnected on, the bytes already built are written there (below). A
-            // different peer replaying the same captured bytes is not a duplicate and still
-            // reaches the cache, exactly as before.
-            when (
-                authRequestGate.evaluate(
+            // One call for the whole ladder — transport lock, duplicate in flight, replay cache,
+            // fresh — so its order is a property of [BleAuthRequestGate] and cannot be edited
+            // here. This method only performs the effect of the outcome it got.
+            val decision =
+                authRequestGate.decide(
                     challengeBytes,
                     authRequest.timestampUnixSeconds,
                     gatt.device.address,
+                    claimTransport = {
+                        transportLockManager.tryClaimTransport(
+                            challengeBytes,
+                            dev.rourunisen.tapauth.data.TransportType.BLE,
+                        )
+                    },
                 )
-            ) {
-                BleAuthRequestGate.Verdict.DUPLICATE_IN_FLIGHT -> {
+
+            // A challenge another transport owns is not this link's to track; every other outcome
+            // is. Registering it before the duplicate's answer is re-delivered is what makes the
+            // reconnected handle the live one when the user answers.
+            if (decision != BleAuthRequestGate.Decision.Claimed) {
+                activeConnectionsByChallenge[challengeKey] = gatt
+                Log.d(TAG, "Tracking BLE connection for challenge: $challengeKey")
+            }
+
+            // Step 6: one effect per outcome.
+            //
+            // A duplicate is a same-peer repeat of the challenge the user is approving on — a
+            // notification racing the initial read, or a re-notification of the same request — and
+            // must not reach the replay cache, which would report it as a replay and disconnect a
+            // link whose prompt is still open. It never creates a second prompt either: when it
+            // arrives on a handle the Client reconnected on, the bytes already built are written
+            // there. A different peer replaying the same captured bytes is decided as Replay and
+            // disconnected exactly as before.
+            when (decision) {
+                BleAuthRequestGate.Decision.Claimed -> {
+                    Log.i(
+                        TAG,
+                        "BLE request ignored - challenge already claimed by another transport (likely UDP)",
+                    )
+                    // IMPORTANT: Disconnect immediately to free resources - UDP is handling this
+                    disconnectGatt(gatt)
+                    return
+                }
+                BleAuthRequestGate.Decision.Duplicate -> {
                     Log.d(
                         TAG,
                         "BLE duplicate of in-flight challenge from ${gatt.device.address}, ignoring",
@@ -1317,7 +1324,7 @@ class BleGattService : Service() {
                     redeliverPendingResponse(challengeKey, challengeBytes, gatt, matchedDevice)
                     return
                 }
-                BleAuthRequestGate.Verdict.REPLAY -> {
+                BleAuthRequestGate.Decision.Replay -> {
                     Log.w(TAG, "BLE replay attack detected, rejecting request")
                     // Silently disconnect - don't help attacker with denial message
                     if (
@@ -1330,7 +1337,7 @@ class BleGattService : Service() {
                     }
                     return
                 }
-                BleAuthRequestGate.Verdict.PROCESS -> Unit
+                BleAuthRequestGate.Decision.Process -> Unit
             }
 
             // The signature was already verified by parseAndVerifyAuthRequest above, which also
