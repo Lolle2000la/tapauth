@@ -2943,6 +2943,79 @@ mod tests {
         assert_eq!(session.peer(), Some(elsewhere));
     }
 
+    /// A `PairingInit` that names no phone must fail the session instead of being
+    /// accepted with an empty name.
+    ///
+    /// The defect this catches: `Session::on_init` keeping an init whose
+    /// `server_device_name` is empty — the pre-`AcceptedInit` shape, where the empty
+    /// string was the sentinel for "the phone sent no name". There the session
+    /// publishes `AwaitingSas`, the phone walks the user through the SAS, and what
+    /// the daemon persists is a `PairedServer` the user can never recognise.
+    #[tokio::test]
+    async fn a_pairing_init_with_no_device_name_fails_the_session() {
+        let (desktop, started) = ClientPairingState::start(
+            Ed25519KeyPair::from_signing_key_bytes(&DESKTOP_SEED).unwrap(),
+            "thinkpad",
+            PairingEndpoint {
+                udp_port: Some(36_692),
+                ipv4: Some(Ipv4Addr::LOCALHOST),
+                ipv6: None,
+            },
+            None,
+        )
+        .unwrap();
+        let mut phone = ServerPairingSession::new(
+            started.session_id,
+            Ed25519KeyPair::from_signing_key_bytes(&PHONE_SEED).unwrap(),
+            "",
+        )
+        .unwrap();
+        let nameless = phone.create_init().unwrap();
+        assert_eq!(
+            nameless.server_device_name, "",
+            "the frame under test must carry no device name"
+        );
+
+        let (mut session, phases) = test_session(desktop, started.session_id).await;
+        // `test_session` pre-accepts an init so the handlers can be driven without a
+        // handshake; a *first* `PairingInit` needs the pre-accept state instead.
+        session.accepted = None;
+
+        let flow = session
+            .on_init(
+                nameless,
+                Peer::Udp(SocketAddr::from((Ipv4Addr::LOCALHOST, 41_000))),
+            )
+            .await;
+        assert!(
+            matches!(flow, Flow::Done),
+            "a nameless init must end the session"
+        );
+        assert!(
+            session.accepted.is_none(),
+            "a nameless init must not be accepted"
+        );
+        assert!(
+            session.completion.is_none(),
+            "a refused init must not produce a CompletedPairing"
+        );
+        // Nothing is published before teardown, so the shared phase is still the
+        // pre-handshake one: no accepted phase went out.
+        assert_eq!(
+            phases.borrow().clone(),
+            SessionPhase::AwaitingPhone,
+            "a refused init must not publish an accepted phase"
+        );
+
+        session.finish().await;
+        assert_eq!(
+            phases.borrow().clone(),
+            SessionPhase::Failed(
+                "the phone's pairing request was refused (PROTOCOL_ERROR)".to_string()
+            )
+        );
+    }
+
     /// The terminal phase is published only after the link is stopped and the
     /// firewall rule **removed**, and exactly once.
     ///
