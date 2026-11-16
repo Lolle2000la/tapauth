@@ -1,9 +1,11 @@
 //! The on-disk posture of a secret: where the state directory is, and how a file in
 //! it is written and read.
 //!
-//! Every function here is reachable only through [`super::ClientConfigManager`]: the
-//! 0700 directory and 0600 file modes, the `tapauthd:tapauthd` chown, and the owner
-//! and mode a read accepts. What a config *is* lives in `super`.
+//! The four file and directory primitives below are re-exported from the parent module
+//! at their original visibility. Everything else here is reachable only through
+//! [`super::ClientConfigManager`]: the 0700 directory and 0600 file modes, the
+//! `tapauthd:tapauthd` chown, and the owner and mode a read accepts. What a config *is*
+//! lives in `super`.
 
 use super::{ConfigError, CONFIG_DIR};
 use nix::unistd::{geteuid, User};
@@ -14,7 +16,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Get active state/config directory (allows override via TAPAUTH_STATE_DIR in development/testing)
-pub(super) fn get_config_dir() -> PathBuf {
+pub fn get_config_dir() -> PathBuf {
     #[cfg(any(feature = "dev-state-override", test))]
     if let Ok(dir) = std::env::var("TAPAUTH_STATE_DIR") {
         return PathBuf::from(dir);
@@ -81,7 +83,7 @@ fn chown_to_tapauthd(path: &Path) -> Result<(), ConfigError> {
 }
 
 /// Ensure configuration directory exists with strict permissions (700)
-pub(super) fn ensure_secure_directory(path: &Path) -> Result<(), ConfigError> {
+pub fn ensure_secure_directory(path: &Path) -> Result<(), ConfigError> {
     // Only tapauthd or root may create/modify; if root, we will chown to tapauthd
     if !is_euid_privileged_for_writes() {
         return Err(ConfigError::InsufficientPermissions);
@@ -106,7 +108,7 @@ pub(super) fn ensure_secure_directory(path: &Path) -> Result<(), ConfigError> {
 }
 
 /// Write data to a file with strict owner-only permissions (600)
-pub(super) fn write_secure_file(path: &Path, data: &[u8]) -> Result<(), ConfigError> {
+pub fn write_secure_file(path: &Path, data: &[u8]) -> Result<(), ConfigError> {
     // Only tapauthd or root may write; if root, we will chown to tapauthd
     if !is_euid_privileged_for_writes() {
         tracing::error!("write_secure_file: insufficient permissions");
@@ -139,7 +141,7 @@ pub(super) fn write_secure_file(path: &Path, data: &[u8]) -> Result<(), ConfigEr
 }
 
 /// Read data from a secure file
-pub(super) fn read_secure_file(path: &Path) -> Result<Vec<u8>, ConfigError> {
+pub fn read_secure_file(path: &Path) -> Result<Vec<u8>, ConfigError> {
     // Verify file permissions
     let metadata = fs::metadata(path)?;
     let permissions = metadata.permissions();

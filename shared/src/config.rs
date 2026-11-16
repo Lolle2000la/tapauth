@@ -21,9 +21,8 @@
 mod storage;
 mod toml_config;
 
+pub use storage::{ensure_secure_directory, get_config_dir, read_secure_file, write_secure_file};
 pub use toml_config::{TapAuthConfig, DEFAULT_CONFIG_PATH, DEFAULT_PAM_REFUSED_SERVICES};
-
-use storage::{ensure_secure_directory, get_config_dir, read_secure_file, write_secure_file};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
