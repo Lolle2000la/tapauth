@@ -58,9 +58,17 @@ class BleGattService : Service() {
         const val ACTION_SCAN_RESULT = "dev.rourunisen.tapauth.ACTION_BLE_SCAN_RESULT"
 
         /**
-         * Grace period after a GATT disconnect before pending requests for that device are
-         * cancelled. Short enough to bound an orphaned prompt's lifetime, long enough to ride out
-         * transient link drops and duplicate connection callbacks.
+         * Grace after a GATT disconnect before the peer's prompt is cancelled and its claim
+         * released for a retry.
+         *
+         * This bounds the prompt and this transport's claim, **not** the reconnect: the Phone is
+         * the BLE central, so it reconnects only when its `SCAN_MODE_LOW_POWER` scan (512 ms window
+         * / 5 s interval) next reports the Client's advertisement, and the foreground-service hop,
+         * connect, discovery, MTU, CCCD and read sequence come on top — a scan-driven reconnect can
+         * therefore exceed this by design of the scanner. That is why the expiry releases the claim
+         * instead of concluding it ([BleDisconnectGrace], [BleAuthRequestGate.releaseForRetry]):
+         * the retransmission that finally arrives raises a fresh prompt, where a concluded claim
+         * would be answered as a replay and disconnect the link again.
          */
         const val BLE_DISCONNECT_CANCEL_GRACE_MS = 5_000L
 
@@ -152,6 +160,17 @@ class BleGattService : Service() {
             isReplay = { challenge, timestampUnixSeconds ->
                 replayMitigationCache.isReplay(challenge, timestampUnixSeconds)
             },
+            elapsedMillis = { android.os.SystemClock.elapsedRealtime() },
+        )
+
+    /**
+     * Decides what the disconnect grace and a duplicate-in-flight arrival mean, so this service
+     * performs one effect per outcome: whether a peer that dropped still gets its claim released,
+     * and whether a duplicate needs the held answer re-delivered, a fresh prompt, or nothing.
+     */
+    private val disconnectGrace =
+        BleDisconnectGrace(
+            graceMillis = BLE_DISCONNECT_CANCEL_GRACE_MS,
             elapsedMillis = { android.os.SystemClock.elapsedRealtime() },
         )
 
@@ -313,8 +332,9 @@ class BleGattService : Service() {
                         // the reconnect presents that same challenge from the same peer. With the
                         // claim held it is a duplicate in flight and the prompt survives; released,
                         // the arrival would reach the replay cache, be called a replay and tear the
-                        // new link down. Release happens once the reconnection grace below has
-                        // passed without a reconnect.
+                        // new link down. The grace coroutine below asks BleDisconnectGrace what to
+                        // do once the grace has passed.
+                        val disconnectedAtMillis = android.os.SystemClock.elapsedRealtime()
 
                         // Drop any challenge-tracked connections that pointed at this (now dead)
                         // GATT handle so a stale response can never be written through it.
@@ -323,10 +343,11 @@ class BleGattService : Service() {
                         // Authentication prompts are user-driven and must survive transient GATT
                         // reconnections, so requests are NOT cancelled immediately here. But a
                         // link that stays down must not leave an orphaned prompt (and its BLE
-                        // connection intent) alive until the daemon timeout: after a short grace
-                        // period, if the device has not reconnected, cancel its pending requests.
-                        // The grace is also where the peer's claims are released, so a link that
-                        // never comes back leaves nothing held behind it.
+                        // connection intent) alive until the daemon timeout: once the grace has
+                        // passed, a peer that has not reconnected has its prompt cancelled and its
+                        // claim released for a retry. The grace bounds that prompt, not the
+                        // reconnect — the reconnect is scan-driven and can outlast it — so the
+                        // released claim keeps the challenge away from the replay cache.
                         serviceScope.launch {
                             delay(BLE_DISCONNECT_CANCEL_GRACE_MS)
                             // The handle is dead whether or not the device came back on another
@@ -336,21 +357,40 @@ class BleGattService : Service() {
                             // reconnection from accumulating; the registry still knows the handle
                             // as torn down, so nothing can take it for a live connection again.
                             gattConnections.forget(gatt)
-                            if (!connectingOrConnectedDevices.contains(deviceAddress)) {
-                                // The prompt is over, so a later request carrying the same
-                                // challenge is a replay again rather than a duplicate in flight,
-                                // and the answer still held for this peer has nobody left to reach.
-                                authRequestGate.concludePeer(deviceAddress)
-                                pendingResponses.abandonPeer(deviceAddress)
-                                if (
-                                    dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()
-                                        .cancelRequestsByBleDisconnection(deviceAddress)
-                                ) {
-                                    Log.d(
-                                        TAG,
-                                        "Cancelled pending requests after prolonged BLE disconnect of $deviceAddress",
-                                    )
+                            when (
+                                disconnectGrace.onGraceExpired(
+                                    BleDisconnectGrace.LinkFacts(
+                                        claimHeld = authRequestGate.holdsClaimFor(deviceAddress),
+                                        disconnectedAtMillis = disconnectedAtMillis,
+                                        reconnected =
+                                            connectingOrConnectedDevices.contains(deviceAddress),
+                                    ),
+                                )
+                            ) {
+                                BleDisconnectGrace.Outcome.ReleaseAndCancel -> {
+                                    // The held answer has nobody left to reach and the prompt is
+                                    // over. Both run BEFORE the release mark: a retransmission
+                                    // landing in between is answered as a retry, and the cancel
+                                    // below would claim and cancel the fresh prompt it raised —
+                                    // leaving the challenge with no prompt, no mark and no
+                                    // disconnect, a silent hang.
+                                    pendingResponses.abandonPeer(deviceAddress)
+                                    if (
+                                        dev.rourunisen.tapauth.service.AuthRequestManager
+                                            .getInstance()
+                                            .cancelRequestsByBleDisconnection(deviceAddress)
+                                    ) {
+                                        Log.d(
+                                            TAG,
+                                            "Cancelled pending requests after prolonged BLE disconnect of $deviceAddress",
+                                        )
+                                    }
+                                    // Last, so the retry it enables cannot be swallowed: the claim
+                                    // stays held (the release concludes nothing), so a later
+                                    // retransmission of this challenge is a retry and not a replay.
+                                    authRequestGate.releaseForRetry(deviceAddress)
                                 }
+                                else -> Unit
                             }
                         }
 
@@ -1309,10 +1349,13 @@ class BleGattService : Service() {
             // A duplicate is a same-peer repeat of the challenge the user is approving on — a
             // notification racing the initial read, or a re-notification of the same request — and
             // must not reach the replay cache, which would report it as a replay and disconnect a
-            // link whose prompt is still open. It never creates a second prompt either: when it
-            // arrives on a handle the Client reconnected on, the bytes already built are written
-            // there. A different peer replaying the same captured bytes is decided as Replay and
+            // link whose prompt is still open. What it means for the prompt is BleDisconnectGrace's
+            // question: an answer already built is written again on the handle the Client
+            // reconnected
+            // on, an open prompt swallows it, and a claim the grace released raises a fresh prompt
+            // below. A different peer replaying the same captured bytes is decided as Replay and
             // disconnected exactly as before.
+            var retryingReleasedChallenge = false
             when (decision) {
                 BleAuthRequestGate.Decision.Claimed -> {
                     Log.i(
@@ -1328,11 +1371,47 @@ class BleGattService : Service() {
                         TAG,
                         "BLE duplicate of in-flight challenge from ${gatt.device.address}, ignoring",
                     )
-                    // Unless it arrived on a new handle: the Client lost the link before the answer
-                    // reached it, so the same bytes are written again here instead of on the dead
-                    // one, and the prompt the user is answering stays alive.
-                    redeliverPendingResponse(challengeKey, challengeBytes, gatt, matchedDevice)
-                    return
+                    // What this copy means is decided by BleDisconnectGrace: a claim the grace
+                    // released for a retry has no prompt left to answer (a fresh one is raised
+                    // below, exactly like a first arrival), and an answer already built is written
+                    // again — on the handle the Client reconnected on, when the link it was raised
+                    // on is gone. Anything else is a copy of the prompt the user is still
+                    // answering and is ignored, never disconnected.
+                    when (
+                        disconnectGrace.onDuplicate(
+                            BleDisconnectGrace.ArrivalFacts(
+                                claimHeld = true,
+                                promptAnswered =
+                                    pendingResponses.holdsAnswerFor(
+                                        challengeKey,
+                                        gatt.device.address,
+                                    ),
+                                releasedForRetry =
+                                    authRequestGate.wasReleasedForRetry(challengeBytes),
+                            ),
+                        )
+                    ) {
+                        BleDisconnectGrace.Outcome.AnswerOnLiveHandle -> {
+                            redeliverPendingResponse(
+                                challengeKey,
+                                challengeBytes,
+                                gatt,
+                                matchedDevice,
+                            )
+                            return
+                        }
+                        BleDisconnectGrace.Outcome.Retry -> {
+                            retryingReleasedChallenge = true
+                            Log.i(
+                                TAG,
+                                "BLE challenge was released for a retry after a disconnect; re-offering it to the user",
+                            )
+                            // Falls through to the shared rate limiter and the prompt below,
+                            // exactly like the Process outcome. The release mark is consumed there,
+                            // once the retry is really being raised.
+                        }
+                        else -> return
+                    }
                 }
                 BleAuthRequestGate.Decision.Replay -> {
                     Log.w(TAG, "BLE replay attack detected, rejecting request")
@@ -1354,9 +1433,10 @@ class BleGattService : Service() {
             // path uses (RequestRateLimiter.getInstance(), keyed on the paired Client's public
             // key): without it this path is a bypass of that limiter, and a Client that keeps
             // sending fresh requests is throttled on one transport and not on the other. It runs
-            // here, on the Process outcome, because this is the only outcome that raises a prompt:
-            // a retransmission answered as a Duplicate never spends the burst allowance, and a
-            // challenge another transport owns never reached a prompt at all.
+            // here for both outcomes that raise a prompt — Process, and a Retry of a claim the
+            // grace released (a retry arrives long after the limiter's 2 s de-duplication window,
+            // so it really spends a burst slot) — while Claimed, Duplicate and Replay return above
+            // it and never spend the allowance.
             if (
                 !requestRateLimiter.shouldAcceptAuthenticatedRequest(
                     matchedDevice.publicKey,
@@ -1379,6 +1459,14 @@ class BleGattService : Service() {
                 TAG,
                 "BLE signature verified for device: ${matchedDevice.displayName} (${matchedDevice.deviceId})",
             )
+
+            // A retry consumes its release only here, where the limiter has admitted it and the
+            // prompt is about to be registered: consumed up in the arm, a rate-limited or throwing
+            // retry would leave the challenge with no prompt, no mark and no disconnect, and every
+            // later copy of it would be a silent duplicate.
+            if (retryingReleasedChallenge) {
+                authRequestGate.retryStarted(challengeBytes)
+            }
 
             // Step 8: Request biometric authentication via AuthRequestManager
             val authRequestManager = dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()

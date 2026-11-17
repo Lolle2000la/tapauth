@@ -6,6 +6,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -133,9 +134,9 @@ class BleAuthRequestGateTest {
      * inside that window is a duplicate in flight rather than a replay.
      *
      * This pins the gate only: it says nothing about *when* the service releases a peer. That the
-     * `STATE_DISCONNECTED` handler leaves `concludePeer` alone (and runs it only once the grace has
-     * expired without a reconnect) cannot be observed from here — `BluetoothGatt` is a framework
-     * class — so it is pinned by the source guard in `BleGattServiceWiringTest`.
+     * `STATE_DISCONNECTED` handler leaves `releaseForRetry` alone (and runs it only once the grace
+     * has expired without a reconnect) cannot be observed from here — `BluetoothGatt` is a
+     * framework class — so it is pinned by the source guard in `BleGattServiceWiringTest`.
      */
     @Test
     fun theClaimSurvivesTheGraceWindowSoARepeatInsideItIsADuplicate() {
@@ -163,13 +164,15 @@ class BleAuthRequestGateTest {
     }
 
     /**
-     * `concludePeer` is the release the service runs at the end of the reconnection grace, and only
-     * when the device did not come back — not the `STATE_DISCONNECTED` handler it used to run it
-     * from. It removes exactly that peer's claims, so an abandoned link leaks nothing while another
-     * peer's in-flight prompt keeps its claim.
+     * `releaseForRetry` is the release the service runs at the end of the disconnect grace, and
+     * only when the device did not come back. It must not conclude a challenge: the reconnect it
+     * waited for is scan-driven and can outlast any constant, so the retransmission that finally
+     * arrives has to stay a duplicate in flight — a concluded claim would send it to the replay
+     * cache, whose "replay" answer makes the service tear the new link down, and the Desktop's
+     * window would then time out with no way back.
      */
     @Test
-    fun concludePeerAtGraceExpiryReleasesOnlyThatPeersChallenges() {
+    fun releaseForRetryKeepsTheClaimSoTheArrivalOnTheReconnectedLinkIsADuplicate() {
         assertEquals(
             BleAuthRequestGate.Decision.Process,
             gate.decide(challenge, nowSeconds, peer, claimsTransport(true)),
@@ -179,20 +182,99 @@ class BleAuthRequestGateTest {
             gate.decide(otherChallenge, nowSeconds, otherPeer, claimsTransport(true)),
         )
 
-        gate.concludePeer(peer)
+        // The grace expired with nothing on this peer's link left to answer.
+        gate.releaseForRetry(peer)
 
-        assertEquals(1, gate.inFlightCount)
-        // The abandoned request is concluded: nothing is held for it any more, so the next arrival
-        // is decided by the replay cache again, exactly as for a request whose answer was sent.
+        assertTrue(
+            "the claim has to stay, it is only released for a retry",
+            gate.holdsClaimFor(peer),
+        )
+        assertTrue(gate.wasReleasedForRetry(challenge))
+        assertFalse(
+            "another peer's claim is not this release's to mark",
+            gate.wasReleasedForRetry(otherChallenge),
+        )
+        assertEquals("no claim may be concluded by the grace", 2, gate.inFlightCount)
+
+        // The retransmission from the same peer on the reconnected link: still a duplicate, and the
+        // replay cache — whose answer for these bytes is "replay" — is never asked.
         assertEquals(
-            BleAuthRequestGate.Decision.Replay,
+            BleAuthRequestGate.Decision.Duplicate,
             gate.decide(challenge, nowSeconds, peer, claimsTransport(true)),
         )
+        assertEquals(
+            "a released claim must not be swallowed as a replay",
+            2,
+            replayChecks.get(),
+        )
+
+        // And the other peer's open prompt is untouched by that release.
         assertEquals(
             BleAuthRequestGate.Decision.Duplicate,
             gate.decide(otherChallenge, nowSeconds, otherPeer, claimsTransport(true)),
         )
-        assertEquals("only the released peer's claim may be gone", 1, gate.inFlightCount)
+        assertFalse(gate.wasReleasedForRetry(otherChallenge))
+        assertEquals(2, replayChecks.get())
+    }
+
+    /**
+     * An answer being *built* is not the Client receiving it: the grant or denial is recorded
+     * before the write, and that write fails on the handle the link died under. Concluding a claim
+     * whose prompt the user answered therefore discards a completed approval and hands the
+     * retransmission that finally arrives to the replay cache — which answers "replay", disconnects
+     * the fresh link, and leaves the Desktop with no way back for the rest of its window. So the
+     * release covers an answered claim exactly like an unanswered one.
+     */
+    @Test
+    fun anAnsweredChallengeIsReleasedForRetrySoTheRetransmissionAfterALostAnswerIsNotAReplay() {
+        assertEquals(
+            BleAuthRequestGate.Decision.Process,
+            gate.decide(challenge, nowSeconds, peer, claimsTransport(true)),
+        )
+
+        // The user approved while the link was down: the answer was recorded, never written.
+        gate.releaseForRetry(peer)
+
+        assertTrue("the claim must survive an answered prompt too", gate.holdsClaimFor(peer))
+        assertTrue(gate.wasReleasedForRetry(challenge))
+        assertEquals("the release concludes nothing", 1, gate.inFlightCount)
+
+        // The Client reconnected and retransmits the challenge it never got the verdict for.
+        assertEquals(
+            BleAuthRequestGate.Decision.Duplicate,
+            gate.decide(challenge, nowSeconds, peer, claimsTransport(true)),
+        )
+        assertEquals("a lost answer must not be swallowed as a replay", 1, replayChecks.get())
+    }
+
+    /**
+     * `retryStarted` consumes the release, so exactly one fresh prompt follows each release and the
+     * arrival after that is a plain duplicate of the prompt it raised.
+     */
+    @Test
+    fun retryStartedConsumesTheRelease() {
+        assertEquals(
+            BleAuthRequestGate.Decision.Process,
+            gate.decide(challenge, nowSeconds, peer, claimsTransport(true)),
+        )
+        gate.releaseForRetry(peer)
+        assertTrue(gate.wasReleasedForRetry(challenge))
+
+        gate.retryStarted(challenge)
+
+        assertFalse(
+            "the retry the release announced is being raised",
+            gate.wasReleasedForRetry(challenge),
+        )
+        assertTrue("the claim the retry feeds on is still held", gate.holdsClaimFor(peer))
+        // A second copy is a duplicate of the prompt the retry just raised, and the gate is not
+        // consulted about a retry it already granted.
+        assertEquals(
+            BleAuthRequestGate.Decision.Duplicate,
+            gate.decide(challenge, nowSeconds, peer, claimsTransport(true)),
+        )
+        assertEquals("a retried challenge never reaches the replay cache", 1, replayChecks.get())
+        assertEquals(1, gate.inFlightCount)
     }
 
     @Test

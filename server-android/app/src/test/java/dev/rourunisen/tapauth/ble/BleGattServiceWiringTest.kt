@@ -13,18 +13,19 @@ import org.junit.Test
  * `BleGattService` is an Android `Service` whose callbacks take a framework `BluetoothGatt`, so
  * neither the `STATE_DISCONNECTED` handler nor the response-delivery loop can be constructed off a
  * device. That leaves real defects with no failing test anywhere: re-adding
- * `authRequestGate.concludePeer(deviceAddress)` to the disconnect handler (a reconnect inside the
- * grace would then reach the replay cache, be called a replay and tear the new link down, killing
- * the prompt), and dropping the confirmation from the retirement call (every loop end — including a
- * link that died mid-delivery — would retire the held bytes and the re-delivery path becomes dead
- * code). The same holds for the effect each verdict of `BleAuthRequestGate.decide` maps to here: a
- * `disconnect` added to the duplicate arm compiles and keeps every gate test green. The same holds
- * for the receipt log line, which carries the caller's own `username` and `hostname`: whether they
- * are wrapped in `scrubLogValue` is a property of one `Log.d` argument, which no JVM test can read
- * back. A source guard is the only executable statement of those contracts a unit test can make: it
- * is deliberately a parse of the shipped call sites, in the spirit of
- * `client-pam/src/source_guards.rs`, and it does not replace the instrumentation suite that
- * exercises the behaviour.
+ * `authRequestGate.releaseForRetry(deviceAddress)` to the disconnect handler (a reconnect inside
+ * the grace would then reach the replay cache, be called a replay and tear the new link down,
+ * killing the prompt), and dropping the confirmation from the retirement call (every loop end —
+ * including a link that died mid-delivery — would retire the held bytes and the re-delivery path
+ * becomes dead code). The same holds for the effect each outcome of `BleAuthRequestGate.decide` and
+ * of `BleDisconnectGrace` maps to here: a `disconnect` added to the duplicate arm, or a `return`
+ * before the prompt a released challenge has to be re-offered at, compiles and keeps every gate,
+ * grace and handoff test green. The same holds for the receipt log line, which carries the caller's
+ * own `username` and `hostname`: whether they are wrapped in `scrubLogValue` is a property of one
+ * `Log.d` argument, which no JVM test can read back. A source guard is the only executable
+ * statement of those contracts a unit test can make: it is deliberately a parse of the shipped call
+ * sites, in the spirit of `client-pam/src/source_guards.rs`, and it does not replace the
+ * instrumentation suite that exercises the behaviour.
  *
  * A failure here means the rule moved or changed shape: re-read `BleGattService.kt`, then fix
  * whichever side is wrong. The file is found by walking up from the test's working directory
@@ -44,9 +45,9 @@ class BleGattServiceWiringTest {
         // still held. Released here, it reaches the replay cache, which answers "replay" and
         // disconnects the new link — the prompt dies with it.
         assertFalse(
-            "STATE_DISCONNECTED must not call authRequestGate.concludePeer before the grace " +
-                "has expired; found it in:\n$branch",
-            branch.contains(CONCLUDE_PEER),
+            "STATE_DISCONNECTED must not call authRequestGate.releaseForRetry before the " +
+                "grace has expired; found it in:\n$branch",
+            branch.contains(RELEASE_CALL),
         )
 
         // Same defect class, one registry over: the answer held for the peer is the other thing a
@@ -62,17 +63,32 @@ class BleGattServiceWiringTest {
         }
     }
 
+    /**
+     * The peer's claim is released at exactly one place, and that place is the `ReleaseAndCancel`
+     * arm of the decision the grace coroutine asks after it has waited out the grace.
+     *
+     * Each half is a defect of its own: a release that runs before the wait, or in the branch
+     * rather than in the coroutine, drops a claim whose peer is merely reconnecting; a release
+     * outside the decision's arm fires for a device that did come back; and a release that is
+     * missing entirely leaves an unanswered prompt alive behind a dead link. The decision itself
+     * has to be asked once and after the wait, or it is being asked with facts that cannot be true
+     * yet.
+     */
     @Test
-    fun theGateIsReleasedOnceAndOnlyInsideTheGraceExpiryBlock() {
+    fun theGateIsReleasedOnceAndOnlyInsideTheGraceExpiryArm() {
         assertEquals(
             "the peer's claims are released at exactly one place: the grace-expiry release",
             1,
-            source.split(CONCLUDE_PEER).size - 1,
+            source.split(RELEASE_CALL).size - 1,
+        )
+        assertEquals(
+            "the disconnect branch must ask the grace decision exactly once",
+            1,
+            source.split(GRACE_DECISION).size - 1,
         )
 
-        // …and that place must be inside the coroutine that waits out the grace first, so a link
-        // that stays down leaves nothing held and a link that comes back leaves its claim alone.
-        val launch = source.indexOf(SERVICE_SCOPE_LAUNCH, source.indexOf(DISCONNECTED_ARM))
+        val start = source.indexOf(DISCONNECTED_ARM)
+        val launch = source.indexOf(SERVICE_SCOPE_LAUNCH, start)
         assertTrue("the disconnect branch must start its grace coroutine", launch >= 0)
         val graceWait = source.indexOf(GRACE_WAIT, launch)
         assertTrue("the grace coroutine must await $GRACE_WAIT", graceWait > launch)
@@ -81,32 +97,110 @@ class BleGattServiceWiringTest {
             "the grace block is delimited by `$GRACE_BLOCK_END`; re-read BleGattService.kt",
             graceBlockEnd > graceWait,
         )
-        val conclude = source.indexOf(CONCLUDE_PEER)
+
+        val decision = source.indexOf(GRACE_DECISION)
         assertTrue(
-            "authRequestGate.concludePeer must run after $GRACE_WAIT, inside the grace-expiry " +
-                "block (offset $conclude not in $graceWait..$graceBlockEnd)",
-            conclude > graceWait && conclude < graceBlockEnd,
+            "`$GRACE_DECISION` must run after $GRACE_WAIT, inside the grace-expiry block " +
+                "(offset $decision not in $graceWait..$graceBlockEnd)",
+            decision > graceWait && decision < graceBlockEnd,
         )
-        // The `if` is the invariant, not the wait: above it the release also fires for a device
-        // that *did* reconnect inside the grace, whose next retransmission then reaches the replay
-        // cache and gets the fresh link torn down — the original bug, one indentation level out.
-        val reconnectCheck = source.indexOf(RECONNECT_CHECK, graceWait)
+
+        // The `when` on that decision is the invariant: above it the release also fires for a
+        // device that *did* reconnect inside the grace, whose next retransmission then reaches the
+        // replay cache and gets the fresh link torn down — the original bug, one indentation level
+        // out.
+        val release = source.indexOf(RELEASE_CALL)
         assertTrue(
-            "the release must sit inside the reconnect check `$RECONNECT_CHECK` that follows " +
-                "$GRACE_WAIT (offset $reconnectCheck not in $graceWait..$graceBlockEnd)",
-            reconnectCheck > graceWait && reconnectCheck < graceBlockEnd,
+            "`$RELEASE_CALL` must run after `$GRACE_DECISION` (offset $release vs $decision)",
+            release > decision,
+        )
+        val arm = source.indexOf(RELEASE_ARM, decision)
+        assertTrue(
+            "the release must sit inside the `$RELEASE_ARM` arm of the decision (offset $arm not " +
+                "after the decision at $decision)",
+            arm > decision && arm < graceBlockEnd,
+        )
+        // The arm is bounded by its own `when`: the next `BleDisconnectGrace.Outcome.` label is not
+        // a bound at all here (this is the only one in the file), so a release moved into the
+        // `else ->` or hoisted just after the `when` would still satisfy a block-wide bound.
+        val armEnd = source.indexOf(OUTCOME_ELSE, arm + RELEASE_ARM.length)
+        assertTrue(
+            "the `$RELEASE_ARM` arm must be closed by `$OUTCOME_ELSE` (offset $armEnd not in " +
+                "$arm..$graceBlockEnd)",
+            armEnd > arm && armEnd < graceBlockEnd,
         )
         assertTrue(
-            "authRequestGate.concludePeer must be inside `$RECONNECT_CHECK`: released above it, a " +
-                "device that reconnected inside the grace loses its claim and its retransmission " +
-                "is answered as a replay (release at $conclude, check at $reconnectCheck)",
-            conclude > reconnectCheck && conclude < graceBlockEnd,
+            "`$RELEASE_CALL` must be inside `$RELEASE_ARM` (offset $release not in $arm..$armEnd); " +
+                "released anywhere else — the `else ->` of that `when`, or just after it — a device " +
+                "that reconnected inside the grace loses its claim and its retransmission is " +
+                "answered as a replay",
+            release > arm && release < armEnd,
         )
+
         // Outside that block the release would be unconditional on a reconnect having happened,
         // which is the disconnect-handler bug the first test refuses.
         assertTrue(
             "the release must stay inside the disconnect branch's grace coroutine",
-            conclude < source.indexOf(CLOSED_HANDLE_TOMBSTONE, launch),
+            release < source.indexOf(CLOSED_HANDLE_TOMBSTONE, launch),
+        )
+
+        // …and it is the arm's LAST effect. Marking the release first lets a retransmission that
+        // lands before the cancel below be answered as a retry: the fresh prompt it registers is
+        // then claimed and cancelled by that call, so the challenge keeps no prompt, no mark and
+        // no disconnect, and every later copy of it is a silent duplicate.
+        val abandoned = source.indexOf(ABANDON_PEER_CALL, arm)
+        assertTrue(
+            "`$ABANDON_PEER_CALL` must run before the release inside `$RELEASE_ARM` (offset " +
+                "$abandoned vs $release)",
+            abandoned > arm && abandoned < release,
+        )
+        val cancelled = source.indexOf(CANCEL_BY_DISCONNECTION_CALL, arm)
+        assertTrue(
+            "`$CANCEL_BY_DISCONNECTION_CALL` must run before the release inside `$RELEASE_ARM` " +
+                "(offset $cancelled vs $release)",
+            cancelled > arm && cancelled < release,
+        )
+    }
+
+    /**
+     * The facts the grace decision is asked with come from the service's own registries, and
+     * nothing else in the suite binds them: `BleDisconnectGraceTest` proves the rule *given* the
+     * facts, so a `reconnected = false` literal here compiles and keeps every test green while each
+     * expiry releases a peer whose link is up — the original bug, one call site up. `claimHeld` has
+     * the mirror-image failure: a literal `false` makes the expiry do nothing at all, so an
+     * unanswered prompt outlives its link forever. And a `disconnectedAtMillis = null` makes every
+     * expiry `KeepWaiting` — no cancel, no release, an orphaned prompt — while the other two read
+     * perfectly, so the drop time has to be pinned to the measured reading as well.
+     */
+    @Test
+    fun theGraceDecisionIsAskedWithTheServicesOwnLiveFacts() {
+        val launch = source.indexOf(SERVICE_SCOPE_LAUNCH, source.indexOf(DISCONNECTED_ARM))
+        assertTrue("the disconnect branch must start its grace coroutine", launch >= 0)
+        val graceWait = source.indexOf(GRACE_WAIT, launch)
+        assertTrue("the grace coroutine must await $GRACE_WAIT", graceWait > launch)
+        val decision = source.indexOf(GRACE_DECISION, graceWait)
+        assertTrue(
+            "`$GRACE_DECISION` must be asked after $GRACE_WAIT (offset $decision vs $graceWait), " +
+                "or the facts it is given are from before the grace began",
+            decision > graceWait,
+        )
+
+        val facts = argumentsOf(LINK_FACTS_CALL)
+        assertTrue(
+            "the decision must be told whether the peer still holds a claim, from the gate " +
+                "(`$CLAIM_HELD_ARGUMENT`); facts: $facts",
+            facts.contains(CLAIM_HELD_ARGUMENT),
+        )
+        assertTrue(
+            "the decision must be told whether the peer is connected again, from the connection " +
+                "registry (`$RECONNECTED_ARGUMENT`); facts: $facts",
+            facts.contains(RECONNECTED_ARGUMENT),
+        )
+        assertTrue(
+            "the decision must be given the drop time the grace is measured from " +
+                "(`$DISCONNECTED_AT_ARGUMENT`); a literal null there makes every expiry wait " +
+                "forever; facts: $facts",
+            facts.contains(DISCONNECTED_AT_ARGUMENT),
         )
     }
 
@@ -273,15 +367,18 @@ class BleGattServiceWiringTest {
     private fun String.normalized(): String = replace(Regex("\\s+"), " ").trim()
 
     /**
-     * The service performs one effect per outcome of `BleAuthRequestGate.decide`, and the ordering
-     * that produces the outcome is no longer here to be re-edited.
+     * The service performs one effect per outcome of `BleAuthRequestGate.decide` — and, inside the
+     * duplicate arm, per outcome of `BleDisconnectGrace` — and the ordering that produces the
+     * outcome is not here to be re-edited.
      *
      * The two halves are what the JVM tests either side cannot state: `BleAuthRequestGateTest`
      * knows the gate answers `Replay` for a foreign peer but not that the service disconnects it
-     * (the property the gate exists to preserve), and `BleResponseHandoffTest` never runs the
-     * duplicate arm at all. Adding a `disconnect` to the duplicate path compiles, keeps every gate
-     * and handoff test green, and tears down the link whose prompt the user is answering — the
-     * original defect.
+     * (the property the gate exists to preserve), and neither `BleResponseHandoffTest` nor
+     * `BleDisconnectGraceTest` runs the duplicate arm at all. Adding a `disconnect` to the
+     * duplicate path compiles, keeps every gate and handoff test green, and tears down the link
+     * whose prompt the user is answering — the original defect. So does returning from the arm
+     * before the prompt a released challenge has to be re-offered at: the release then swallows the
+     * very retransmission it exists to recover.
      */
     @Test
     fun theDecisionIsMappedToOneEffectPerOutcome() {
@@ -293,13 +390,58 @@ class BleGattServiceWiringTest {
 
         val duplicate = decisionArm("Duplicate")
         assertTrue(
+            "the Duplicate arm must ask what the duplicate means before acting on it:\n$duplicate",
+            duplicate.contains(ON_DUPLICATE_CALL),
+        )
+        assertTrue(
             "the Duplicate arm must re-deliver the held answer on the handle the Client " +
                 "reconnected on:\n$duplicate",
             duplicate.contains(REDELIVER_CALL),
         )
+        // A prompt the grace released is gone, so its challenge is re-offered: without the fall-
+        // through, the arriving copy is a silent duplicate and the Desktop waits out its window for
+        // a prompt nobody ever sees.
+        assertTrue(
+            "the Duplicate arm must mark the arrival it must re-offer as a retry:\n$duplicate",
+            duplicate.contains(RETRY_FLAG_SET),
+        )
+        for (effect in DISCONNECT_EFFECTS) {
+            assertFalse(
+                "the Duplicate arm must not disconnect the link the prompt still needs " +
+                    "(`$effect`):\n$duplicate",
+                duplicate.contains(effect),
+            )
+        }
+        // And the retry has to reach the prompt: the arm falls through to the shared rate limiter
+        // and the prompt, exactly like the Process outcome.
+        val retry = outcomeArm("Retry")
+        assertTrue(
+            "the Retry arm must mark the arrival it re-offers:\n$retry",
+            retry.contains(RETRY_FLAG_SET),
+        )
         assertFalse(
-            "the Duplicate arm must not disconnect the link the prompt still needs:\n$duplicate",
-            duplicate.contains("disconnect"),
+            "the Retry arm must fall through to the prompt, not end the arrival:\n$retry",
+            retry.contains("return"),
+        )
+        // The release is consumed only once the limiter admitted the retry and the prompt is about
+        // to be registered: consumed up in the arm, a rate-limited or throwing retry would leave
+        // the challenge with no prompt, no mark and no disconnect, and every later copy of it a
+        // silent duplicate.
+        assertFalse(
+            "the release must not be consumed before the rate limiter sees the retry:\n$retry",
+            retry.contains(RETRY_STARTED_CALL),
+        )
+        val started = source.indexOf(RETRY_STARTED_CALL)
+        assertTrue(
+            "`$RETRY_STARTED_CALL` must follow `$ADMIT_CALL` (offset $started vs " +
+                "$ADMIT_CALL at ${source.indexOf(ADMIT_CALL)})",
+            started > source.indexOf(ADMIT_CALL),
+        )
+        val submit = source.indexOf(SUBMIT_CALL, source.indexOf(ADMIT_CALL))
+        assertTrue(
+            "`$RETRY_STARTED_CALL` must precede `$SUBMIT_CALL` (offset $started vs $submit), or the " +
+                "prompt it belongs to is registered before the mark is cleared",
+            submit > started,
         )
 
         // A different peer replaying the same captured bytes is decided as Replay, and that
@@ -366,6 +508,42 @@ class BleGattServiceWiringTest {
         return source.substring(start, end)
     }
 
+    /**
+     * The body of one `BleDisconnectGrace.Outcome` arm of the duplicate branch's `when`: from its
+     * label to the `else ->` that closes the `when`.
+     */
+    private fun outcomeArm(variant: String): String {
+        val label = OUTCOME_PREFIX + variant + " ->"
+        val start = source.indexOf(label)
+        assertTrue("`$label` must be an arm of the duplicate's `when`", start >= 0)
+        val end = source.indexOf(OUTCOME_ELSE, start + label.length)
+        assertTrue("`$label` must be followed by `$OUTCOME_ELSE`", end > start)
+        return source.substring(start, end)
+    }
+
+    /**
+     * The argument list of the first `call` in the source — from the call's own `(` to its matching
+     * `)` — with whitespace and line breaks collapsed, so the shape is compared and not the
+     * formatting.
+     */
+    private fun argumentsOf(call: String): String {
+        val start = source.indexOf(call)
+        assertTrue("`$call` must exist in BleGattService.kt", start >= 0)
+        var depth = 0
+        var index = start + call.length - 1
+        while (index < source.length) {
+            when (source[index]) {
+                '(' -> depth++
+                ')' -> {
+                    depth--
+                    if (depth == 0) return source.substring(start, index + 1).normalized()
+                }
+            }
+            index++
+        }
+        throw AssertionError("`$call` is never closed in BleGattService.kt")
+    }
+
     /** `STATE_DISCONNECTED` up to the grace coroutine it starts, i.e. the pre-teardown body. */
     private fun disconnectBranchUpToItsGraceCoroutine(): String {
         val start = source.indexOf(DISCONNECTED_ARM)
@@ -396,13 +574,35 @@ class BleGattServiceWiringTest {
         const val DISCONNECTED_ARM = "BluetoothProfile.STATE_DISCONNECTED -> {"
         const val SERVICE_SCOPE_LAUNCH = "serviceScope.launch {"
         const val GRACE_WAIT = "delay(BLE_DISCONNECT_CANCEL_GRACE_MS)"
-        const val CONCLUDE_PEER = "authRequestGate.concludePeer("
 
-        /** The reconnect test the grace-expiry release has to stay inside. */
-        const val RECONNECT_CHECK = "if (!connectingOrConnectedDevices.contains(deviceAddress))"
+        /** The one expiry release; it may only run inside the grace expiry's own arm. */
+        const val RELEASE_CALL = "authRequestGate.releaseForRetry("
 
-        /** Ways to drop held response state; only the grace expiry may use them. */
-        val DROPPING_HELD_STATE = listOf("abandonPeer(", "clear(")
+        /** The question the grace coroutine asks once the wait is over. */
+        const val GRACE_DECISION = "disconnectGrace.onGraceExpired("
+
+        /** The facts that question is given, and the three it has to be built from. */
+        const val LINK_FACTS_CALL = "BleDisconnectGrace.LinkFacts("
+        const val CLAIM_HELD_ARGUMENT = "claimHeld = authRequestGate.holdsClaimFor(deviceAddress)"
+        const val RECONNECTED_ARGUMENT =
+            "reconnected = connectingOrConnectedDevices.contains(deviceAddress)"
+        const val DISCONNECTED_AT_ARGUMENT = "disconnectedAtMillis = disconnectedAtMillis"
+
+        /** The one arm of that decision that may release anything. */
+        const val RELEASE_ARM = "BleDisconnectGrace.Outcome.ReleaseAndCancel ->"
+
+        /** The effects the release arm has to run before it marks the release. */
+        const val ABANDON_PEER_CALL = "pendingResponses.abandonPeer("
+        const val CANCEL_BY_DISCONNECTION_CALL = "cancelRequestsByBleDisconnection("
+
+        /** The variant prefix of each `BleDisconnectGrace.Outcome` arm. */
+        const val OUTCOME_PREFIX = "BleDisconnectGrace.Outcome."
+
+        /** How the duplicate branch's `when` ends, i.e. where the last arm's body stops. */
+        const val OUTCOME_ELSE = "else ->"
+
+        /** Ways to drop held state; only the grace expiry may use them. */
+        val DROPPING_HELD_STATE = listOf(RELEASE_CALL, "abandonPeer(", "clear(")
 
         /** The first line after the grace coroutine, where the torn-down handle is tombstoned. */
         const val GRACE_BLOCK_END = "// The handle is closed below"
@@ -430,6 +630,18 @@ class BleGattServiceWiringTest {
 
         /** What the Duplicate arm does instead of disconnecting: write the held answer again. */
         const val REDELIVER_CALL = "redeliverPendingResponse("
+
+        /**
+         * What the Duplicate arm asks about the arriving copy, how it flags one it must re-offer,
+         * and where the release that flag announced is consumed.
+         */
+        const val ON_DUPLICATE_CALL = "disconnectGrace.onDuplicate("
+        const val RETRY_FLAG_SET = "retryingReleasedChallenge = true"
+        const val RETRY_STARTED_CALL = "authRequestGate.retryStarted("
+        const val SUBMIT_CALL = "submitRequest("
+
+        /** The effects that end a link, which the Duplicate arm must not perform. */
+        val DISCONNECT_EFFECTS = listOf("disconnectGatt(", "gatt.disconnect()")
 
         /** What the receipt line must log: the two caller strings, scrubbed. */
         val SCRUBBED_RECEIPT_FIELDS =
