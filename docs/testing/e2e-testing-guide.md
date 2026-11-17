@@ -94,8 +94,10 @@ Pairing runs over the same two transports as authentication — there is no TCP 
 3. The pending session is cancelled via `pam-cancel` IPC; the blocked client exits promptly with `OUTCOME=IGNORE` (never `SUCCESS`).
 
 ### Phase 2d: Adversarial UDP — Tampered Ciphertext
-1. The captured grant is re-injected with a flipped bit inside the AES-256-GCM tag (protobuf framing and temporal ID stay intact).
-2. The daemon fails AEAD verification, aborts fail-closed (`OUTCOME=IGNORE` → PAM password fallback), and logs "Failed to decrypt response packet".
+1. With auto-grant **on**, the captured grant is re-injected with a flipped bit inside the AES-256-GCM tag (protobuf framing and temporal ID stay intact) while a fresh auth session is pending and before the phone's own grant lands.
+2. The daemon reaches AEAD verification, fails it, and **drops** the datagram rather than treating it as a response: it logs "Failed to decrypt response packet" and keeps waiting. The rule under test is that an attempt concludes only on a verified response from an authorised server, on its own deadline, or on an explicit local cancel or user denial — never on an arbitrary datagram from the link, which would let any host on it end an authentication with one frame.
+3. The phone's real grant then authenticates the session: `pam-auth` prints `OUTCOME=SUCCESS`, exits 0, and the daemon attributes the grant to `Udp` (BLE is disabled for this phase, so the success cannot have come from the other transport). The phase therefore asserts the strictly stronger property — the injection is dropped **and** a genuine authentication still completes — instead of the fail-closed abort it asserted before that rule existed.
+4. The warn is the aggregate drop warning: it carries that phrase on its first occurrence and is then rate-limited to one per 60 s (`DROP_WARN_INTERVAL`, `tapauthd/src/auth_handler.rs`), with per-frame detail at `debug`, so an unauthenticated host cannot turn one datagram into unbounded journal output. This phase's injection is the only frame in the suite that fails AEAD, so the occurrence it asserts is the first one.
 
 ### Phase 3: Bluetooth Low Energy (BLE) Authentication
 1. Desktop enables BLE transport and disables UDP (`set-transports --network false --ble true`).

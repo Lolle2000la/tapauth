@@ -177,11 +177,14 @@ record (named by subject, not shown by SHA):
   an attempt now concludes only on a verified response from an authorised server, on
   its own deadline, or on an explicit local cancel/denial. Anything undecodable or
   unauthenticated from an arbitrary source is dropped and the attempt continues, with
-  rate-limited logging so the drop path is not itself an amplification vector. This
-  also covers the replayed-frame case: a replay that previously reported
-  `WaitOutcome::Timeout` (and so widened the retransmission interval, letting a host
-  that captured one datagram thin the requests aimed at the phone) is now a drop that
-  leaves the interval alone.
+  rate-limited logging so the drop path is not itself an amplification vector.
+  **That commit also closes the replayed-frame backoff nit — as a consequence, not by a
+  change of its own:** a replayed frame used to be classified `WaitOutcome::Timeout`,
+  which counts as "the request went unanswered" and widened the retransmission
+  interval, so a host that captured one datagram and replayed it could thin the
+  requests aimed at the phone that may answer. It is now `WaitOutcome::Unattributable`,
+  the same classification as every other frame that does not authenticate, and a drop
+  leaves the interval alone. There is nothing left to fix here.
 * **`feat(ble): apply post-auth rate limiting on the BLE path`** — the BLE transport
   now applies the same post-authentication limiter as UDP, keyed on the authenticated
   client public key, so a hammering client is throttled and one client's key cannot
