@@ -26,6 +26,25 @@ use crate::protocol::pb::EncryptedPacket;
 
 const MAX_UDP_MESSAGE_SIZE: usize = 16 * 1024; // 16KB, matches TCP pairing path
 
+/// Whether a received datagram is small enough to hand to `EncryptedPacket::decode`.
+///
+/// The one spelling of the cap: the receive loop below gates on it before decoding, so
+/// the largest thing a peer can make this process decode is `MAX_UDP_MESSAGE_SIZE`.
+/// Crate-visible rather than public — the `fuzz/` target reaches it through
+/// `datagram_within_size_cap_for_fuzz` (`fuzz-api`).
+pub(crate) fn datagram_within_size_cap(len: usize) -> bool {
+    len <= MAX_UDP_MESSAGE_SIZE
+}
+
+/// `fuzz-api` only: [`datagram_within_size_cap`], so the packet-decode target's domain
+/// is the set of datagrams this receive path would actually decode. Uncompiled in every
+/// other configuration.
+#[cfg(feature = "fuzz-api")]
+#[doc(hidden)]
+pub fn datagram_within_size_cap_for_fuzz(len: usize) -> bool {
+    datagram_within_size_cap(len)
+}
+
 /// How often the aggregate "dropped a datagram" warning may fire.
 ///
 /// The receive port is reachable by every host on the link, so the rate of
@@ -672,7 +691,7 @@ pub async fn receive_udp_packet(
                 "buffer length mismatch",
             ))
         })?;
-        if packet_bytes.len() > MAX_UDP_MESSAGE_SIZE {
+        if !datagram_within_size_cap(packet_bytes.len()) {
             record_dropped_datagram(
                 "larger than the maximum datagram size",
                 addr,
@@ -799,6 +818,58 @@ mod tests {
             // Every returned interface carries at least one usable address.
             assert!(iface.ipv4.is_some() || iface.ipv6.is_some());
         }
+    }
+
+    /// Both halves of the read-then-write handoff must compare the address.
+    ///
+    /// A refresh whose result is written but then compared against a stale
+    /// local (what a "don't hold the lock across a syscall" refactor produces)
+    /// answers `false` for every address, including the host's own. A
+    /// membership test replaced by a non-emptiness check answers `true` for
+    /// every address. Neither shows up on one execution of the other's path,
+    /// so the documentation address is asserted on the cold cache (the write
+    /// path, which nothing else in this binary warms) and again on the warm one
+    /// (the fast read path), and the host's own addresses are asserted warm.
+    #[test]
+    fn an_interface_address_is_local_and_a_documentation_address_is_not() {
+        // Loopback short-circuits before the cache, so this holds on any host.
+        assert!(is_local_ip(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(is_local_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+
+        // TEST-NET-3 (RFC 5737) is reserved for documentation and belongs to no
+        // interface. A host that really used it would fail here, and that is the
+        // only assumption this assertion makes.
+        let documentation = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        assert!(
+            !is_local_ip(&documentation),
+            "the cold cache answered true for an address no interface carries"
+        );
+
+        let mut checked = 0usize;
+        for iface in get_multicast_interfaces() {
+            for addr in [iface.ipv4.map(IpAddr::V4), iface.ipv6.map(IpAddr::V6)]
+                .into_iter()
+                .flatten()
+            {
+                assert!(
+                    is_local_ip(&addr),
+                    "{addr} is assigned to {} but is_local_ip said it is not local",
+                    iface.name
+                );
+                checked += 1;
+            }
+        }
+
+        if checked == 0 {
+            // No non-loopback interface on this host, so the refresh path has
+            // no address to be right about and only the loopback half applies.
+            return;
+        }
+
+        assert!(
+            !is_local_ip(&documentation),
+            "the warm cache answered true for an address no interface carries"
+        );
     }
 
     #[test]
