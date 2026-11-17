@@ -930,6 +930,96 @@ fn transcript_hash_binds_every_negotiated_field() {
     assert_eq!(phone.sas().unwrap(), baseline_sas.as_str());
 }
 
+/// The transcript commits to an advertisement as **raw wire ids**: a peer that also
+/// advertises an id this build cannot name produces a different `H` than the same peer
+/// advertising only the baseline, even though both negotiate the same suite.
+///
+/// The defect this catches: hashing the *decoded* lists. `[1, 3]` and `[1]` decode to
+/// the same `[AES_256_GCM]`, so two peers that put different bytes on the wire would
+/// derive the same `H` — and therefore the same keys and SAS — from a transcript that
+/// depends on what the *receiver* could name.
+#[test]
+fn an_unknown_advertised_id_changes_the_transcript_hash() {
+    let session_id = [0x6Eu8; PAIRING_SESSION_ID_LEN];
+
+    let mut baseline = seeded_desktop(session_id);
+    baseline
+        .handle_init(&init_with_algorithms(vec![1], vec![1], vec![1]))
+        .unwrap();
+    let baseline_hash = *baseline.transcript_hash().unwrap();
+
+    let mut extra = seeded_desktop(session_id);
+    let response = extra
+        .handle_init(&init_with_algorithms(vec![1, 3], vec![1], vec![1]))
+        .unwrap()
+        .clone();
+    let extra_hash = *extra.transcript_hash().unwrap();
+
+    // The unknown id is skipped by the negotiation...
+    assert_eq!(
+        response.selected_symmetric_algorithm,
+        SymmetricAlgorithm::Aes256Gcm as i32
+    );
+    assert_eq!(
+        extra.negotiated(),
+        baseline.negotiated(),
+        "an id neither side can name must not change what is negotiated"
+    );
+    // ...but it is not skipped by the transcript.
+    assert_ne!(
+        extra_hash, baseline_hash,
+        "the advertised list must enter H as the raw wire ids, not as the ids this \
+         build can name"
+    );
+}
+
+/// Both roles commit to the same advertisement for the same wire ids, **including**
+/// when it names an id this build cannot name: the phone's `H` over what it sent
+/// equals the desktop's `H` over what it received, so the signatures, the keys and the
+/// SAS all still agree and the pairing completes.
+///
+/// The defect this catches: one role hashing the wire ids while the other hashes the
+/// decoded list. A newer peer's extra id would then leave the two sides with different
+/// `H`, different keys and different SAS, and the pairing would die at the signature
+/// check *after* negotiating successfully — the failure the forward-compatibility rule
+/// exists to prevent.
+#[test]
+fn both_roles_hash_the_same_raw_advertisement() {
+    let session_id = [0x6Fu8; PAIRING_SESSION_ID_LEN];
+    let mut desktop = seeded_desktop(session_id);
+    let qr_pk = desktop.client_x25519_public_key();
+    let mut phone = seeded_phone(session_id);
+    // As a newer build would advertise: its own baseline, plus an id this one cannot
+    // name. Only the test seam can produce the second, which is why the rule has no
+    // other way to be exercised.
+    phone.set_advertised_unknown(vec![3]).unwrap();
+
+    let init = phone.create_init().unwrap();
+    assert_eq!(
+        init.supported_symmetric_algorithms,
+        vec![SymmetricAlgorithm::Aes256Gcm as i32, 3],
+        "the unknown id must travel on the wire, after this build's own list"
+    );
+
+    let response = desktop.handle_init(&init).unwrap().clone();
+    // The desktop's signature is over *its* `H`; the phone accepting it is the phone
+    // recomputing `H` from its own view of the same advertisement.
+    phone.verify_response(&response, &qr_pk).unwrap();
+
+    assert_eq!(
+        desktop.transcript_hash(),
+        phone.transcript_hash(),
+        "the two roles must hash the same bytes for the same advertisement"
+    );
+    assert_eq!(desktop.sas().unwrap(), phone.sas().unwrap());
+    assert_eq!(
+        desktop.negotiated().unwrap().symmetric_algorithm,
+        SymmetricAlgorithm::Aes256Gcm,
+        "the unknown id is skipped by the negotiation on both sides"
+    );
+    assert_eq!(phone.negotiated(), desktop.negotiated());
+}
+
 // --- 8. Client-wide algorithm pinning --------------------------------
 
 /// Pair a desktop started with `pinned` against a phone that advertises

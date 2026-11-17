@@ -253,10 +253,13 @@ impl ClientPairingState {
             server_ed25519_public_key: &server_ed25519_public_key,
             client_device_name: &live.client_device_name,
             server_device_name: &init.server_device_name,
-            // Exactly as received, order included: both sides must hash the same bytes.
-            supported_symmetric: &supported_symmetric,
-            supported_hash: &supported_hash,
-            supported_signature: &supported_signature,
+            // Exactly as received — every id, raw and in order, including one this
+            // build cannot name: the lists enter `H` as the bytes the peer sent, so
+            // the peer hashes the same values for the same advertisement. The decoded
+            // lists above are for the negotiation only, never for the transcript.
+            supported_symmetric: &init.supported_symmetric_algorithms,
+            supported_hash: &init.supported_hash_algorithms,
+            supported_signature: &init.supported_signature_algorithms,
             selected_symmetric: negotiated.symmetric_algorithm,
             selected_hash: negotiated.hash_algorithm,
             selected_signature: negotiated.signature_algorithm,

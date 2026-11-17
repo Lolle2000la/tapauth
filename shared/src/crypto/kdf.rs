@@ -36,9 +36,19 @@ pub struct PairingTranscript<'a> {
     pub server_ed25519_public_key: &'a [u8; 32],
     pub client_device_name: &'a str,
     pub server_device_name: &'a str,
-    pub supported_symmetric: &'a [SymmetricAlgorithm],
-    pub supported_hash: &'a [HashAlgorithm],
-    pub supported_signature: &'a [SignatureAlgorithm],
+    /// The peer's `supported_symmetric_algorithms` **as raw wire ids**, not as this
+    /// build's decoded variants.
+    ///
+    /// That is the whole point: a peer may advertise an id this build cannot name,
+    /// and `H` must still cover the bytes it sent. Decoding first would make the
+    /// transcript — and so the derived keys and the SAS — a function of what the
+    /// *receiver* could name, and two peers holding the same wire bytes would derive
+    /// different values (cryptography-specification.md §1 rule 4).
+    pub supported_symmetric: &'a [i32],
+    /// Raw wire ids, as [`PairingTranscript::supported_symmetric`].
+    pub supported_hash: &'a [i32],
+    /// Raw wire ids, as [`PairingTranscript::supported_symmetric`].
+    pub supported_signature: &'a [i32],
     pub selected_symmetric: SymmetricAlgorithm,
     pub selected_hash: HashAlgorithm,
     pub selected_signature: SignatureAlgorithm,
@@ -50,12 +60,14 @@ fn push_length_prefixed_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-/// Append `be32(n) || [be32(alg), ...]` for an algorithm list.
-fn push_algorithm_list<T: Copy + Into<i32>>(out: &mut Vec<u8>, algorithms: &[T]) {
+/// Append `be32(n) || [be32(id), ...]` for an algorithm list.
+///
+/// The ids are the raw wire values, so an id this build cannot name still contributes
+/// its bytes to `H` instead of being dropped with the decoder.
+fn push_algorithm_list(out: &mut Vec<u8>, algorithms: &[i32]) {
     out.extend_from_slice(&(algorithms.len() as u32).to_be_bytes());
     for algorithm in algorithms {
-        let encoded: i32 = (*algorithm).into();
-        out.extend_from_slice(&encoded.to_be_bytes());
+        out.extend_from_slice(&algorithm.to_be_bytes());
     }
 }
 
@@ -73,6 +85,11 @@ fn push_algorithm_list<T: Copy + Into<i32>>(out: &mut Vec<u8>, algorithms: &[T])
 ///
 /// The device-name lengths are UTF-8 **byte** lengths, matching the contract in
 /// cryptography-specification.md §2.2.
+///
+/// The three `supported_*` lists are framed exactly as their wire form is: the raw
+/// advertised ids, in the order they arrived, whatever this build can name. The three
+/// `selected_*` fields, by contrast, are the typed values the receiver validated, so
+/// an unnameable selection cannot reach this function at all.
 pub fn compute_pairing_transcript_hash(t: &PairingTranscript<'_>) -> [u8; 32] {
     let mut out = Vec::with_capacity(256);
 
@@ -221,11 +238,7 @@ mod tests {
         ced25519: &'a [u8; 32],
         sed25519: &'a [u8; 32],
         deprecated_names: &'a (&'a str, &'a str),
-        supported: &'a (
-            Vec<SymmetricAlgorithm>,
-            Vec<HashAlgorithm>,
-            Vec<SignatureAlgorithm>,
-        ),
+        supported: &'a (Vec<i32>, Vec<i32>, Vec<i32>),
     ) -> PairingTranscript<'a> {
         PairingTranscript {
             version: 2,
@@ -259,13 +272,17 @@ mod tests {
         let ced = [3u8; 32];
         let sed = [4u8; 32];
         let names = ("desktop", "phone");
+        // Raw wire ids, not variants: `0` is `*_UNSPECIFIED` on the wire.
         let supported = (
             vec![
-                SymmetricAlgorithm::Aes256Gcm,
-                SymmetricAlgorithm::Unspecified,
+                SymmetricAlgorithm::Aes256Gcm as i32,
+                SymmetricAlgorithm::Unspecified as i32,
             ],
-            vec![HashAlgorithm::Sha256, HashAlgorithm::Unspecified],
-            vec![SignatureAlgorithm::Ed25519],
+            vec![
+                HashAlgorithm::Sha256 as i32,
+                HashAlgorithm::Unspecified as i32,
+            ],
+            vec![SignatureAlgorithm::Ed25519 as i32],
         );
 
         let base = base_transcript(&sid, &cx, &sx, &ced, &sed, &names, &supported);
@@ -326,7 +343,7 @@ mod tests {
 
         // Supported list length.
         let shrunk = (
-            vec![SymmetricAlgorithm::Aes256Gcm],
+            vec![SymmetricAlgorithm::Aes256Gcm as i32],
             supported.1.clone(),
             supported.2.clone(),
         );
@@ -337,8 +354,8 @@ mod tests {
         // Supported list member (same length, different order/content).
         let reordered = (
             vec![
-                SymmetricAlgorithm::Unspecified,
-                SymmetricAlgorithm::Aes256Gcm,
+                SymmetricAlgorithm::Unspecified as i32,
+                SymmetricAlgorithm::Aes256Gcm as i32,
             ],
             supported.1.clone(),
             supported.2.clone(),
@@ -349,7 +366,10 @@ mod tests {
 
         let hash_lists = (
             supported.0.clone(),
-            vec![HashAlgorithm::Unspecified, HashAlgorithm::Sha256],
+            vec![
+                HashAlgorithm::Unspecified as i32,
+                HashAlgorithm::Sha256 as i32,
+            ],
             supported.2.clone(),
         );
         let mut variant = base;
@@ -359,7 +379,10 @@ mod tests {
         let sig_lists = (
             supported.0.clone(),
             supported.1.clone(),
-            vec![SignatureAlgorithm::Ed25519, SignatureAlgorithm::Ed25519],
+            vec![
+                SignatureAlgorithm::Ed25519 as i32,
+                SignatureAlgorithm::Ed25519 as i32,
+            ],
         );
         let mut variant = base;
         variant.supported_signature = &sig_lists.2;
@@ -391,9 +414,9 @@ mod tests {
         let ced = [3u8; 32];
         let sed = [4u8; 32];
         let supported = (
-            vec![SymmetricAlgorithm::Aes256Gcm],
-            vec![HashAlgorithm::Sha256],
-            vec![SignatureAlgorithm::Ed25519],
+            vec![SymmetricAlgorithm::Aes256Gcm as i32],
+            vec![HashAlgorithm::Sha256 as i32],
+            vec![SignatureAlgorithm::Ed25519 as i32],
         );
 
         let names_a = ("ab", "c");
@@ -426,9 +449,9 @@ mod tests {
         let sed = [0x44u8; 32];
         let names = ("desktop", "phone");
         let supported = (
-            vec![SymmetricAlgorithm::Aes256Gcm],
-            vec![HashAlgorithm::Sha256],
-            vec![SignatureAlgorithm::Ed25519],
+            vec![SymmetricAlgorithm::Aes256Gcm as i32],
+            vec![HashAlgorithm::Sha256 as i32],
+            vec![SignatureAlgorithm::Ed25519 as i32],
         );
 
         let hash = compute_pairing_transcript_hash(&base_transcript(
@@ -569,9 +592,11 @@ mod tests {
 
     /// Build a transcript whose fields are all derived from `fill`.
     fn transcript_hash_for_fill(fill: u8) -> [u8; 32] {
-        const SUPPORTED_SYMMETRIC: [SymmetricAlgorithm; 1] = [SymmetricAlgorithm::Aes256Gcm];
-        const SUPPORTED_HASH: [HashAlgorithm; 1] = [HashAlgorithm::Sha256];
-        const SUPPORTED_SIGNATURE: [SignatureAlgorithm; 1] = [SignatureAlgorithm::Ed25519];
+        // Raw wire ids: the transcript commits to the bytes that go on the wire,
+        // not to the variants this build decodes them into.
+        const SUPPORTED_SYMMETRIC: [i32; 1] = [SymmetricAlgorithm::Aes256Gcm as i32];
+        const SUPPORTED_HASH: [i32; 1] = [HashAlgorithm::Sha256 as i32];
+        const SUPPORTED_SIGNATURE: [i32; 1] = [SignatureAlgorithm::Ed25519 as i32];
 
         let session_id = [fill; 16];
         let key = [fill; 32];
