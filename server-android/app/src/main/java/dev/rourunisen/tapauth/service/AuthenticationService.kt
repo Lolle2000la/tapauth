@@ -48,7 +48,7 @@ class AuthenticationService : Service() {
     private val replayMitigationCache = ReplayMitigationCache.getInstance()
     private val retransmissionManager = RetransmissionManager.getInstance()
     private val transportLockManager = TransportLockManager.getInstance()
-    private val requestRateLimiter = RequestRateLimiter()
+    private val requestRateLimiter = RequestRateLimiter.getInstance()
     private lateinit var temporalIdCache: TemporalIdCache
     private lateinit var appConfig: dev.rourunisen.tapauth.data.AppConfiguration
     private var connectivityManager: ConnectivityManager? = null
@@ -84,8 +84,10 @@ class AuthenticationService : Service() {
         //   IPv6: transient link-local (ff12::/16); low 32 bits are inside the
         //         IANA "Reserved for Private Use" dynamic group-id range
         //         (0xFD000000-0xFDFFFFFF, RFC 10028).
-        private val IPV4_MULTICAST_GROUP: InetAddress = InetAddress.getByName("239.255.26.44")
-        private val IPV6_MULTICAST_GROUP: InetAddress = InetAddress.getByName("ff12::fdec:fc27")
+        // Internal, not private: `SharedProtocolLiteralsTest` pins both against the literals
+        // `shared/src/network.rs` publishes.
+        internal val IPV4_MULTICAST_GROUP: InetAddress = InetAddress.getByName("239.255.26.44")
+        internal val IPV6_MULTICAST_GROUP: InetAddress = InetAddress.getByName("ff12::fdec:fc27")
         // Debounce delay for multicast rejoin operations (milliseconds)
         private const val REJOIN_DEBOUNCE_MS = 500L
 
@@ -667,18 +669,6 @@ class AuthenticationService : Service() {
         return joinToString("") { "%02x".format(it) }
     }
 
-    /**
-     * Hex SHA-256 of [data], used only as a stable de-duplication key for the rate limiter.
-     *
-     * Retransmissions and multi-transport deliveries of one request decrypt to identical
-     * `WrapperMessage` bytes, so they collapse to one request id. This is not protocol crypto and
-     * deliberately has no JNI export.
-     */
-    private fun sha256Hex(data: ByteArray): String {
-        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(data)
-        return digest.toHex()
-    }
-
     private fun ByteArray.toHexPreview(maxBytes: Int = 8): String {
         val take = kotlin.math.min(this.size, maxBytes)
         return this.take(take).joinToString("") { "%02x".format(it) } +
@@ -824,14 +814,17 @@ class AuthenticationService : Service() {
         try {
             Log.d(TAG, "Handling AuthenticationRequest from device: ${device.displayName}")
 
-            // Post-authentication rate limiting
-            // Use a hash of the message payload as request identifier for de-duplication.
-            // Retransmissions and multi-transport deliveries of the same request will have
-            // identical wrapperMessage bytes after decryption, so they produce the same hash.
-            // This is a local de-duplication key, not protocol crypto: the protocol hashes and
-            // signatures all live in Rust, so a plain JDK digest is enough here.
-            val requestId = sha256Hex(wrapperMessage)
-            if (!requestRateLimiter.shouldAcceptRequest(device.publicKey.toHex(), requestId)) {
+            // Post-authentication rate limiting. One limiter, one key material and one request
+            // identifier for both transports: RequestRateLimiter.shouldAcceptAuthenticatedRequest
+            // keys on the paired Client's public key and hashes the WrapperMessage, so a
+            // retransmission or a multi-transport delivery of this same request is recognised as
+            // the same request rather than as fresh traffic.
+            if (
+                !requestRateLimiter.shouldAcceptAuthenticatedRequest(
+                    device.publicKey,
+                    wrapperMessage,
+                )
+            ) {
                 Log.w(TAG, "Rate limiting auth request from device: ${device.displayName}")
                 return
             }

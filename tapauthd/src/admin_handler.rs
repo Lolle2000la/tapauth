@@ -153,8 +153,9 @@ async fn dispatch(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::pairing::cancel_outcome;
+    use super::pairing::{advertised_port, cancel_outcome, check_requested_port};
     use super::*;
+    use prost::Message as _;
 
     /// `CancelPairing` after the worker already retired is a success, while a
     /// real failure keeps its error answer.
@@ -309,7 +310,7 @@ mod tests {
         let mutated = dispatch(
             ipc::AdminRequest {
                 payload: Some(ipc::admin_request::Payload::CompletePairing(
-                    ipc::CompletePairingRequest { port: 0 },
+                    ipc::CompletePairingRequest { port: None },
                 )),
             },
             &daemon,
@@ -327,6 +328,129 @@ mod tests {
             reloads.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "a mutating request must reload the daemon exactly once"
+        );
+    }
+
+    /// A session with no UDP socket (BLE-only) reports its port as the field being
+    /// **absent**, and that absence survives the wire as `None` rather than turning
+    /// into `0`.
+    ///
+    /// The defect this catches: the `port = 0` sentinel coming back — a reply that
+    /// sends `0` for a BLE-only session, or a decoder that maps absence onto `0` — so
+    /// a caller cannot tell "no port" from "port 0", and the value it sends back is
+    /// read as either.
+    #[test]
+    fn a_ble_only_session_reports_no_port_and_absence_survives_the_wire() {
+        assert_eq!(
+            advertised_port(0),
+            None,
+            "a BLE-only session must report absence, not port 0"
+        );
+        assert_eq!(advertised_port(41234), Some(41234));
+
+        // The reply's field is `optional`, so absence is the field not being
+        // written: it decodes back to `None`, never to `Some(0)`.
+        let unset = ipc::WaitForPairingResponse {
+            sas_code: "123-456".to_string(),
+            port: None,
+        };
+        let decoded =
+            ipc::WaitForPairingResponse::decode(unset.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.port, None);
+        assert_eq!(decoded.sas_code, "123-456");
+
+        // And a request's absence is accepted without being compared to anything:
+        // there is no port to match against a session that has none.
+        assert!(check_requested_port(None, 0).is_ok());
+        assert!(
+            check_requested_port(None, 41234).is_ok(),
+            "an absent port names no port, so it cannot mismatch one"
+        );
+    }
+
+    /// An **explicitly present** `0` and absence are two different things on the wire:
+    /// `Some(0)` writes the field and decodes back to `Some(0)`, `None` writes nothing
+    /// and decodes back to `None`.
+    ///
+    /// The defect this catches: the field reverting to a plain proto3 scalar. There
+    /// `Some(0)` would encode to nothing and an explicit `0` on the wire would decode to
+    /// `None`, so "an explicit zero is invalid" would silently become a second spelling
+    /// of "BLE-only" and `check_requested_port`'s refusal of `Some(0)` would be
+    /// unreachable — while the absence test above and every other test here stay green.
+    #[test]
+    fn a_present_zero_port_is_written_and_does_not_decode_as_absence() {
+        // Field 2, wire type 0 (varint) is tag `0x10`; an empty `sas_code` (field 1)
+        // writes nothing, so these are the whole encoding. A plain proto3 scalar omits a
+        // zero, so the written zeros in these bytes are the `optional` keyword's doing.
+        let present = ipc::WaitForPairingResponse {
+            sas_code: String::new(),
+            port: Some(0),
+        };
+        let present_bytes = present.encode_to_vec();
+        assert_eq!(
+            present_bytes,
+            vec![0x10, 0x00],
+            "a present zero port must be written as tag 0x10 + varint 0, not omitted"
+        );
+        let decoded = ipc::WaitForPairingResponse::decode(present_bytes.as_slice()).unwrap();
+        assert_eq!(
+            decoded.port,
+            Some(0),
+            "an explicit zero on the wire must decode as Some(0), never as None"
+        );
+
+        // Absence is the field not being written at all, and it decodes back to absence.
+        let absent = ipc::WaitForPairingResponse {
+            sas_code: String::new(),
+            port: None,
+        };
+        let absent_bytes = absent.encode_to_vec();
+        assert_eq!(
+            absent_bytes,
+            Vec::<u8>::new(),
+            "an absent port must not be written at all"
+        );
+        let decoded = ipc::WaitForPairingResponse::decode(absent_bytes.as_slice()).unwrap();
+        assert_eq!(decoded.port, None);
+    }
+
+    /// `Some(0)` and an out-of-range value are **invalid**, not a second spelling of
+    /// "BLE-only", and a real port must still match the session's.
+    ///
+    /// The defect this catches: reading `0` back as absence (the sentinel returning
+    /// through the value path) or `port as u16`-style truncation, which would let
+    /// `65536` silently address port `0` instead of being refused.
+    #[test]
+    fn a_zero_or_out_of_range_pairing_port_is_refused_as_invalid() {
+        let zero = check_requested_port(Some(0), 41234).unwrap_err();
+        assert_eq!(zero.status, ipc::AdminStatus::AdminError as i32);
+        assert!(
+            zero.error_message.contains("Invalid pairing port: 0"),
+            "a zero port must be named as invalid, got {:?}",
+            zero.error_message
+        );
+
+        let too_big = check_requested_port(Some(u32::from(u16::MAX) + 1), 41234).unwrap_err();
+        assert_eq!(too_big.status, ipc::AdminStatus::AdminError as i32);
+        assert!(
+            too_big
+                .error_message
+                .contains("Invalid pairing port: 65536"),
+            "an out-of-range port must be named as invalid, got {:?}",
+            too_big.error_message
+        );
+
+        assert!(
+            check_requested_port(Some(41234), 41234).is_ok(),
+            "the session's own port must match"
+        );
+        let mismatch = check_requested_port(Some(41235), 41234).unwrap_err();
+        assert!(
+            mismatch
+                .error_message
+                .contains("Port mismatch: expected 41234, got 41235"),
+            "a different real port must be reported as a mismatch, got {:?}",
+            mismatch.error_message
         );
     }
 }

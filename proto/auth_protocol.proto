@@ -158,7 +158,10 @@ message PairingPacket {
 message PairingInit {
   bytes server_x25519_public_key = 1;                        // 32-byte ephemeral X25519 public key (X_S)
   bytes server_ed25519_public_key = 2;                       // 32-byte static Ed25519 public key (Ed_S)
-  string server_device_name = 3;                             // Display name (max 64 UTF-8 bytes)
+  // Display name. Required and non-blank: an empty, whitespace-only or
+  // zero-width-only name is refused with PROTOCOL_ERROR before any key is derived.
+  // At most 64 UTF-8 bytes; an over-long value is refused rather than truncated.
+  string server_device_name = 3;
   repeated SymmetricAlgorithm supported_symmetric_algorithms = 4;
   repeated HashAlgorithm supported_hash_algorithms = 5;
   repeated SignatureAlgorithm supported_signature_algorithms = 6;
@@ -168,7 +171,12 @@ message PairingInit {
 message PairingResponse {
   bytes client_x25519_public_key = 1;                        // 32-byte ephemeral X25519 public key (X_C; MUST match QR `pk`)
   bytes client_ed25519_public_key = 2;                       // 32-byte static Ed25519 public key (Ed_C)
-  string client_device_name = 3;                             // Client hostname/display name (max 64 UTF-8 bytes)
+  // Client hostname/display name. Required and at most 64 UTF-8 bytes; the Client
+  // truncates its own name to that bound, and an over-long value is refused by the
+  // Server rather than truncated. The blank-name refusal on `server_device_name` above
+  // is not enforced for this field: no role rejects an empty or zero-width
+  // `client_device_name`, so "non-blank" is not a rule either side implements here.
+  string client_device_name = 3;
   SymmetricAlgorithm selected_symmetric_algorithm = 4;
   HashAlgorithm selected_hash_algorithm = 5;
   SignatureAlgorithm selected_signature_algorithm = 6;

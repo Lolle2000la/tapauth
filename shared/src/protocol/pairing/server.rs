@@ -48,11 +48,19 @@ pub(super) struct LiveServerPairing {
     x25519_keypair: Option<X25519KeyPair>,
     server_identity: Ed25519KeyPair,
     server_device_name: String,
-    /// Exactly what `PairingInit` advertised; these lists enter `H`, so they are
-    /// cached and reused verbatim in [`ServerPairingSession::verify_response`].
+    /// Exactly what `PairingInit` advertised; their **wire ids** enter `H`, so they
+    /// are cached and reused verbatim in [`ServerPairingSession::verify_response`].
     advertised_symmetric: Vec<SymmetricAlgorithm>,
     advertised_hash: Vec<HashAlgorithm>,
     advertised_signature: Vec<SignatureAlgorithm>,
+    /// Ids a *newer* build would advertise next to its own, and this one cannot name.
+    ///
+    /// They go on the wire and into `H` exactly as sent — that is the whole point of
+    /// [`ServerPairingSession::set_advertised_unknown`] — but never into the typed
+    /// lists the negotiation and the selection check read, because this build has no
+    /// variant to put them in. Empty in every shipped build.
+    #[cfg(test)]
+    advertised_unknown: Vec<i32>,
     init: Option<PairingInit>,
     transcript_hash: Option<[u8; 32]>,
     keys: Option<PairingSessionKeys>,
@@ -60,6 +68,40 @@ pub(super) struct LiveServerPairing {
     /// went out, so the handshake has moved past every earlier step while the keys
     /// stay available for `process_confirm_client` retransmissions.
     confirmation_sent: bool,
+}
+
+impl LiveServerPairing {
+    /// The ids a newer build would advertise next to this one's own list.
+    ///
+    /// Empty in every build but a test one: this build has no variant to add, which
+    /// is why the forward-compatibility rule can only be exercised through
+    /// [`ServerPairingSession::set_advertised_unknown`].
+    #[cfg(test)]
+    fn unknown_advertised(&self) -> &[i32] {
+        &self.advertised_unknown
+    }
+
+    /// The same answer for a build that cannot hold such an id.
+    #[cfg(not(test))]
+    fn unknown_advertised(&self) -> &[i32] {
+        &[]
+    }
+}
+
+/// `typed` as raw wire ids, in list order, followed by `extra` — the ids a newer build
+/// would append to the same list.
+///
+/// The advertisement this side sends ([`ServerPairingSession::create_init`]) and the
+/// advertisement it commits to `H` ([`ServerPairingSession::verify_response`]) both
+/// read their ids through here, so the bytes a peer receives and the bytes this side
+/// hashes cannot drift apart. Decoding first and hashing the variants instead would
+/// make `H` a function of what *this* build can name.
+fn advertised_ids<T: Copy + Into<i32>>(typed: &[T], extra: &[i32]) -> Vec<i32> {
+    typed
+        .iter()
+        .map(|algorithm| (*algorithm).into())
+        .chain(extra.iter().copied())
+        .collect()
 }
 
 impl ServerPairingSession {
@@ -119,6 +161,8 @@ impl ServerPairingSession {
                 advertised_symmetric: SUPPORTED_SYMMETRIC_ALGORITHMS.to_vec(),
                 advertised_hash: SUPPORTED_HASH_ALGORITHMS.to_vec(),
                 advertised_signature: SUPPORTED_SIGNATURE_ALGORITHMS.to_vec(),
+                #[cfg(test)]
+                advertised_unknown: Vec::new(),
                 init: None,
                 transcript_hash: None,
                 keys: None,
@@ -151,21 +195,14 @@ impl ServerPairingSession {
             server_x25519_public_key: live.server_x25519_public_key.to_vec(),
             server_ed25519_public_key: live.server_identity.verifying_key_bytes().to_vec(),
             server_device_name: live.server_device_name.clone(),
-            supported_symmetric_algorithms: live
-                .advertised_symmetric
-                .iter()
-                .map(|algorithm| *algorithm as i32)
-                .collect(),
-            supported_hash_algorithms: live
-                .advertised_hash
-                .iter()
-                .map(|algorithm| *algorithm as i32)
-                .collect(),
-            supported_signature_algorithms: live
-                .advertised_signature
-                .iter()
-                .map(|algorithm| *algorithm as i32)
-                .collect(),
+            // One conversion for both this advertisement and the transcript below, so
+            // what goes on the wire is byte-for-byte what `H` commits to.
+            supported_symmetric_algorithms: advertised_ids(
+                &live.advertised_symmetric,
+                live.unknown_advertised(),
+            ),
+            supported_hash_algorithms: advertised_ids(&live.advertised_hash, &[]),
+            supported_signature_algorithms: advertised_ids(&live.advertised_signature, &[]),
         };
         live.init = Some(init.clone());
         Ok(init)
@@ -180,6 +217,11 @@ impl ServerPairingSession {
     /// A `client_x25519_public_key` that is not 32 bytes is reported as
     /// [`ProtocolError::ChallengeMismatch`] too — it can never equal the QR key,
     /// and the caller's remedy (abort with `KEY_MISMATCH`) is the same.
+    ///
+    /// A `client_device_name` over [`PAIRING_DEVICE_NAME_MAX_BYTES`] is refused with
+    /// [`ProtocolError::InvalidMessageFormat`]: like the desktop's `handle_init`, this
+    /// side splices the peer's name into `H` verbatim, so a value that does not fit
+    /// must be rejected rather than shortened.
     ///
     /// The phone must have built its `PairingInit` first (the transcript it
     /// advertised is the one it verifies against) and may verify exactly one
@@ -211,6 +253,13 @@ impl ServerPairingSession {
                 &response.client_ed25519_public_key,
                 "client_ed25519_public_key",
             )?;
+            // Same rule as the desktop's `handle_init`: the peer's name is spliced
+            // into `H` as received and our own is cut to
+            // `PAIRING_DEVICE_NAME_MAX_BYTES` at build time, so the bound holds only
+            // because an over-long value is refused, never silently shortened.
+            if response.client_device_name.len() > PAIRING_DEVICE_NAME_MAX_BYTES {
+                return Err(ProtocolError::InvalidMessageFormat);
+            }
 
             let selected_symmetric =
                 SymmetricAlgorithm::try_from(response.selected_symmetric_algorithm)
@@ -240,6 +289,14 @@ impl ServerPairingSession {
             let server_x25519_public_key = live.server_x25519_public_key;
             let server_ed25519_public_key = live.server_identity.verifying_key_bytes();
 
+            // The advertisement exactly as this side sent it, raw ids included: the
+            // desktop hashes the same bytes from the `PairingInit` it received, so an
+            // id neither build can name still lands identically in both `H`s.
+            let advertised_symmetric =
+                advertised_ids(&live.advertised_symmetric, live.unknown_advertised());
+            let advertised_hash = advertised_ids(&live.advertised_hash, &[]);
+            let advertised_signature = advertised_ids(&live.advertised_signature, &[]);
+
             let transcript = PairingTranscript {
                 version: PROTOCOL_VERSION_V2,
                 session_id: &session_id,
@@ -249,9 +306,9 @@ impl ServerPairingSession {
                 server_ed25519_public_key: &server_ed25519_public_key,
                 client_device_name: &response.client_device_name,
                 server_device_name: &live.server_device_name,
-                supported_symmetric: &live.advertised_symmetric,
-                supported_hash: &live.advertised_hash,
-                supported_signature: &live.advertised_signature,
+                supported_symmetric: &advertised_symmetric,
+                supported_hash: &advertised_hash,
+                supported_signature: &advertised_signature,
                 selected_symmetric,
                 selected_hash,
                 selected_signature,
@@ -420,6 +477,19 @@ impl ServerPairingSession {
         Ok(())
     }
 
+    /// Advertise ids this build cannot name, exactly as a newer build would: they go
+    /// on the wire after this side's own list and are committed to `H` as raw bytes,
+    /// while the negotiation and the selection check only ever see the typed lists.
+    ///
+    /// Test hook, and test-only state: no shipped build can produce such an id, which
+    /// is why the interoperability rule — both roles hash the same advertisement
+    /// whatever they can name — has no other way to be exercised.
+    #[cfg(test)]
+    pub(super) fn set_advertised_unknown(&mut self, ids: Vec<i32>) -> Result<(), ProtocolError> {
+        self.live_mut()?.advertised_unknown = ids;
+        Ok(())
+    }
+
     /// Decrypt the desktop's provisioning payload (`PairingConfirmClient`).
     ///
     /// **Desktop → phone** (initial-key-exchange.md Step 5): decrypts
@@ -441,12 +511,16 @@ impl ServerPairingSession {
         let (keys, transcript_hash, negotiated) =
             session_material(&live.keys, &live.transcript_hash, &self.negotiated)?;
         let aad = context_with_hash(PAIRING_PROVISION_AAD_CONTEXT, transcript_hash);
-        let plaintext = decrypt_with_key(
+        // The decrypted payload holds the CSK verbatim, and so does the protobuf
+        // `Vec` decoded from it (prost has no zeroizing field); this buffer is
+        // cleared on drop, the decoded one by the caller as soon as it has copied
+        // the key into a zeroizing type.
+        let plaintext = Zeroizing::new(decrypt_with_key(
             negotiated.symmetric_algorithm,
             &keys.k_c2s,
             &confirm.encrypted_payload,
             &aad,
-        )?;
+        )?);
         let payload = PairingProvisionPayload::decode(plaintext.as_slice())?;
         if payload.csk.len() != 32 {
             return Err(ProtocolError::InvalidMessageFormat);

@@ -81,9 +81,16 @@ message AdminRequest {
 
 message GetServersRequest {}
 message StartPairingRequest {}
-message WaitForPairingRequest { uint32 port = 1; }
-message CompletePairingRequest { uint32 port = 1; }
-message CancelPairingRequest { uint32 port = 1; bytes session_id = 2; }
+// `port` is the session's ephemeral UDP pairing port, and it is `optional` so that
+// a session with no UDP socket (BLE-only) is *absent* rather than `0`: the wire used
+// to spell "BLE-only" as the sentinel `0`, which an out-of-range or zero value can
+// now no longer impersonate. A present value is a real port (`1..=65535`); `0` and
+// anything above `65535` are refused as invalid. `optional` on a proto3 scalar is
+// wire-compatible: the varint encoding is unchanged, it only adds presence tracking,
+// so absence is the field not being written at all.
+message WaitForPairingRequest { optional uint32 port = 1; }
+message CompletePairingRequest { optional uint32 port = 1; }
+message CancelPairingRequest { optional uint32 port = 1; bytes session_id = 2; }
 message RemoveDeviceRequest { string public_key = 1; }
 message RotateCskRequest {}
 message RecoverTpmRequest {}
@@ -125,7 +132,7 @@ message AdminResponse {
 }
 
 message GetServersResponse { repeated PairedServerInfo servers = 1; }
-message StartPairingResponse { string url = 1; uint32 port = 2; bytes session_id = 3; }
-message WaitForPairingResponse { string sas_code = 1; uint32 port = 2; }
+message StartPairingResponse { string url = 1; optional uint32 port = 2; bytes session_id = 3; }
+message WaitForPairingResponse { string sas_code = 1; optional uint32 port = 2; }
 message CompletePairingResponse { string server_hex = 1; }
 message CancelPairingResponse {}

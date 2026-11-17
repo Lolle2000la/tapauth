@@ -103,10 +103,10 @@ class BlePairingClient(private val context: Context) {
         private val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
         /** MTU to request before service discovery so pairing frames fit one PDU. */
-        private const val TARGET_MTU = 517
+        internal const val TARGET_MTU = 517
 
         /** `pairing_adv_id` length (`SHA-256("tapauth-ble-pair-v2" || sid || X_C)[..10]`). */
-        private const val ADV_ID_BYTES = 10
+        internal const val ADV_ID_BYTES = 10
 
         /** Bound on a single GATT write, since a lost callback must not wedge the caller. */
         private const val WRITE_TIMEOUT_MS = 5_000L

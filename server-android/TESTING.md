@@ -16,23 +16,30 @@ JNI crypto tests require native libraries and must run on an Android device or e
 
 #### Prerequisites
 
-1. Build native libraries:
+1. Native libraries are built by Gradle itself — the `cargo { }` block in
+   `app/build.gradle.kts` cross-compiles `shared` for the requested ABIs and
+   `preBuild` depends on it, so there is nothing to run by hand:
+
    ```bash
-   ./build-native.sh
+   # Optional: build just the native libraries and stop
+   ./gradlew cargoBuild
    ```
 
 2. Start an Android emulator or connect a physical device
 
 #### Run Tests
 
+`testBuildType` is `e2e` (`app/build.gradle.kts`), so the instrumented task is the
+`e2e` variant's:
+
 ```bash
-./gradlew connectedAndroidTest
+./gradlew connectedE2eAndroidTest
 ```
 
 Or run specific test class:
 
 ```bash
-./gradlew connectedAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=dev.rourunisen.tapauth.crypto.TapAuthCryptoTest
+./gradlew connectedE2eAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=dev.rourunisen.tapauth.crypto.TapAuthCryptoTest
 ```
 
 #### Test Runner
@@ -46,15 +53,15 @@ The project uses a custom `TapAuthTestRunner` that replaces the production `TapA
 Located in `androidTest/`, these instrumentation tests validate the JNI boundary:
 
 - **Key Generation**: Ed25519, X25519 keypair generation
-- **Key Exchange**: X25519 Diffie-Hellman and PSK derivation
+- **Key Exchange**: X25519 Diffie-Hellman, and the HKDF-SHA256 `K_c2s`/`K_s2c`/SAS derivation salted with the handshake transcript `H` (there is no PSK in v2: the only symmetric key is the CSK)
 - **Temporal IDs**: Generation and verification for UDP (16 bytes) and BLE (10 bytes)
-- **Encryption**: PSK and CSK encryption/decryption with AES-256-GCM
+- **Encryption**: CSK encryption/decryption with AES-256-GCM
 - **Signatures**: Ed25519 signing and verification consistency
 - **Protobuf**: Message parsing and type determination
 - **Pairing Protocol**: Message creation and parsing
 - **Error Handling**: Invalid input validation and exception propagation
 
-**50+ test cases** ensuring correct type conversions, error handling, and cryptographic consistency across the Kotlin/Rust FFI boundary.
+**28 test cases** (`@Test`) ensuring correct type conversions, error handling, and cryptographic consistency across the Kotlin/Rust FFI boundary.
 
 ### Protocol Tests (Rust)
 
@@ -73,12 +80,12 @@ cd .. && cargo test --manifest-path shared/Cargo.toml --features jni protobuf_te
 
 ### GitHub Actions
 
-The CI workflow (`.github/workflows/ci.yml`):
+The CI workflows (`.github/workflows/ci.yml` for the Rust checks and formatting, `.github/workflows/ci-android.yml` for the Android build and emulator runs):
 
 1. **Rust Tests**: All workspace tests including protobuf tests
 2. **Android Build**: Builds native libraries for all ABIs
 3. **APK Build**: Assembles debug APK
-4. **Android Instrumentation Tests**: Runs JNI tests in Android emulator (API 34, x86_64)
+4. **Android Instrumentation Tests**: Runs JNI tests in an emulator (API 36, x86_64) as part of the real-Android E2E run (`scripts/ci/run-all-e2e.sh`)
 5. **Code Formatting**: Checks Rust (rustfmt) and Kotlin (Spotless)
 
 The emulator step uses KVM acceleration and caches AVD snapshots for faster execution. Test results are uploaded as artifacts.

@@ -2697,24 +2697,42 @@ else
     phase_skip "2c" "no captured server grant packet available (packet capture needs root)"
 fi
 
-# Step 6d: Phase 2d - Adversarial UDP: Tampered packet must never authenticate
+# Step 6d: Phase 2d - Adversarial UDP: a tampered datagram must not end the
+# session, and must never authenticate on its own. The rule under test is the
+# one `fix(net)` established: an attempt concludes only on (a) a valid,
+# cryptographically verified response from an authorised server, (b) its own
+# deadline, or (c) an explicit local cancel or user denial. A tampered frame is
+# none of those, so it is dropped and the attempt keeps waiting for the answer
+# the phone really sends — which is what makes this phase stronger than the
+# fail-closed shape it replaced: passing now requires the injection to be
+# dropped *and* the genuine grant to still authenticate.
 echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
 echo "║  PHASE 2d: Adversarial UDP (Tampered Ciphertext)              ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
 if [ "$CAPTURE_OK" = "1" ]; then
-    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
+    # Auto-grant stays ON for this whole phase (unlike Phase 2c, which pauses it
+    # so nothing answers): the phone's real grant landing after the injection is
+    # half of what is asserted. `start-auto-grant` is not idempotent — a second
+    # listener would double every touch — and Phase 2c left the one listener
+    # running, so restore it only if it is actually gone.
+    if [ ! -f /tmp/bio-auto-grant.pid ] \
+        || ! kill -0 "$(cat /tmp/bio-auto-grant.pid)" 2>/dev/null; then
+        "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
+        sleep 1
+    fi
     # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 2c).
     settle_for_dedup "Phase 2c"
 
     LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
     TAMPER_REQUEST_ID="e2e-tamper-$$"
-    echo "==> Starting auth session (request id $TAMPER_REQUEST_ID) with no grant expected..."
+    echo "==> Starting auth session (request id $TAMPER_REQUEST_ID); auto-grant will answer it..."
     TAMPER_LOG="${TEST_DIR}/tamper-cli.log"
     "$CLI_BIN" pam-auth "$TEST_USER" 30 "$TAMPER_REQUEST_ID" > "$TAMPER_LOG" 2>&1 &
     TAMPER_CLI_PID=$!
-    # Inject inside the pre-grant window (DEBUG_AUTO_APPROVE_DELAY_MS is 1s).
+    # Inject inside the pre-grant window (DEBUG_AUTO_APPROVE_DELAY_MS is 1s), so
+    # the corrupted frame reaches the daemon before the phone's real grant does.
     sleep 0.4
 
     echo "==> Injecting grant with a flipped AES-GCM tag byte..."
@@ -2728,37 +2746,42 @@ if [ "$CAPTURE_OK" = "1" ]; then
     sleep 1
     cat "$TAMPER_LOG"
 
-    # The daemon maps any authentication error to OUTCOME=IGNORE so that PAM
-    # falls back to password authentication (fail-closed). The important
-    # property: the tampered packet must abort the session IMMEDIATELY with a
-    # crypto error instead of being accepted, and must be visible in the audit
-    # log. A session that silently continued to timeout would still pass the
-    # exit-code check below, so the DETAIL and log assertions are mandatory.
-    if grep -q "OUTCOME=IGNORE" "$TAMPER_LOG"; then
-        echo "✅ Tampered packet rejected; session ended fail-closed (OUTCOME=IGNORE → PAM password fallback)."
-    else
-        echo "❌ ERROR: expected fail-closed OUTCOME=IGNORE after tampered packet injection."
-        exit 1
-    fi
-    if grep -q "DETAIL=Authentication failed" "$TAMPER_LOG"; then
-        echo "✅ Session ended with the crypto error, not a silent timeout."
-    else
-        echo "❌ ERROR: expected DETAIL=Authentication failed... (got the output above)."
-        exit 1
-    fi
+    # The tampered frame keeps protobuf framing and the temporal identifier and
+    # only fails AEAD, so the daemon must reach decryption and drop it there.
+    # That warn is the aggregate drop warning: it carries the phrase on its first
+    # occurrence and is then rate-limited to one per 60 s (DROP_WARN_INTERVAL in
+    # tapauthd/src/auth_handler.rs), with per-drop detail at debug. This phase's
+    # injection is the only frame in the run that fails AEAD, so the first
+    # occurrence is this one.
     assert_log_since "$LOG_BASE" "Failed to decrypt response packet" \
-        "Daemon logged the decryption failure (audit trail present)"
-    if [ "$TAMPER_EXIT" -ne 0 ]; then
-        echo "✅ Exit code non-zero ($TAMPER_EXIT) — no successful authentication."
+        "Daemon dropped the tampered datagram instead of treating it as a response (audit trail present)"
+
+    # The dropped frame must not conclude anything: the session is still waiting,
+    # so the auto-granted grant that follows still authenticates it.
+    if grep -q "OUTCOME=SUCCESS" "$TAMPER_LOG"; then
+        echo "✅ Tampered datagram dropped; the phone's real grant still authenticated the session (OUTCOME=SUCCESS)."
     else
-        echo "❌ ERROR: tampered injection must not produce a successful exit code."
+        echo "❌ ERROR: expected the dropped injection to leave the session waiting for the real grant (OUTCOME=SUCCESS)."
+        exit 1
+    fi
+    if [ "$TAMPER_EXIT" -eq 0 ]; then
+        echo "✅ Exit code 0 — the session concluded on the phone's verified grant."
+    else
+        echo "❌ ERROR: an arbitrary datagram must not end the attempt; pam-auth exited ${TAMPER_EXIT}."
+        exit 1
+    fi
+    # ...and it concluded over the transport the tampered frame arrived on: BLE
+    # is disabled for this phase (`set-transports --ble false --network true`
+    # above), so a drop that cost the UDP path its grant could not be papered
+    # over by the other transport.
+    TAMPER_TRANSPORT=$(grant_transport_since "$LOG_BASE")
+    if [ "$TAMPER_TRANSPORT" != "Udp" ]; then
+        echo "❌ ERROR: expected the grant to be attributed to Udp, got '${TAMPER_TRANSPORT}'."
+        tail -n +"$((LOG_BASE + 1))" "$DAEMON_LOG" 2>/dev/null | tail -n 20
         exit 1
     fi
 
-    # Restore auto-grant for the following positive phases
-    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
-    sleep 1
-    phase_pass "2d" "the corrupted grant ended the session fail-closed (OUTCOME=IGNORE, DETAIL=Authentication failed), the daemon logged the decryption failure, and the exit code was non-zero (${TAMPER_EXIT})"
+    phase_pass "2d" "the corrupted grant was dropped rather than answered (the daemon logged the decryption failure and kept waiting), and the phone's real grant then authenticated the session over Udp (OUTCOME=SUCCESS, exit code ${TAMPER_EXIT})"
 else
     echo "ℹ️  SKIPPED (no captured grant packet available)."
     phase_skip "2d" "no captured server grant packet available (packet capture needs root)"

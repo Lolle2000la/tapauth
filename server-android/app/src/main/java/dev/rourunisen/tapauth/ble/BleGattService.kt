@@ -28,6 +28,7 @@ import dev.rourunisen.tapauth.crypto.parseAndVerifyGrantConfirmation
 import dev.rourunisen.tapauth.crypto.rawMessage
 import dev.rourunisen.tapauth.data.DeviceRepository
 import dev.rourunisen.tapauth.service.ReplayMitigationCache
+import dev.rourunisen.tapauth.service.RequestRateLimiter
 import dev.rourunisen.tapauth.service.TransportLockManager
 import dev.rourunisen.tapauth.service.scrubLogValue
 import java.util.UUID
@@ -131,6 +132,15 @@ class BleGattService : Service() {
     private lateinit var biometricHelper: BiometricHelper
     private val replayMitigationCache = ReplayMitigationCache.getInstance()
     private val transportLockManager = TransportLockManager.getInstance()
+
+    /**
+     * The process's one post-authentication limiter, shared with the UDP path.
+     *
+     * This is the same instance `AuthenticationService` holds: a Client that hammers one transport
+     * and then the other is working against one budget, not two. See [RequestRateLimiter] for the
+     * schedule and for why the key material is the paired Client's public key.
+     */
+    private val requestRateLimiter = RequestRateLimiter.getInstance()
 
     /**
      * Orders duplicate in-flight AuthenticationRequests ahead of the replay cache, so a same-peer
@@ -1338,6 +1348,29 @@ class BleGattService : Service() {
                     return
                 }
                 BleAuthRequestGate.Decision.Process -> Unit
+            }
+
+            // Post-authentication rate limiting, on the one limiter and the one schedule the UDP
+            // path uses (RequestRateLimiter.getInstance(), keyed on the paired Client's public
+            // key): without it this path is a bypass of that limiter, and a Client that keeps
+            // sending fresh requests is throttled on one transport and not on the other. It runs
+            // here, on the Process outcome, because this is the only outcome that raises a prompt:
+            // a retransmission answered as a Duplicate never spends the burst allowance, and a
+            // challenge another transport owns never reached a prompt at all.
+            if (
+                !requestRateLimiter.shouldAcceptAuthenticatedRequest(
+                    matchedDevice.publicKey,
+                    wrapperMessageBytes,
+                )
+            ) {
+                Log.w(
+                    TAG,
+                    "Rate limiting BLE auth request from device: ${matchedDevice.displayName}",
+                )
+                // No prompt, so nothing on this link has an answer coming: drop it rather than let
+                // the Client wait on a request that will never be answered.
+                disconnectGatt(gatt)
+                return
             }
 
             // The signature was already verified by parseAndVerifyAuthRequest above, which also

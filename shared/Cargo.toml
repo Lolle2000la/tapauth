@@ -73,6 +73,12 @@ paranoid-android = { version = "0.2", features = ["api-30"] }
 [build-dependencies]
 prost-build.workspace = true
 
+[dev-dependencies]
+# Property-based tests: the in-file `property_tests` modules prove the invariants the
+# example-based tests can only sample (see `protocol/messages/context.rs` and
+# `protocol/pairing/fields.rs`).
+proptest = "1.12"
+
 [features]
 default = []
 # Enables the UniFFI-exported Rust↔Kotlin surface (`src/ffi.rs`). The Gradle
@@ -91,3 +97,10 @@ dev-state-override = []
 # addresses (loopback/NAT) so a daemon can be tested against a locally emulated
 # peer. For testing/dev only; production builds must NOT enable it.
 dev-udp-loopback = []
+
+# `#[cfg(kani)]` is how the in-file Kani harnesses (pairing/negotiation.rs,
+# pairing/fields.rs) gate themselves. Kani sets that cfg; no other build does, so it
+# must be registered here or `unexpected_cfgs` fires — and at `deny` a misspelled
+# `cfg(kanii)` becomes a build error instead of a harness the suite silently skips.
+[lints.rust]
+unexpected_cfgs = { level = "deny", check-cfg = ['cfg(kani)'] }

@@ -11,7 +11,7 @@
 //! [`TapauthError`] carrying the exception type it must surface as.
 
 use prost::Message as ProstMessage;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{
     current_time_window, decrypt_with_csk_and_prepended_nonce, encrypted_packet_aad,
@@ -161,7 +161,13 @@ pub(crate) struct VerifiedAuthRequest {
 }
 
 /// The provisioning payload of `PairingConfirmClient`, after AEAD decryption.
-#[derive(Debug, Clone)]
+///
+/// The `csk` field is a [`Zeroizing`] buffer, whose own `Debug` prints the bytes,
+/// so `Debug` is hand-written here: a `{:?}` of this record (a failed assertion,
+/// a `tracing` field) must not put the CSK in a log. The generated Kotlin
+/// `toString()` of the corresponding UniFFI record is not influenced by this —
+/// see [`ParsedPairingProvision`](crate::ffi::ParsedPairingProvision).
+#[derive(Clone)]
 pub(crate) struct ProvisionedClient {
     /// The CSK the desktop provisioned; must be persisted by the phone.
     pub(crate) csk: Zeroizing<[u8; CSK_LEN]>,
@@ -169,6 +175,16 @@ pub(crate) struct ProvisionedClient {
     pub(crate) username: String,
     /// Authenticated Client hostname.
     pub(crate) client_hostname: String,
+}
+
+impl std::fmt::Debug for ProvisionedClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProvisionedClient")
+            .field("csk", &"<redacted>")
+            .field("username", &self.username)
+            .field("client_hostname", &self.client_hostname)
+            .finish()
+    }
 }
 
 /// A `PairingResponse` whose QR commitment, signature and algorithm selection all
@@ -699,18 +715,19 @@ pub(crate) fn pairing_process_confirm_client(
     let packet = decode_session_packet(session, confirm_client_packet)?;
     match packet.msg {
         Some(pairing_packet::Msg::ConfirmClient(confirm)) => {
-            let payload = session.process_confirm_client(&confirm)?;
-            let csk: [u8; CSK_LEN] =
-                payload
-                    .csk
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| TapauthError::Argument {
-                        detail: format!(
-                            "provisioned CSK must be {CSK_LEN} bytes, got {}",
-                            payload.csk.len()
-                        ),
-                    })?;
+            let mut payload = session.process_confirm_client(&confirm)?;
+            let csk_len = payload.csk.len();
+            let csk: Result<[u8; CSK_LEN], TapauthError> = payload
+                .csk
+                .as_slice()
+                .try_into()
+                .map_err(|_| TapauthError::Argument {
+                    detail: format!("provisioned CSK must be {CSK_LEN} bytes, got {csk_len}"),
+                });
+            // `prost` keeps the decrypted CSK in a plain `Vec`, so it is cleared
+            // here on the malformed-length path too, before `payload` is dropped.
+            payload.csk.zeroize();
+            let csk = csk?;
             Ok(ProvisionedClient {
                 csk: Zeroizing::new(csk),
                 username: payload.username,
@@ -836,4 +853,48 @@ pub(crate) fn encrypted_packet_temporal_identifier(
                 packet.temporal_identifier.len()
             ),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProvisionedClient, CSK_LEN};
+    use zeroize::Zeroizing;
+
+    /// `ProvisionedClient`'s hand-written `Debug` prints a fixed redaction where the
+    /// CSK is instead of the buffer's bytes, which `Zeroizing<[u8; CSK_LEN]>`'s own
+    /// `Debug` would print — so a `{:?}` in a failed assertion or a `tracing` field
+    /// cannot put the key in a log, while the non-secret fields stay readable.
+    ///
+    /// The defect this catches: dropping the hand-written impl back to a derived one,
+    /// which formats the CSK as `[171, 171, ...]` and leaks it the moment anyone logs
+    /// or asserts on the record.
+    #[test]
+    fn a_debug_of_the_provisioned_client_redacts_the_csk() {
+        const CSK_BYTE: u8 = 0xAB;
+        let provisioned = ProvisionedClient {
+            csk: Zeroizing::new([CSK_BYTE; CSK_LEN]),
+            username: "luca".to_string(),
+            client_hostname: "thinkpad".to_string(),
+        };
+
+        let rendered = format!("{provisioned:?}");
+        assert!(
+            rendered.contains("\"<redacted>\""),
+            "the CSK must be printed as a redaction, got {rendered}"
+        );
+        // Those are the two spellings a leaking impl would produce: `u8`'s `Debug`
+        // decimal list and a hex formatter. Neither appears in the struct name, the
+        // username or the hostname, so their presence can only be the key.
+        assert!(
+            !rendered.contains(&CSK_BYTE.to_string()),
+            "the CSK must not appear as its decimal bytes, got {rendered}"
+        );
+        assert!(
+            !rendered.to_lowercase().contains("ab"),
+            "the CSK must not appear in hex, got {rendered}"
+        );
+        // The point of the redaction is that the record still diagnoses itself.
+        assert!(rendered.contains("luca"), "got {rendered}");
+        assert!(rendered.contains("thinkpad"), "got {rendered}");
+    }
 }

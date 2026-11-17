@@ -35,7 +35,7 @@ const QR_QUIET_ZONE: u16 = 2;
 pub enum PairingState {
     Loading,
     ShowingQRCode { url: String, qr_data: Rc<QrData> },
-    VerifyingSAS { sas: String, port: u16 },
+    VerifyingSAS { sas: String, port: Option<u16> },
     CompletingPairing,
     Success { device_id: String },
     Error { error: GuiIpcError },
@@ -109,17 +109,28 @@ async fn await_completion_or_cancel<F: std::future::Future>(
     }
 }
 
+/// The `SAS:` message a verified SAS is reported as: `SAS:<sas>:<port>`, with an
+/// empty tail for a session that has no port (BLE-only). Its reader is the
+/// `PairingComplete` arm, which parses the tail back into an `Option<u16>`.
+fn format_verified_sas(sas: &str, port: Option<u16>) -> String {
+    match port {
+        Some(port) => format!("SAS:{sas}:{port}"),
+        None => format!("SAS:{sas}:"),
+    }
+}
+
 /// The `(port, session_id)` pair a `CancelPairing` must carry to address the
 /// session the screen holds, or the daemon-side wildcard.
 ///
 /// A rejected `StartPairing` (the daemon still holds an older session) captures
 /// no session, so the error screen's Cancel action has nothing to identify it
-/// with: `port = 0` and an empty id mean "don't check that field" in
-/// `tapauthd/src/admin_handler.rs`, which cancels whatever is still held.
-fn cancel_address(session: Option<PairingSession>) -> (u16, Vec<u8>) {
+/// with: an absent port and an empty id mean "don't check that field" in
+/// `tapauthd/src/admin_handler.rs`, which cancels whatever is still held. The port
+/// is absent rather than `0`, which is no longer a port on that wire.
+fn cancel_address(session: Option<PairingSession>) -> (Option<u16>, Vec<u8>) {
     match session {
         Some(session) => (session.port, session.session_id),
-        None => (0, Vec::new()),
+        None => (None, Vec::new()),
     }
 }
 
@@ -195,7 +206,7 @@ impl PairingScreen {
         screen.state = state;
         screen.session = Some(PairingSession {
             url: "tapauth://pair?v=2".to_string(),
-            port,
+            port: Some(port),
             session_id: vec![0xab; 16],
         });
         screen
@@ -204,7 +215,7 @@ impl PairingScreen {
     /// Take the address the error screen's Cancel action must hand to
     /// `CancelPairing`, and move the screen back to `Loading` so the
     /// `PairingStarted` that follows starts a fresh session.
-    fn take_cancel_address(&mut self) -> (u16, Vec<u8>) {
+    fn take_cancel_address(&mut self) -> (Option<u16>, Vec<u8>) {
         let address = cancel_address(self.session.take());
         self.cancel_wait = None;
         self.state = PairingState::Loading;
@@ -245,10 +256,10 @@ impl PairingScreen {
                 Task::perform(
                     async move {
                         tokio::select! {
-                            result = crate::ipc::wait_for_pairing(port as u32) => {
+                            result = crate::ipc::wait_for_pairing(port) => {
                                 match result {
                                     Ok((sas, port)) => ScreenMessage::PairingComplete(
-                                        format!("SAS:{}:{}", sas, port),
+                                        format_verified_sas(&sas, port),
                                     ),
                                     Err(e) => ScreenMessage::PairingFailed(e),
                                 }
@@ -268,7 +279,8 @@ impl PairingScreen {
                     if parts.len() == 3 {
                         self.state = PairingState::VerifyingSAS {
                             sas: parts[1].to_string(),
-                            port: parts[2].parse().unwrap_or(0),
+                            // The empty tail is a session with no port (BLE-only).
+                            port: parts[2].parse().ok(),
                         };
                     }
                 } else {
@@ -297,7 +309,7 @@ impl PairingScreen {
                     let cancel2 = cancel.clone();
                     self.cancel_wait = Some(cancel);
 
-                    let completion = crate::ipc::complete_pairing(port as u32);
+                    let completion = crate::ipc::complete_pairing(port);
 
                     return Task::perform(
                         async move {
@@ -545,7 +557,7 @@ mod tests {
     fn session(port: u16) -> PairingSession {
         PairingSession {
             url: "tapauth://pair?v=2".to_string(),
-            port,
+            port: Some(port),
             session_id: vec![0xab; 16],
         }
     }
@@ -579,7 +591,7 @@ mod tests {
         assert!(qr_state("tapauth://pair?v=2").session_in_flight());
         assert!(PairingState::VerifyingSAS {
             sas: "123-456".to_string(),
-            port: 41234,
+            port: Some(41234),
         }
         .session_in_flight());
 
@@ -609,7 +621,7 @@ mod tests {
         let pending = screen
             .take_pending_session()
             .expect("a session completing on the daemon must be cancelled");
-        assert_eq!(pending.port, 41234);
+        assert_eq!(pending.port, Some(41234));
         assert_eq!(pending.session_id, vec![0xab; 16]);
         assert!(
             screen.take_pending_session().is_none(),
@@ -638,7 +650,7 @@ mod tests {
     async fn cancelling_a_completion_wakes_the_task_that_is_waiting_on_it() {
         let mut screen = screen_in(PairingState::VerifyingSAS {
             sas: "123-456".to_string(),
-            port: 41234,
+            port: Some(41234),
         });
         assert!(
             screen.cancel_wait.is_none(),
@@ -841,7 +853,7 @@ mod tests {
         let mut screen = screen_in(PairingState::Error {
             error: GuiIpcError::ResponseTimeout,
         });
-        assert_eq!(screen.take_cancel_address(), (41234, vec![0xab; 16]));
+        assert_eq!(screen.take_cancel_address(), (Some(41234), vec![0xab; 16]));
         assert!(screen.session.is_none());
         assert!(
             matches!(screen.state, PairingState::Loading),
@@ -856,7 +868,7 @@ mod tests {
             error: GuiIpcError::DaemonError("A pairing session is already in progress.".into()),
         });
         screen.session = None;
-        assert_eq!(screen.take_cancel_address(), (0, Vec::new()));
+        assert_eq!(screen.take_cancel_address(), (None, Vec::new()));
         assert!(
             matches!(screen.state, PairingState::Loading),
             "the error screen must return to `Loading` for the retry"
@@ -870,7 +882,7 @@ mod tests {
             qr_state("tapauth://pair?v=2"),
             PairingState::VerifyingSAS {
                 sas: "123-456".to_string(),
-                port: 41234,
+                port: Some(41234),
             },
             PairingState::Error {
                 error: GuiIpcError::ResponseTimeout,
@@ -878,7 +890,7 @@ mod tests {
         ] {
             match close_action(&state, Some(session(41234))) {
                 CloseAction::Cancel(pending) => {
-                    assert_eq!(pending.port, 41234);
+                    assert_eq!(pending.port, Some(41234));
                     assert_eq!(pending.session_id, vec![0xab; 16]);
                 }
                 CloseAction::CloseNow => panic!("{state:?} must cancel its session on close"),

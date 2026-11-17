@@ -161,7 +161,7 @@ mod tests {
         // (a) First request in an in-flight state: cancel the captured session.
         match app.on_close_request() {
             CloseTask::Cancel(session) => {
-                assert_eq!(session.port, 41234);
+                assert_eq!(session.port, Some(41234));
                 assert_eq!(session.session_id, vec![0xab; 16]);
             }
             other => panic!("a pending session must be cancelled on close, got {other:?}"),
@@ -187,7 +187,7 @@ mod tests {
 
         assert!(matches!(app.on_close_request(), CloseTask::Ignored));
         match app.current_screen.close_action() {
-            CloseAction::Cancel(session) => assert_eq!(session.port, 41234),
+            CloseAction::Cancel(session) => assert_eq!(session.port, Some(41234)),
             CloseAction::CloseNow => {
                 panic!("the ignored close request consumed the session")
             }

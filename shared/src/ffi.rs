@@ -60,7 +60,7 @@ mod ops;
 
 use std::sync::{Arc, Mutex};
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::Ed25519KeyPair;
 use crate::protocol::pairing::{ServerPairingSession, PAIRING_SESSION_ID_LEN};
@@ -148,14 +148,37 @@ pub struct ParsedAuthRequest {
 }
 
 /// The provisioning payload of `PairingConfirmClient`, after AEAD decryption.
-#[derive(Debug, Clone, uniffi::Record)]
+///
+/// `Debug` is hand-written: `csk` is the key itself, so a `{:?}` of this record
+/// must print a fixed redaction rather than the bytes. The Kotlin `data class`
+/// UniFFI generates for this record is not covered by that — its `toString()` is
+/// derived from the field list on the Kotlin side and cannot be influenced from
+/// Rust, so Kotlin must not log the record either.
+#[derive(Clone, uniffi::Record)]
 pub struct ParsedPairingProvision {
     /// The CSK the desktop provisioned; must be persisted by the phone.
+    ///
+    /// Rust zeroizes the decrypted payload and its own `Zeroizing` copy
+    /// (`ffi/ops.rs`), then hands the bytes over as this plain `Vec`, which becomes
+    /// the Kotlin `ByteArray` the phone owns — a buffer Rust cannot reach and
+    /// cannot wipe.
+    /// The phone must clear that `ByteArray` once it has persisted the device;
+    /// nothing on the Kotlin side does today.
     pub csk: Vec<u8>,
     /// Linux account this pairing authorizes.
     pub username: String,
     /// Authenticated Client hostname.
     pub client_hostname: String,
+}
+
+impl std::fmt::Debug for ParsedPairingProvision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParsedPairingProvision")
+            .field("csk", &"<redacted>")
+            .field("username", &self.username)
+            .field("client_hostname", &self.client_hostname)
+            .finish()
+    }
 }
 
 /// A `PairingResponse` whose QR commitment, signature and algorithm selection all
@@ -781,9 +804,13 @@ impl PairingSession {
     ///   encryption fails
     /// - [`TapauthError::State`]: the session already concluded, the confirmation was
     ///   already sent, the packet cannot be encoded, or the session lock is poisoned
-    pub fn create_confirm_server(&self, csk: Vec<u8>) -> Result<Vec<u8>, TapauthError> {
-        let csk = read_csk(&csk)?;
-        self.with(|session| ops::pairing_create_confirm_server(session, &csk))
+    pub fn create_confirm_server(&self, mut csk: Vec<u8>) -> Result<Vec<u8>, TapauthError> {
+        let key = read_csk(&csk);
+        // The caller's `Vec` is the raw CSK; clear it once the zeroizing copy exists,
+        // so the Rust side keeps no un-zeroized copy of it.
+        csk.zeroize();
+        let key = key?;
+        self.with(|session| ops::pairing_create_confirm_server(session, &key))
     }
 
     /// Build a keepalive frame (serialized `PairingPacket` with `PairingKeepalive`).
@@ -2713,6 +2740,43 @@ mod tests {
             pairing_packet_session_id(vec![0xFF, 0xFF]),
             Err(TapauthError::Argument { .. })
         ));
+    }
+
+    /// `ParsedPairingProvision`'s hand-written `Debug` prints a fixed redaction where
+    /// the CSK is, so no `{:?}` of the record (a failed assertion, a `tracing` field)
+    /// can put the key in a log, while the non-secret fields stay readable.
+    ///
+    /// The defect this catches: dropping the hand-written impl back to a derived one,
+    /// which formats the CSK as `[171, 171, ...]` and leaks it the moment anyone logs
+    /// or asserts on the record.
+    #[test]
+    fn a_debug_of_the_parsed_provision_redacts_the_csk() {
+        const CSK_BYTE: u8 = 0xAB;
+        let provision = ParsedPairingProvision {
+            csk: vec![CSK_BYTE; 32],
+            username: "luca".to_string(),
+            client_hostname: "thinkpad".to_string(),
+        };
+
+        let rendered = format!("{provision:?}");
+        assert!(
+            rendered.contains("\"<redacted>\""),
+            "the CSK must be printed as a redaction, got {rendered}"
+        );
+        // Those are the two spellings a leaking impl would produce: `u8`'s `Debug`
+        // decimal list and a hex formatter. Neither appears in the struct name, the
+        // username or the hostname, so their presence can only be the key.
+        assert!(
+            !rendered.contains(&CSK_BYTE.to_string()),
+            "the CSK must not appear as its decimal bytes, got {rendered}"
+        );
+        assert!(
+            !rendered.to_lowercase().contains("ab"),
+            "the CSK must not appear in hex, got {rendered}"
+        );
+        // The point of the redaction is that the record still diagnoses itself.
+        assert!(rendered.contains("luca"), "got {rendered}");
+        assert!(rendered.contains("thinkpad"), "got {rendered}");
     }
 
     /// The pre-decryption temporal-identifier read requires the 16-byte UDP/GATT form.

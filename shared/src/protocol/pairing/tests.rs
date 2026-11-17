@@ -229,12 +229,15 @@ fn completion_proof_is_signed_by_ed_s_not_ed_c() {
     let csk = [0x42u8; 32];
     let confirm = phone.create_confirm_server(&csk).unwrap();
 
-    // Open the proof with the phone's own `K_s2c`, exactly as the desktop does.
+    // Open the proof with the phone's own `K_s2c`, exactly as the desktop does —
+    // under the *negotiated* algorithm, not a literal, so an algorithm the
+    // session did not select cannot still open it here.
     let keys = phone.keys().unwrap();
     let transcript_hash = *phone.transcript_hash().unwrap();
+    let negotiated = phone.negotiated().unwrap();
     let aad = context_with_hash(PAIRING_COMPLETE_AAD_CONTEXT, &transcript_hash);
     let plaintext = decrypt_with_key(
-        SymmetricAlgorithm::Aes256Gcm,
+        negotiated.symmetric_algorithm,
         &keys.k_s2c,
         &confirm.encrypted_complete,
         &aad,
@@ -447,9 +450,12 @@ fn init_offering_no_supported_algorithm_is_rejected() {
 /// A `PairingInit` whose only advertised ids are the **reserved** tag `2`
 /// (retired `CHACHA20_POLY1305` / `BLAKE3`) must be refused, not defaulted
 /// and not accepted because "something was advertised".
-/// The defect this catches: a decoder that drops ids it cannot name from the
-/// list (leaving it empty and the negotiation free to pick a suite the peer
-/// never offered), or one that maps an unknown id onto the baseline.
+/// The defect this catches: a decoder that drops ids it cannot name and then lets
+/// the negotiation fall back to a default suite (or treat the emptied list as
+/// "anything goes"), which would pair with a peer that never offered the suite.
+/// Dropping the id is correct — an advertisement may name algorithms this build
+/// does not implement — but dropping it leaves an empty list, and an empty list
+/// intersects with nothing.
 #[test]
 fn init_advertising_only_the_reserved_algorithm_tag_is_refused() {
     let mut init = init_with_algorithms(vec![2], vec![1], vec![1]);
@@ -479,9 +485,10 @@ fn init_advertising_only_the_reserved_algorithm_tag_is_refused() {
     assert!(desktop.sas().is_none());
 }
 
-/// An id this build cannot name at all (`99`) is refused for every list.
-/// The defect this catches: `try_from` collapsing an unknown id onto a
-/// default variant, which would both accept the offer and hash a different
+/// An id this build cannot name at all (`99`) is refused when it is *all* a list
+/// offers. The defect this catches: `try_from` collapsing an unknown id onto a
+/// default variant, or an empty post-skip list being negotiated as though the peer
+/// had offered something — either would both accept the offer and hash a different
 /// transcript than the peer did.
 #[test]
 fn init_advertising_only_an_unknown_algorithm_id_is_refused() {
@@ -501,6 +508,57 @@ fn init_advertising_only_an_unknown_algorithm_id_is_refused() {
             "lists {lists:?} must be refused"
         );
         assert!(desktop.response().is_none());
+    }
+}
+
+/// An **advertisement** is a compatibility surface: it may name algorithms this
+/// build does not implement, and that must not cost the peer the handshake. The
+/// unknown ids are skipped and the rest is negotiated, so `[3, 1]` still yields
+/// `AES_256_GCM` / `SHA256` / `ED25519`.
+///
+/// The defect this catches: the advertisement path decoding each id with
+/// `try_from(...)?` inside a `collect`, so a single id from a newer peer refuses a
+/// peer that also advertised the baseline — the forward compatibility
+/// `cryptography-specification.md` §1.4 promises an older Client.
+#[test]
+fn init_advertising_an_unknown_id_alongside_the_baseline_negotiates_the_baseline() {
+    let baseline = NegotiatedAlgorithms {
+        symmetric_algorithm: SymmetricAlgorithm::Aes256Gcm,
+        hash_algorithm: HashAlgorithm::Sha256,
+        signature_algorithm: SignatureAlgorithm::Ed25519,
+    };
+
+    for lists in [
+        (vec![3, 1], vec![1], vec![1]),
+        (vec![1, 3], vec![1], vec![1]),
+        (vec![1], vec![3, 1], vec![1]),
+        (vec![1], vec![1], vec![3, 1]),
+        (vec![99, 3, 1], vec![2, 99, 1], vec![1, 99]),
+    ] {
+        let (symmetric, hash, signature) = lists.clone();
+        let init = init_with_algorithms(symmetric, hash, signature);
+        let mut desktop = seeded_desktop([0x6Du8; PAIRING_SESSION_ID_LEN]);
+        let response = desktop
+            .handle_init(&init)
+            .unwrap_or_else(|e| panic!("lists {lists:?} must negotiate, got {e:?}"));
+
+        assert_eq!(
+            response.selected_symmetric_algorithm, baseline.symmetric_algorithm as i32,
+            "lists {lists:?} must negotiate the baseline symmetric algorithm"
+        );
+        assert_eq!(
+            response.selected_hash_algorithm, baseline.hash_algorithm as i32,
+            "lists {lists:?} must negotiate the baseline hash algorithm"
+        );
+        assert_eq!(
+            response.selected_signature_algorithm, baseline.signature_algorithm as i32,
+            "lists {lists:?} must negotiate the baseline signature algorithm"
+        );
+        assert_eq!(desktop.negotiated(), Some(baseline), "lists {lists:?}");
+        assert!(
+            desktop.sas().is_some(),
+            "lists {lists:?}: skipping the unknown id must establish the session"
+        );
     }
 }
 
@@ -870,6 +928,96 @@ fn transcript_hash_binds_every_negotiated_field() {
     // attempts above never touched it.
     assert_eq!(phone.transcript_hash().unwrap(), &baseline_hash);
     assert_eq!(phone.sas().unwrap(), baseline_sas.as_str());
+}
+
+/// The transcript commits to an advertisement as **raw wire ids**: a peer that also
+/// advertises an id this build cannot name produces a different `H` than the same peer
+/// advertising only the baseline, even though both negotiate the same suite.
+///
+/// The defect this catches: hashing the *decoded* lists. `[1, 3]` and `[1]` decode to
+/// the same `[AES_256_GCM]`, so two peers that put different bytes on the wire would
+/// derive the same `H` — and therefore the same keys and SAS — from a transcript that
+/// depends on what the *receiver* could name.
+#[test]
+fn an_unknown_advertised_id_changes_the_transcript_hash() {
+    let session_id = [0x6Eu8; PAIRING_SESSION_ID_LEN];
+
+    let mut baseline = seeded_desktop(session_id);
+    baseline
+        .handle_init(&init_with_algorithms(vec![1], vec![1], vec![1]))
+        .unwrap();
+    let baseline_hash = *baseline.transcript_hash().unwrap();
+
+    let mut extra = seeded_desktop(session_id);
+    let response = extra
+        .handle_init(&init_with_algorithms(vec![1, 3], vec![1], vec![1]))
+        .unwrap()
+        .clone();
+    let extra_hash = *extra.transcript_hash().unwrap();
+
+    // The unknown id is skipped by the negotiation...
+    assert_eq!(
+        response.selected_symmetric_algorithm,
+        SymmetricAlgorithm::Aes256Gcm as i32
+    );
+    assert_eq!(
+        extra.negotiated(),
+        baseline.negotiated(),
+        "an id neither side can name must not change what is negotiated"
+    );
+    // ...but it is not skipped by the transcript.
+    assert_ne!(
+        extra_hash, baseline_hash,
+        "the advertised list must enter H as the raw wire ids, not as the ids this \
+         build can name"
+    );
+}
+
+/// Both roles commit to the same advertisement for the same wire ids, **including**
+/// when it names an id this build cannot name: the phone's `H` over what it sent
+/// equals the desktop's `H` over what it received, so the signatures, the keys and the
+/// SAS all still agree and the pairing completes.
+///
+/// The defect this catches: one role hashing the wire ids while the other hashes the
+/// decoded list. A newer peer's extra id would then leave the two sides with different
+/// `H`, different keys and different SAS, and the pairing would die at the signature
+/// check *after* negotiating successfully — the failure the forward-compatibility rule
+/// exists to prevent.
+#[test]
+fn both_roles_hash_the_same_raw_advertisement() {
+    let session_id = [0x6Fu8; PAIRING_SESSION_ID_LEN];
+    let mut desktop = seeded_desktop(session_id);
+    let qr_pk = desktop.client_x25519_public_key();
+    let mut phone = seeded_phone(session_id);
+    // As a newer build would advertise: its own baseline, plus an id this one cannot
+    // name. Only the test seam can produce the second, which is why the rule has no
+    // other way to be exercised.
+    phone.set_advertised_unknown(vec![3]).unwrap();
+
+    let init = phone.create_init().unwrap();
+    assert_eq!(
+        init.supported_symmetric_algorithms,
+        vec![SymmetricAlgorithm::Aes256Gcm as i32, 3],
+        "the unknown id must travel on the wire, after this build's own list"
+    );
+
+    let response = desktop.handle_init(&init).unwrap().clone();
+    // The desktop's signature is over *its* `H`; the phone accepting it is the phone
+    // recomputing `H` from its own view of the same advertisement.
+    phone.verify_response(&response, &qr_pk).unwrap();
+
+    assert_eq!(
+        desktop.transcript_hash(),
+        phone.transcript_hash(),
+        "the two roles must hash the same bytes for the same advertisement"
+    );
+    assert_eq!(desktop.sas().unwrap(), phone.sas().unwrap());
+    assert_eq!(
+        desktop.negotiated().unwrap().symmetric_algorithm,
+        SymmetricAlgorithm::Aes256Gcm,
+        "the unknown id is skipped by the negotiation on both sides"
+    );
+    assert_eq!(phone.negotiated(), desktop.negotiated());
 }
 
 // --- 8. Client-wide algorithm pinning --------------------------------
@@ -1763,4 +1911,98 @@ fn full_pairing_round_trips_every_frame_through_the_wire_codec() {
         desktop.verify_abort(&desktop_abort).unwrap_err(),
         ProtocolError::InvalidSignature
     ));
+}
+
+// --- 12. The peer-supplied device name is bounded on receive ----------
+
+/// A `PairingInit` naming its phone with more than 64 bytes is refused, never
+/// shortened into the transcript.
+///
+/// The defect this catches: `ClientPairingState::handle_init` splicing
+/// `init.server_device_name` into `H` exactly as received while only *our* own
+/// name is cut to [`PAIRING_DEVICE_NAME_MAX_BYTES`] at build time — so the stated
+/// bound on that transcript field does not hold against a hostile peer, and a
+/// name shortened on one side (or not shortened at all) makes two peers hash
+/// different bytes for the same handshake. The 64-byte form is asserted to still
+/// pair, so the check is a bound and not a ban.
+#[test]
+fn a_pairing_init_with_an_over_long_device_name_is_refused() {
+    let (mut desktop, started) = start_desktop();
+    let mut phone =
+        ServerPairingSession::new(started.session_id, phone_identity(), "pixel").unwrap();
+    let mut init = phone.create_init().unwrap();
+
+    // 65 bytes: one byte past the budget.
+    init.server_device_name = "x".repeat(PAIRING_DEVICE_NAME_MAX_BYTES + 1);
+    assert!(matches!(
+        desktop.handle_init(&init).unwrap_err(),
+        ProtocolError::InvalidMessageFormat
+    ));
+    // The refusal is not a partial handshake: nothing was cached, derived or
+    // taken, so the session is exactly as it was before the frame arrived.
+    assert!(
+        desktop.response().is_none(),
+        "a refused init must not be cached"
+    );
+    assert!(desktop.transcript_hash().is_none(), "no H may exist");
+    assert!(desktop.sas().is_none(), "no session keys may be derived");
+    assert!(desktop.negotiated().is_none());
+    assert!(!desktop.session_keys_present());
+    assert!(
+        desktop.ephemeral_keypair_present(),
+        "the ephemeral x_C is taken only by a derivation, so a refused init keeps it"
+    );
+
+    // 66 bytes made of three-byte characters: the budget is on bytes, so this is
+    // refused even though it is only 22 chars.
+    init.server_device_name = "\u{20ac}".repeat(22);
+    assert_eq!(init.server_device_name.len(), 66);
+    assert_eq!(init.server_device_name.chars().count(), 22);
+    assert!(matches!(
+        desktop.handle_init(&init).unwrap_err(),
+        ProtocolError::InvalidMessageFormat
+    ));
+
+    // The boundary: exactly 64 bytes still pairs, and both sides agree on the SAS.
+    let at_the_limit = "x".repeat(PAIRING_DEVICE_NAME_MAX_BYTES);
+    let (mut desktop, started) = start_desktop();
+    let mut phone =
+        ServerPairingSession::new(started.session_id, phone_identity(), &at_the_limit).unwrap();
+    let init = phone.create_init().unwrap();
+    assert_eq!(init.server_device_name.len(), PAIRING_DEVICE_NAME_MAX_BYTES);
+    let response = desktop.handle_init(&init).unwrap().clone();
+    phone
+        .verify_response(&response, &started.client_x25519_public_key)
+        .unwrap();
+    assert_eq!(desktop.sas(), phone.sas());
+}
+
+/// The phone applies the same bound to the desktop's `client_device_name`, so the
+/// invariant holds symmetrically rather than on one receive path only.
+///
+/// The defect this catches: `ServerPairingSession::verify_response` hashing an
+/// over-long `response.client_device_name` verbatim, which both removes the bound
+/// on a peer-supplied transcript field and lets a desktop choose a name the phone
+/// would then display and persist.
+#[test]
+fn a_pairing_response_with_an_over_long_client_device_name_is_refused() {
+    let (desktop, mut phone, response, qr_pk) = exchange();
+
+    let mut over_long = response.clone();
+    over_long.client_device_name = "\u{e9}".repeat(33); // 66 bytes, 33 chars
+    assert_eq!(over_long.client_device_name.len(), 66);
+    assert!(matches!(
+        phone.verify_response(&over_long, &qr_pk).unwrap_err(),
+        ProtocolError::InvalidMessageFormat
+    ));
+    // Nothing was derived or cached for the refused response...
+    assert!(phone.transcript_hash().is_none(), "no H may exist");
+    assert!(phone.sas().is_none(), "no session keys may be derived");
+    assert!(!phone.session_keys_present());
+    assert!(phone.negotiated().is_none());
+
+    // ...and the genuine response still verifies afterwards, so the refusal did
+    // not consume the one response a phone may verify.
+    phone.verify_response(&response, &qr_pk).unwrap();
+    assert_eq!(desktop.sas(), phone.sas());
 }

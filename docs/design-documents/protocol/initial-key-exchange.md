@@ -29,7 +29,7 @@ sequenceDiagram
     User->>Client (Desktop): Initiate pairing (StartPairing)
     Client (Desktop)->>Client (Desktop): Generate ephemeral X25519 (X_C), random sid (16B)
     Client (Desktop)->>Client (Desktop): Bind ephemeral UDP socket [::]:0 & start BLE pairing adv
-    Client (Desktop)-->>User: Display QR Code (v=2, sid, pk=X_C, p, ip4, ip6)
+    Client (Desktop)-->>User: Display QR Code (v=2, sid, pk=X_C, optional p/ip4/ip6)
 
     User->>Server (Phone): Scan QR Code
     Server (Phone)->>Server (Phone): Generate ephemeral X25519 (X_S)
@@ -89,12 +89,13 @@ When the user triggers pairing (`StartPairing` IPC):
    * The daemon keeps the **same static 4-characteristic GATT service** registered (with `PAIRING_CHAR_UUID`), avoiding Android `BD_ADDR` GATT handle cache staleness immediately after pairing.
 4. **QR Code URL**:
    ```text
-   tapauth://pair?v=2&sid=<16B-hex>&pk=<32B-x25519-hex>&p=<udp_port>&ip4=<ipv4>&ip6=<ipv6>
+   tapauth://pair?v=2&sid=<32 hex>&pk=<64 hex>[&p=<udp_port>][&ip4=<ipv4>][&ip6=<ipv6>]
    ```
-   * `v=2`: Protocol v2 pairing version.
-   * `sid`: 16-byte random session identifier (hex).
-   * `pk`: Client's 32-byte ephemeral X25519 public key $X_C$ (hex).
-   * `p`, `ip4`, `ip6`: Ephemeral UDP pairing port and Client IPv4/IPv6 addresses (optional when BLE-only pairing is used; the Server must allow proceeding without IPs when BLE is available).
+   * `v=2`: Protocol v2 pairing version; every other version is refused.
+   * `sid`: 16-byte random session identifier, written as exactly 32 hex characters.
+   * `pk`: Client's 32-byte ephemeral X25519 public key $X_C$, written as exactly 64 hex characters and never the all-zero key (the Server reads an all-zero `pk` as its "skip the QR comparison" sentinel, so an honest Client never emits one).
+   * `p`, `ip4`, `ip6`: **optional** — the ephemeral UDP pairing port and the Client's IPv4/IPv6 addresses, present only when a UDP pairing socket exists; a BLE-only session omits all three and the Server must proceed without them when BLE is available. A present `p` is ASCII digits in `1..=65535` (`0` is not an endpoint).
+   * The whole URL is capped at 512 bytes (`MAX_PAIRING_URL_LEN`, `shared/src/models.rs`), every query key may appear at most once, and values are percent-encoded by the generator and percent-decoded by the parser under mirrored rules — `generate_pairing_url_v2` and `PairingInfo::parse` in `shared/src/models.rs`, with `PairingUrl.parse` in Kotlin and `shared/testdata/pairing_url_vectors.json` pinning the two together.
 
 ### Step 2: Server Initiates Unified UDP + BLE Transport Race (`PairingInit`)
 
@@ -104,7 +105,7 @@ Upon scanning the QR code, the Server (Android):
 3. Constructs a single `PairingPacket { version: 2, session_id, msg: PairingInit(...) }` containing:
    * `server_x25519_public_key` ($X_S$)
    * `server_ed25519_public_key` ($Ed_S$, the phone's long-term signing key)
-   * `server_device_name` (truncated to max 64 UTF-8 bytes)
+   * `server_device_name` (the phone's display name, and part of the transcript: **required and non-blank** — a name that is empty, whitespace-only, or made only of zero-width/format code points is refused with `PairingAbort(PROTOCOL_ERROR)` rather than stored, see the pre-validation in Step 3 — and at most 64 UTF-8 bytes, which the Server enforces by cutting its own name on a character boundary before sending)
    * `supported_symmetric_algorithms`, `supported_hash_algorithms`, `supported_signature_algorithms` — the algorithms this build implements, taken from `SUPPORTED_*` in `shared/src/protocol/pairing/negotiation.rs` in list order (preferred first). Today that is one element each — `[AES_256_GCM]`, `[SHA256]`, `[ED25519]` — because v2 ships one active primitive per slot; a later release appends the new id (next free tag, never `2`) first in that slice and keeps the baseline, so a Client that implements only the baseline still finds a match. The protocol version is not negotiated: only v2 is accepted (see [`authentication-flow.md`](authentication-flow.md) §2.6).
 4. Races the transports:
    * **UDP**: If IP & port are present, sends `PairingInit` every **500ms** (up to 15s) until `PairingResponse` arrives.
@@ -114,6 +115,14 @@ Upon scanning the QR code, the Server (Android):
 ### Step 3: Client Algorithm Negotiation, Transcript Hash & Signed `PairingResponse`
 
 Upon receiving `PairingInit` matching `session_id`:
+
+**Two refusals are decided before anything below runs**, because everything below is one-way: from step 2 onwards $H$, $K_{\text{c2s}}$/$K_{\text{s2c}}$ and the SAS exist, and every frame the Client sends — a refusal included — would then be tagged under them.
+
+* **Blank device name.** `server_device_name` must name the phone: a name that is empty, whitespace-only, or built only from zero-width/format code points is refused with `PairingAbort(PROTOCOL_ERROR)` (`Session::on_init` in `tapauthd/src/pairing.rs`, which applies the same normalization rules as the display sanitizer). No $H$, no keys, no negotiated algorithms and no session state are produced for that init, and nothing is persisted.
+* **Over-long peer name.** A `server_device_name` longer than 64 UTF-8 bytes is refused as `ProtocolError` (`ClientPairingState::handle_init`) instead of being truncated: the field is spliced into $H$ exactly as received, so silently shortening it would let two peers hash different bytes for the same handshake. `ServerPairingSession::verify_response` applies the identical rule to `response.client_device_name`, so the bound holds symmetrically. Only names *we* build are truncated (the Client cuts its own name, the Server its own, to 64 bytes on a character boundary).
+
+The abort of a refusal decided at that point is **sent without a MAC** (`auth_tag` empty): no $K_{\text{dir}}$ exists yet, so there is nothing to sign it with. That is the reason the decision belongs here and not after step 2 — a `PROTOCOL_ERROR` raised later could only be tagged under a key the phone never derived, which the phone's `verify_abort` reports as an invalid signature and (per Step 4) ignores. A tag-less abort is unauthenticated by construction and is likewise ignored, so the abort is informational for a peer that is misbehaving, and the Server's own deadline remains the backstop.
+
 1. The Client intersects each `supported_*` list from `PairingInit` with its own supported algorithms (preferring the active CSK's `SymmetricAlgorithm` and `HashAlgorithm` if a `CSK` already exists so all paired Servers remain compatible with multicast packets). If any intersection is empty, the Client sends `PairingAbort(UNSUPPORTED_ALGORITHM)` and aborts.
 2. The Client computes the canonical **Handshake Transcript Hash** $H$ over all security-relevant parameters (`version`, `session_id`, $X_C$, $X_S$, $Ed_C$, $Ed_S$, normalized device names, the full `supported_*` lists, and the selected algorithms — see [`cryptography-specification.md`](cryptography-specification.md)).
 3. The Client signs `"tapauth-pair-client-sig-v2" || H` using its static Ed25519 private key ($Ed_{C,\text{priv}}$) to prove possession of $Ed_C$ and bind it to the transcript.
@@ -130,11 +139,11 @@ Before displaying the SAS to the user, the Server **must**:
 1. Perform a **constant-time equality check**: `response.client_x25519_public_key == qr.pk` (`ServerPairingSession::verify_response`, `shared/src/protocol/pairing/server.rs`). An active attacker cannot substitute $X_C$ even before SAS verification.
 2. Compute $H$ from its own view of the handshake fields and verify `response.client_signature` over `"tapauth-pair-client-sig-v2" || H` using `response.client_ed25519_public_key`.
 3. Verify the selected algorithms are in its own supported sets.
-4. Compute $Z = \text{X25519}(x_S, X_C)$ (rejecting all-zero output), $\text{PRK}$, $K_{\text{c2s}}$, $K_{\text{s2c}}$, and the 6-digit SAS:
-   $$\text{SAS} = \text{format!}(\text{"\{:06\}"},\; \text{u64::from\_be\_bytes}(\text{SAS\_bytes}) \bmod 1{,}000{,}000)$$
-   formatted visually as `"123-456"`.
+4. Compute $Z = \text{X25519}(x_S, X_C)$ (rejecting all-zero output), $\text{PRK}$, $K_{\text{c2s}}$, $K_{\text{s2c}}$, and the 6-digit SAS, where $n = \text{u64::from\_be\_bytes}(\text{SAS\_bytes}) \bmod 1{,}000{,}000$:
+   $$\text{SAS} = \text{format!}(\text{"\{:03\}-\{:03\}"},\; n / 1000,\; n \bmod 1000)$$
+   i.e. the zero-padded three-digit halves joined by a hyphen (`format!("{:03}-{:03}", …)` in `shared/src/crypto/kdf.rs`, the string both sides display unchanged — `"123-456"`).
 
-A failing check does **not** produce a `PairingAbort`. The Server logs the rejection (`PairingResponse rejected: …`) and **silently drops the packet**, then keeps listening for an acceptable `PairingResponse` on either transport until its own response deadline expires (`server-android/app/src/main/java/dev/rourunisen/tapauth/network/PairingSession.kt:72-74`, `:473-500`, `:503-530`; the Rust entry point returns `ProtocolError::ChallengeMismatch` / `ProtocolError::UnsupportedAlgorithm` for the caller to swallow). This is deliberate: the pairing UDP port and the BLE characteristic are reachable by anyone on the link, so one spoofed packet must not be able to abort a pairing that is in progress. Only an *authenticated* `PairingAbort` (MAC'd under $K_{\text{dir}}$, see below) or the deadline ends the session early, and the Server's own abort reasons are limited to `USER_REJECTED_SAS` and `SESSION_EXPIRED` (`PairingSession.kt:177-181`). `KEY_MISMATCH` and `PROTOCOL_ERROR` therefore remain declared in [`proto/auth_protocol.proto`](../../../proto/auth_protocol.proto) but are never emitted for an unverifiable response — neither side learns why the packet was ignored.
+A failing check does **not** produce a `PairingAbort`. The Server logs the rejection (`PairingResponse rejected: …`) and **silently drops the packet**, then keeps listening for an acceptable `PairingResponse` on either transport until its own response deadline expires (`server-android/app/src/main/java/dev/rourunisen/tapauth/network/PairingSession.kt:72-74`, `:473-500`, `:503-530`; the Rust entry point returns `ProtocolError::ChallengeMismatch` / `ProtocolError::UnsupportedAlgorithm` / `ProtocolError::InvalidMessageFormat` — the last one for a `client_device_name` over 64 UTF-8 bytes, which is refused rather than truncated — for the caller to swallow). This is deliberate: the pairing UDP port and the BLE characteristic are reachable by anyone on the link, so one spoofed packet must not be able to abort a pairing that is in progress. Only an *authenticated* `PairingAbort` (MAC'd under $K_{\text{dir}}$, see below) or the deadline ends the session early, and the Server's own abort reasons are limited to `USER_REJECTED_SAS` and `SESSION_EXPIRED` (`PairingSession.kt:177-181`). `KEY_MISMATCH` and `PROTOCOL_ERROR` therefore remain declared in [`proto/auth_protocol.proto`](../../../proto/auth_protocol.proto) but are never emitted for an unverifiable response — neither side learns why the packet was ignored.
 
 Because **both** $K_{\text{c2s}}/K_{\text{s2c}}$ and $\text{SAS}$ are derived from $\text{HKDF-Extract}(\text{salt}=H, \text{ikm}=Z)$, tampering with **any** field — $X_C, X_S, Ed_C, Ed_S$, device names, or negotiated algorithms — produces a completely different $H$ and causes an overwhelming SAS mismatch (1 in $10^6$).
 

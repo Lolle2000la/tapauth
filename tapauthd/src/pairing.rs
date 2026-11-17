@@ -85,9 +85,9 @@
 
 use crate::auth_handler::DaemonState;
 use shared::config::CskMetadata;
-use shared::crypto::Ed25519KeyPair;
+use shared::crypto::{ClientSymmetricKey, Ed25519KeyPair};
 use shared::firewall::{FirewallError, FirewallGuard, Protocol as FirewallProtocol};
-use shared::protocol::messages::PROTOCOL_VERSION_V2;
+use shared::protocol::messages::{sanitize_context_string, PROTOCOL_VERSION_V2};
 use shared::protocol::pairing::{
     decode_pairing_packet, encode_pairing_packet, pairing_session_id, ClientPairingState,
     NegotiatedAlgorithms, PairingEndpoint, PinnedAlgorithms, StartedPairing,
@@ -449,9 +449,14 @@ impl PairingState {
 /// The worker retransmits `PairingConfirmClient` every [`RETRANSMIT_INTERVAL`]
 /// (and immediately on every keepalive) until `verify_confirm_server` passes, the
 /// phone aborts, or the session expires.
+///
+/// `csk` is taken as a [`ClientSymmetricKey`] rather than raw bytes so the worker
+/// never holds an un-zeroized copy: it is moved into the request, then into the
+/// session's [`Provisioning`], and wiped (via `SecretBox`) when that is dropped —
+/// including on every failure path.
 pub(crate) async fn request_completion(
     commands: &mpsc::Sender<SessionCommand>,
-    csk: [u8; 32],
+    csk: ClientSymmetricKey,
     username: String,
     client_hostname: String,
 ) -> Result<CompletedPairing, PairingError> {
@@ -846,7 +851,9 @@ pub(crate) enum SessionCommand {
 }
 
 pub(crate) struct CompleteRequest {
-    csk: [u8; 32],
+    /// The CSK to provision. Zeroizing storage, so a request the worker drops
+    /// without answering (a cancelled session) does not leave the key in memory.
+    csk: ClientSymmetricKey,
     username: String,
     client_hostname: String,
     reply: oneshot::Sender<Result<CompletedPairing, PairingError>>,
@@ -856,7 +863,9 @@ pub(crate) struct CompleteRequest {
 /// phone proves it received the CSK.
 struct Provisioning {
     /// Needed to verify `PairingConfirmServer` (the proof is over `H || csk`).
-    csk: [u8; 32],
+    /// Zeroizing storage: the only copy the worker holds, wiped when the
+    /// provisioning ends or the session is dropped.
+    csk: ClientSymmetricKey,
     /// Answered once the session tears down, with the outcome.
     reply: oneshot::Sender<Result<CompletedPairing, PairingError>>,
     /// When the cached frame last went out, or `None` before the first send.
@@ -940,6 +949,26 @@ async fn recv_datagram(
     }
 }
 
+/// Whether a `PairingInit` names no phone: the name is empty, whitespace only,
+/// or nothing but zero-width/format code points.
+///
+/// The rule is exactly "the shared sanitizer's normalized form is empty", so the
+/// character sets are not restated here: a name is blank when, after ANSI escape
+/// sequences are removed as a unit and every code point that is either a
+/// whitespace code point (collapsed to one space, both ends trimmed) or a
+/// forbidden one (controls, bidi formatters, zero-width, BOM) is dropped, nothing
+/// is left — see `sanitize_context_string`, whose rule set the Kotlin mirror and
+/// the vector file already pin.
+///
+/// This is a decision about *whether* the name is usable, not a rewrite of it:
+/// the name stored in [`AcceptedInit`] and spliced into the transcript stays
+/// exactly as the phone sent it.
+fn is_blank_device_name(name: &str) -> bool {
+    /// Only the normalization matters here, so the budget never binds.
+    const NO_TRUNCATION: usize = usize::MAX;
+    sanitize_context_string(name, NO_TRUNCATION).is_empty()
+}
+
 /// A `PairingInit` this session accepted, as one value.
 ///
 /// These fields belong together and nothing but [`Session::on_init`] ever wrote
@@ -962,26 +991,32 @@ struct AcceptedInit {
 }
 
 impl AcceptedInit {
-    /// Accept an init that names its phone.
+    /// Record an init whose phone name is known not to be blank.
     ///
-    /// `None` when the name is empty: there is no way back from that, because a
-    /// phone persisted with no name is indistinguishable downstream from one
-    /// whose name was lost, so the init is refused instead of half-accepted.
+    /// The name is validated exactly once, by [`Session::on_init`] through
+    /// [`is_blank_device_name`], *before* [`ClientPairingState::handle_init`]
+    /// derives `H` and the session keys: a refusal decided after derivation could
+    /// only be announced with an abort tagged under keys the phone does not have
+    /// yet. The `debug_assert!` below restates that invariant instead of
+    /// re-checking it, because at this point it is no longer the phone's message
+    /// that would be wrong — the keys exist, so there is no way back, and a blank
+    /// name would be our own bug.
     fn new(
         peer: Peer,
         response_frame: Vec<u8>,
         server_public_key: [u8; 32],
         device_name: String,
-    ) -> Option<Self> {
-        if device_name.is_empty() {
-            return None;
-        }
-        Some(Self {
+    ) -> Self {
+        debug_assert!(
+            !is_blank_device_name(&device_name),
+            "a PairingInit that names no phone must be refused before `handle_init`"
+        );
+        Self {
             peer,
             response_frame,
             server_public_key,
             device_name,
-        })
+        }
     }
 }
 
@@ -998,8 +1033,9 @@ impl AcceptedInit {
 ///   accepted": its peer, cached response, `Ed_S` and phone name are one
 ///   [`AcceptedInit`], built in one expression by [`Session::on_init`]. Its peer
 ///   is re-pointed by that method's refresh arm and by [`Session::on_keepalive`],
-///   never cleared. A name cannot go missing from it: [`AcceptedInit::new`]
-///   refuses an empty one, so no `CompletedPairing` can carry a nameless phone.
+///   never cleared. A name cannot go missing from it: [`Session::on_init`]
+///   refuses a blank one *before* the handshake derives any key, so no
+///   `CompletedPairing` can carry a nameless phone.
 /// * **Provisioning** — `confirm_frame.is_some() ⟺ provisioning.is_some()`: two
 ///   adjacent writes in [`Session::on_complete`], no `await` between them.
 /// * `completion.is_some() ⟹ provisioning.is_some()`: a pending
@@ -1346,6 +1382,21 @@ impl Session {
             }
         };
 
+        // Decided here, and only here, because everything below this line is
+        // one-way: `handle_init` derives `H`, `K_c2s`/`K_s2c` and the SAS, and
+        // from then on every frame we send — the refusal included — is tagged
+        // under those keys. The phone cannot check such a tag before it has the
+        // response (it has no keys yet), so a refusal decided after derivation
+        // would reach it as an abort it must ignore. Nothing has been derived,
+        // committed or published when this returns, so the abort that goes out
+        // carries no tag, which is the honest form: no key exists to sign with.
+        if is_blank_device_name(&init.server_device_name) {
+            tracing::warn!("Rejecting PairingInit: the phone sent a blank device name");
+            return self
+                .reject_init(PairingAbortReason::ProtocolError, source)
+                .await;
+        }
+
         let response = match self.state.handle_init(&init) {
             Ok(response) => response.clone(),
             Err(e) => {
@@ -1377,15 +1428,9 @@ impl Session {
         };
 
         // One value for the whole of "accepted", so there is no window in which
-        // the peer, the cached response and the phone's identity disagree.
-        let Some(accepted) =
-            AcceptedInit::new(source, frame, server_public_key, init.server_device_name)
-        else {
-            tracing::warn!("Rejecting PairingInit: the phone sent no device name");
-            return self
-                .reject_init(PairingAbortReason::ProtocolError, source)
-                .await;
-        };
+        // the peer, the cached response and the phone's identity disagree. The
+        // name was validated before `handle_init`, so this cannot be refused here.
+        let accepted = AcceptedInit::new(source, frame, server_public_key, init.server_device_name);
         let sas = self.state.sas().map(str::to_string);
         let cached = accepted.response_frame.clone();
         self.accepted = Some(accepted);
@@ -1441,16 +1486,18 @@ impl Session {
     }
 
     async fn on_confirm_server(&mut self, confirm: &PairingConfirmServer) -> Flow {
+        // Borrowed, not copied: the proof is verified against the one copy the
+        // provisioning holds.
         let Some(csk) = self
             .provisioning
             .as_ref()
-            .map(|provisioning| provisioning.csk)
+            .map(|provisioning| provisioning.csk.as_bytes())
         else {
             tracing::debug!("Ignoring PairingConfirmServer: no CSK was provisioned yet");
             return Flow::Continue;
         };
 
-        if let Err(e) = self.state.verify_confirm_server(confirm, &csk) {
+        if let Err(e) = self.state.verify_confirm_server(confirm, csk) {
             // A proof that does not verify must not kill the session: the phone
             // may still be settling, and the check is cheap. Keep retransmitting
             // PairingConfirmClient until the deadline (Step 5).
@@ -1479,8 +1526,8 @@ impl Session {
             );
         };
         // The accepted init is the only source of the two fields the admin handler
-        // persists, and `AcceptedInit::new` refused to hold an empty name, so the
-        // published `CompletedPairing` always names the phone.
+        // persists, and `on_init` refused a blank name before the handshake ran, so
+        // the published `CompletedPairing` always names the phone.
         let server_public_key = accepted.server_public_key;
         let server_device_name = accepted.device_name.clone();
 
@@ -1561,7 +1608,7 @@ impl Session {
         };
 
         let confirm = match self.state.create_confirm_client(
-            &request.csk,
+            request.csk.as_bytes(),
             &request.username,
             &request.client_hostname,
         ) {
@@ -2147,8 +2194,8 @@ mod tests {
     /// that value are set with it (`Session`'s invariants): a session with a
     /// `peer` and no cached response is a state the daemon never reaches. The
     /// cached frame is empty because the fixture never ran the handshake, only
-    /// the handlers, and the name is a real one because `AcceptedInit` refuses an
-    /// empty one.
+    /// the handlers, and the name is a real one because `AcceptedInit` holds only
+    /// a name `on_init` has already accepted.
     async fn test_session(
         state: ClientPairingState,
         session_id: [u8; PAIRING_SESSION_ID_LEN],
@@ -2166,15 +2213,12 @@ mod tests {
             link: PairingLink::start([0u8; 10], false).await,
             phase,
             commands,
-            accepted: Some(
-                AcceptedInit::new(
-                    Peer::Udp(SocketAddr::from((Ipv4Addr::LOCALHOST, 41_000))),
-                    Vec::new(),
-                    [0u8; 32],
-                    "pixel".to_string(),
-                )
-                .expect("the fixture names its phone"),
-            ),
+            accepted: Some(AcceptedInit::new(
+                Peer::Udp(SocketAddr::from((Ipv4Addr::LOCALHOST, 41_000))),
+                Vec::new(),
+                [0u8; 32],
+                "pixel".to_string(),
+            )),
             confirm_frame: None,
             provisioning: None,
             completion: None,
@@ -2296,10 +2340,14 @@ mod tests {
             .await;
         });
 
-        let completed =
-            request_completion(&commands, csk, "luca".to_string(), "thinkpad".to_string())
-                .await
-                .unwrap();
+        let completed = request_completion(
+            &commands,
+            ClientSymmetricKey::from_bytes(csk),
+            "luca".to_string(),
+            "thinkpad".to_string(),
+        )
+        .await
+        .unwrap();
         phone_side.await.unwrap();
 
         assert_eq!(
@@ -2387,7 +2435,7 @@ mod tests {
             async move {
                 request_completion(
                     &commands,
-                    [0x5Au8; 32],
+                    ClientSymmetricKey::from_bytes([0x5Au8; 32]),
                     "luca".to_string(),
                     "thinkpad".to_string(),
                 )
@@ -3013,6 +3061,159 @@ mod tests {
             SessionPhase::Failed(
                 "the phone's pairing request was refused (PROTOCOL_ERROR)".to_string()
             )
+        );
+    }
+
+    /// A session that has accepted no `PairingInit` yet, plus a loopback phone
+    /// socket and a `PairingInit` that names the phone `name`, so `Session::on_init`
+    /// can be driven for real (a first init needs no locked peer).
+    async fn session_and_init(
+        name: &str,
+    ) -> (
+        Session,
+        watch::Receiver<SessionPhase>,
+        UdpSocket,
+        PairingInit,
+    ) {
+        let (desktop, started) = ClientPairingState::start(
+            Ed25519KeyPair::from_signing_key_bytes(&DESKTOP_SEED).unwrap(),
+            "thinkpad",
+            PairingEndpoint {
+                udp_port: Some(36_692),
+                ipv4: Some(Ipv4Addr::LOCALHOST),
+                ipv6: None,
+            },
+            None,
+        )
+        .unwrap();
+        let mut phone = ServerPairingSession::new(
+            started.session_id,
+            Ed25519KeyPair::from_signing_key_bytes(&PHONE_SEED).unwrap(),
+            name,
+        )
+        .unwrap();
+        let init = phone.create_init().unwrap();
+        let phone_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (mut session, phases) = test_session(desktop, started.session_id).await;
+        // `test_session` pre-accepts an init so the other handlers can run; a
+        // *first* `PairingInit` needs the pre-accept state instead.
+        session.accepted = None;
+        (session, phases, phone_socket, init)
+    }
+
+    /// Every shape of "this init names no phone" is refused: empty, padding
+    /// whitespace, and a name made only of zero-width/format code points.
+    ///
+    /// The defect this catches: the previous predicate, a bare `is_empty()`, under
+    /// which `"   "` and `"\u{200B}\u{200D}"` were accepted and then persisted as
+    /// the paired device's display name — a phone the user can never recognise,
+    /// and a transcript field that renders as nothing.
+    #[tokio::test]
+    async fn a_pairing_init_with_a_whitespace_or_zero_width_device_name_is_refused() {
+        // Empty, whitespace-only (including the non-ASCII spaces), and names built
+        // only from zero-width/bidi code points, which `str::trim` leaves intact.
+        let blanks = [
+            "",
+            "   ",
+            "\t\n ",
+            "\u{00A0}\u{3000}",
+            "\u{200B}\u{200D}",
+            "\u{2060}\u{FEFF}",
+        ];
+        for blank in blanks {
+            assert!(
+                is_blank_device_name(blank),
+                "{blank:?} must count as a blank device name"
+            );
+
+            let (mut session, phases, phone_socket, init) = session_and_init(blank).await;
+            assert_eq!(
+                init.server_device_name, blank,
+                "the frame under test must carry {blank:?}"
+            );
+            let flow = session
+                .on_init(init, Peer::Udp(phone_socket.local_addr().unwrap()))
+                .await;
+            assert!(matches!(flow, Flow::Done), "{blank:?} must end the session");
+            assert!(session.accepted.is_none(), "{blank:?} must not be accepted");
+            assert!(
+                session.completion.is_none(),
+                "{blank:?} must not produce a CompletedPairing"
+            );
+            assert_eq!(
+                phases.borrow().clone(),
+                SessionPhase::AwaitingPhone,
+                "{blank:?} must not publish an accepted phase"
+            );
+
+            // The refusal reaches the phone as a PROTOCOL_ERROR abort, not silence.
+            match recv_frame(&phone_socket).await.msg {
+                Some(pairing_packet::Msg::Abort(abort)) => assert_eq!(
+                    abort.reason,
+                    PairingAbortReason::ProtocolError as i32,
+                    "{blank:?} must be refused as PROTOCOL_ERROR"
+                ),
+                other => panic!("expected a PairingAbort for {blank:?}, got {:?}", other),
+            }
+
+            session.finish().await;
+            assert_eq!(
+                phases.borrow().clone(),
+                SessionPhase::Failed(
+                    "the phone's pairing request was refused (PROTOCOL_ERROR)".to_string()
+                )
+            );
+        }
+    }
+
+    /// The blank-name refusal is decided **before** `handle_init`: no transcript,
+    /// no keys, no negotiation, no cached response — and the abort it sends is
+    /// untagged, because no key exists to tag it with.
+    ///
+    /// The defect this catches: validating inside `AcceptedInit::new`, i.e. after
+    /// `ClientPairingState::handle_init`. There the desktop has already derived
+    /// `H`, `K_c2s`/`K_s2c` and the SAS for a phone it then refuses, and the abort
+    /// goes out tagged under a key the phone never derived, so the phone can only
+    /// ignore it. The untagged abort is the observable form of "nothing was
+    /// derived": `ClientPairingState::create_abort` tags exactly when the keys and
+    /// `H` exist.
+    #[tokio::test]
+    async fn a_blank_device_name_is_refused_before_any_transcript_or_key_exists() {
+        let (mut session, _phases, phone_socket, init) = session_and_init(" \u{200B} ").await;
+        assert!(matches!(
+            session
+                .on_init(init, Peer::Udp(phone_socket.local_addr().unwrap()))
+                .await,
+            Flow::Done
+        ));
+
+        // Nothing of the handshake ran. `transcript_hash`/`sas`/`negotiated` are
+        // `handle_init`'s only observable outputs (the crate's `cfg(test)` hooks on
+        // `shared` are not compiled into this binary, so the public accessors are
+        // what a dependent crate can see), and `create_abort` tags off the same
+        // two fields.
+        assert!(
+            session.state.transcript_hash().is_none(),
+            "a refused init must not commit the transcript hash H"
+        );
+        assert!(
+            session.state.sas().is_none(),
+            "a refused init must not derive the session keys or the SAS"
+        );
+        assert!(session.state.negotiated().is_none());
+        assert!(
+            session.state.response().is_none(),
+            "a refused init must not produce a PairingResponse"
+        );
+
+        let abort = match recv_frame(&phone_socket).await.msg {
+            Some(pairing_packet::Msg::Abort(abort)) => abort,
+            other => panic!("expected a PairingAbort, got {:?}", other),
+        };
+        assert_eq!(abort.reason, PairingAbortReason::ProtocolError as i32);
+        assert!(
+            abort.auth_tag.is_empty(),
+            "no key was derived, so the abort must carry no auth tag"
         );
     }
 

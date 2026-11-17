@@ -1,0 +1,75 @@
+name: Kani
+
+# Bounded-model-checking proofs for `shared`. This workflow is **deliberately not a
+# required status check**: it is not listed in
+# `scripts/ci/check-required-checks.sh`, and adding it there would gate every PR on a
+# multi-minute solver run. It exists so a regression in a proof is visible on the PR
+# that causes it rather than in a local run nobody made.
+#
+# `pull_request` carries no `paths:` filter, on purpose. The repository rule is that a
+# `pull_request` trigger is never path-filtered: a skipped run leaves a required check
+# `Pending` forever, so this file must not invite that failure mode if it is ever
+# promoted. `push` is filtered to `main` and to the crates the proofs cover, exactly as
+# `ci.yml` does — it is the post-merge safety net, not the signal.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'shared/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/kani.yml'
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  kani:
+    name: Kani Proofs (shared)
+    runs-on: ubuntu-latest
+    # A cold `cargo kani setup` (CBMC + the Kani toolchain download) plus the job's own
+    # compile is several minutes; the seven harnesses themselves are ~51 s wall
+    # together, build included — the three `negotiate` proofs in
+    # `shared/src/protocol/pairing/negotiation.rs`,
+    # `the_truncated_name_is_the_longest_prefix_within_budget` in
+    # `shared/src/protocol/pairing/fields.rs`, and `encode_then_decode_is_the_identity`,
+    # `decode_len_never_exceeds_the_cap` and `encode_len_refuses_above_the_cap` in
+    # `shared/src/ipc/framing.rs`.
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # `shared/build.rs` runs prost-build, which shells out to `protoc`; without it
+      # the crate's build script fails before Kani can reach a harness. Same idiom as
+      # every other job that builds `shared` (`.github/workflows/ci.yml:60-68`): the
+      # distro package, unpinned. `build.rs` reads `protoc --version` and passes the
+      # pre-3.15 `--experimental_allow_proto3_optional` flag only when it is needed, so
+      # the runner's protoc does not have to match a fixed version.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      # Pinned to the version the harnesses were measured against (0.68.0 / CBMC
+      # 6.11.0). Kani's unwind and slicing defaults move between releases, so an
+      # unpinned upgrade can turn a verifying harness into a spurious failure.
+      - name: Install Kani
+        run: cargo install --locked kani-verifier --version 0.68.0
+
+      - name: Set up Kani (CBMC)
+        run: cargo kani setup
+
+      # `--lib` is mandatory, not cosmetic: without it Kani selects every target in the
+      # package, and `shared` declares `[[bin]] uniffi-bindgen` with
+      # `required-features = ["cli"]` (shared/Cargo.toml). That binary is not built by a
+      # plain `cargo build`, so Kani fails the run on it before reaching a single
+      # harness. `--lib` restricts the target selection to the library, which is where
+      # every `#[cfg(kani)]` harness in this crate lives.
+      - name: Prove the shared harnesses
+        run: cargo kani -p shared --lib
