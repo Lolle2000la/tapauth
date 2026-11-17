@@ -6,6 +6,7 @@ use super::NegotiatedAlgorithms;
 use crate::crypto::{verify_pairing_abort_tag, PairingSessionKeys};
 use crate::protocol::messages::ProtocolError;
 use crate::protocol::pb::PairingAbort;
+use zeroize::Zeroizing;
 
 /// `context || H` — the signature payload of `PairingResponse` and the AEAD AAD of
 /// both confirmation messages.
@@ -17,16 +18,19 @@ pub(super) fn context_with_hash(context: &[u8], transcript_hash: &[u8; 32]) -> V
 }
 
 /// `context || H || csk` — the signature payload of the completion proof.
+///
+/// The buffer carries a verbatim copy of the `CSK`, so it is returned in a
+/// [`Zeroizing`] and cleared when the caller drops it.
 pub(super) fn complete_signature_message(
     context: &[u8],
     transcript_hash: &[u8; 32],
     csk: &[u8; 32],
-) -> Vec<u8> {
+) -> Zeroizing<Vec<u8>> {
     let mut data = Vec::with_capacity(context.len() + transcript_hash.len() + csk.len());
     data.extend_from_slice(context);
     data.extend_from_slice(transcript_hash);
     data.extend_from_slice(csk);
-    data
+    Zeroizing::new(data)
 }
 
 /// The three session values both state machines hand out together.

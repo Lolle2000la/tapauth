@@ -15,7 +15,7 @@ use crate::models::pairing::generate_pairing_url_v2_for_key;
 use crate::protocol::messages::{ProtocolError, PROTOCOL_VERSION_V2};
 use crate::protocol::pb::*;
 use prost::Message as ProstMessage;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Desktop-side pairing state (the protocol *Client*; see the module docs).
 ///
@@ -443,16 +443,22 @@ impl ClientPairingState {
         let live = self.live()?;
         let (keys, transcript_hash, negotiated) =
             session_material(&live.keys, &live.transcript_hash, &self.negotiated)?;
-        let payload = PairingProvisionPayload {
+        let mut payload = PairingProvisionPayload {
             csk: csk.to_vec(),
             username: username.to_string(),
             client_hostname: client_hostname.to_string(),
         };
         let aad = context_with_hash(PAIRING_PROVISION_AAD_CONTEXT, transcript_hash);
+        // Two copies of the CSK exist only for the length of these two statements:
+        // the `Vec` the protobuf message owns (prost has no zeroizing field) and
+        // the encoded form. Both are cleared here rather than left to `drop`, so
+        // neither outlives the encryption.
+        let plaintext = Zeroizing::new(payload.encode_to_vec());
+        payload.csk.zeroize();
         let encrypted_payload = encrypt_with_key(
             negotiated.symmetric_algorithm,
             &keys.k_c2s,
-            &payload.encode_to_vec(),
+            &plaintext,
             &aad,
         )?;
         Ok(PairingConfirmClient { encrypted_payload })

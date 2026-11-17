@@ -85,7 +85,7 @@
 
 use crate::auth_handler::DaemonState;
 use shared::config::CskMetadata;
-use shared::crypto::Ed25519KeyPair;
+use shared::crypto::{ClientSymmetricKey, Ed25519KeyPair};
 use shared::firewall::{FirewallError, FirewallGuard, Protocol as FirewallProtocol};
 use shared::protocol::messages::{sanitize_context_string, PROTOCOL_VERSION_V2};
 use shared::protocol::pairing::{
@@ -449,9 +449,14 @@ impl PairingState {
 /// The worker retransmits `PairingConfirmClient` every [`RETRANSMIT_INTERVAL`]
 /// (and immediately on every keepalive) until `verify_confirm_server` passes, the
 /// phone aborts, or the session expires.
+///
+/// `csk` is taken as a [`ClientSymmetricKey`] rather than raw bytes so the worker
+/// never holds an un-zeroized copy: it is moved into the request, then into the
+/// session's [`Provisioning`], and wiped (via `SecretBox`) when that is dropped —
+/// including on every failure path.
 pub(crate) async fn request_completion(
     commands: &mpsc::Sender<SessionCommand>,
-    csk: [u8; 32],
+    csk: ClientSymmetricKey,
     username: String,
     client_hostname: String,
 ) -> Result<CompletedPairing, PairingError> {
@@ -846,7 +851,9 @@ pub(crate) enum SessionCommand {
 }
 
 pub(crate) struct CompleteRequest {
-    csk: [u8; 32],
+    /// The CSK to provision. Zeroizing storage, so a request the worker drops
+    /// without answering (a cancelled session) does not leave the key in memory.
+    csk: ClientSymmetricKey,
     username: String,
     client_hostname: String,
     reply: oneshot::Sender<Result<CompletedPairing, PairingError>>,
@@ -856,7 +863,9 @@ pub(crate) struct CompleteRequest {
 /// phone proves it received the CSK.
 struct Provisioning {
     /// Needed to verify `PairingConfirmServer` (the proof is over `H || csk`).
-    csk: [u8; 32],
+    /// Zeroizing storage: the only copy the worker holds, wiped when the
+    /// provisioning ends or the session is dropped.
+    csk: ClientSymmetricKey,
     /// Answered once the session tears down, with the outcome.
     reply: oneshot::Sender<Result<CompletedPairing, PairingError>>,
     /// When the cached frame last went out, or `None` before the first send.
@@ -1477,16 +1486,18 @@ impl Session {
     }
 
     async fn on_confirm_server(&mut self, confirm: &PairingConfirmServer) -> Flow {
+        // Borrowed, not copied: the proof is verified against the one copy the
+        // provisioning holds.
         let Some(csk) = self
             .provisioning
             .as_ref()
-            .map(|provisioning| provisioning.csk)
+            .map(|provisioning| provisioning.csk.as_bytes())
         else {
             tracing::debug!("Ignoring PairingConfirmServer: no CSK was provisioned yet");
             return Flow::Continue;
         };
 
-        if let Err(e) = self.state.verify_confirm_server(confirm, &csk) {
+        if let Err(e) = self.state.verify_confirm_server(confirm, csk) {
             // A proof that does not verify must not kill the session: the phone
             // may still be settling, and the check is cheap. Keep retransmitting
             // PairingConfirmClient until the deadline (Step 5).
@@ -1597,7 +1608,7 @@ impl Session {
         };
 
         let confirm = match self.state.create_confirm_client(
-            &request.csk,
+            request.csk.as_bytes(),
             &request.username,
             &request.client_hostname,
         ) {
@@ -2329,10 +2340,14 @@ mod tests {
             .await;
         });
 
-        let completed =
-            request_completion(&commands, csk, "luca".to_string(), "thinkpad".to_string())
-                .await
-                .unwrap();
+        let completed = request_completion(
+            &commands,
+            ClientSymmetricKey::from_bytes(csk),
+            "luca".to_string(),
+            "thinkpad".to_string(),
+        )
+        .await
+        .unwrap();
         phone_side.await.unwrap();
 
         assert_eq!(
@@ -2420,7 +2435,7 @@ mod tests {
             async move {
                 request_completion(
                     &commands,
-                    [0x5Au8; 32],
+                    ClientSymmetricKey::from_bytes([0x5Au8; 32]),
                     "luca".to_string(),
                     "thinkpad".to_string(),
                 )

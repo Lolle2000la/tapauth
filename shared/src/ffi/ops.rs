@@ -11,7 +11,7 @@
 //! [`TapauthError`] carrying the exception type it must surface as.
 
 use prost::Message as ProstMessage;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{
     current_time_window, decrypt_with_csk_and_prepended_nonce, encrypted_packet_aad,
@@ -161,7 +161,13 @@ pub(crate) struct VerifiedAuthRequest {
 }
 
 /// The provisioning payload of `PairingConfirmClient`, after AEAD decryption.
-#[derive(Debug, Clone)]
+///
+/// The `csk` field is a [`Zeroizing`] buffer, whose own `Debug` prints the bytes,
+/// so `Debug` is hand-written here: a `{:?}` of this record (a failed assertion,
+/// a `tracing` field) must not put the CSK in a log. The generated Kotlin
+/// `toString()` of the corresponding UniFFI record is not influenced by this —
+/// see [`ParsedPairingProvision`](crate::ffi::ParsedPairingProvision).
+#[derive(Clone)]
 pub(crate) struct ProvisionedClient {
     /// The CSK the desktop provisioned; must be persisted by the phone.
     pub(crate) csk: Zeroizing<[u8; CSK_LEN]>,
@@ -169,6 +175,16 @@ pub(crate) struct ProvisionedClient {
     pub(crate) username: String,
     /// Authenticated Client hostname.
     pub(crate) client_hostname: String,
+}
+
+impl std::fmt::Debug for ProvisionedClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProvisionedClient")
+            .field("csk", &"<redacted>")
+            .field("username", &self.username)
+            .field("client_hostname", &self.client_hostname)
+            .finish()
+    }
 }
 
 /// A `PairingResponse` whose QR commitment, signature and algorithm selection all
@@ -699,18 +715,19 @@ pub(crate) fn pairing_process_confirm_client(
     let packet = decode_session_packet(session, confirm_client_packet)?;
     match packet.msg {
         Some(pairing_packet::Msg::ConfirmClient(confirm)) => {
-            let payload = session.process_confirm_client(&confirm)?;
-            let csk: [u8; CSK_LEN] =
-                payload
-                    .csk
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| TapauthError::Argument {
-                        detail: format!(
-                            "provisioned CSK must be {CSK_LEN} bytes, got {}",
-                            payload.csk.len()
-                        ),
-                    })?;
+            let mut payload = session.process_confirm_client(&confirm)?;
+            let csk_len = payload.csk.len();
+            let csk: Result<[u8; CSK_LEN], TapauthError> = payload
+                .csk
+                .as_slice()
+                .try_into()
+                .map_err(|_| TapauthError::Argument {
+                    detail: format!("provisioned CSK must be {CSK_LEN} bytes, got {csk_len}"),
+                });
+            // `prost` keeps the decrypted CSK in a plain `Vec`, so it is cleared
+            // here on the malformed-length path too, before `payload` is dropped.
+            payload.csk.zeroize();
+            let csk = csk?;
             Ok(ProvisionedClient {
                 csk: Zeroizing::new(csk),
                 username: payload.username,

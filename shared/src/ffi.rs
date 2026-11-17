@@ -60,7 +60,7 @@ mod ops;
 
 use std::sync::{Arc, Mutex};
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::Ed25519KeyPair;
 use crate::protocol::pairing::{ServerPairingSession, PAIRING_SESSION_ID_LEN};
@@ -148,7 +148,13 @@ pub struct ParsedAuthRequest {
 }
 
 /// The provisioning payload of `PairingConfirmClient`, after AEAD decryption.
-#[derive(Debug, Clone, uniffi::Record)]
+///
+/// `Debug` is hand-written: `csk` is the key itself, so a `{:?}` of this record
+/// must print a fixed redaction rather than the bytes. The Kotlin `data class`
+/// UniFFI generates for this record is not covered by that — its `toString()` is
+/// derived from the field list on the Kotlin side and cannot be influenced from
+/// Rust, so Kotlin must not log the record either.
+#[derive(Clone, uniffi::Record)]
 pub struct ParsedPairingProvision {
     /// The CSK the desktop provisioned; must be persisted by the phone.
     pub csk: Vec<u8>,
@@ -156,6 +162,16 @@ pub struct ParsedPairingProvision {
     pub username: String,
     /// Authenticated Client hostname.
     pub client_hostname: String,
+}
+
+impl std::fmt::Debug for ParsedPairingProvision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParsedPairingProvision")
+            .field("csk", &"<redacted>")
+            .field("username", &self.username)
+            .field("client_hostname", &self.client_hostname)
+            .finish()
+    }
 }
 
 /// A `PairingResponse` whose QR commitment, signature and algorithm selection all
@@ -781,9 +797,13 @@ impl PairingSession {
     ///   encryption fails
     /// - [`TapauthError::State`]: the session already concluded, the confirmation was
     ///   already sent, the packet cannot be encoded, or the session lock is poisoned
-    pub fn create_confirm_server(&self, csk: Vec<u8>) -> Result<Vec<u8>, TapauthError> {
-        let csk = read_csk(&csk)?;
-        self.with(|session| ops::pairing_create_confirm_server(session, &csk))
+    pub fn create_confirm_server(&self, mut csk: Vec<u8>) -> Result<Vec<u8>, TapauthError> {
+        let key = read_csk(&csk);
+        // The caller's `Vec` is the raw CSK; clear it once the zeroizing copy exists,
+        // so the Rust side keeps no un-zeroized copy of it.
+        csk.zeroize();
+        let key = key?;
+        self.with(|session| ops::pairing_create_confirm_server(session, &key))
     }
 
     /// Build a keepalive frame (serialized `PairingPacket` with `PairingKeepalive`).

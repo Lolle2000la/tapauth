@@ -453,12 +453,16 @@ impl ServerPairingSession {
         let (keys, transcript_hash, negotiated) =
             session_material(&live.keys, &live.transcript_hash, &self.negotiated)?;
         let aad = context_with_hash(PAIRING_PROVISION_AAD_CONTEXT, transcript_hash);
-        let plaintext = decrypt_with_key(
+        // The decrypted payload holds the CSK verbatim, and so does the protobuf
+        // `Vec` decoded from it (prost has no zeroizing field); this buffer is
+        // cleared on drop, the decoded one by the caller as soon as it has copied
+        // the key into a zeroizing type.
+        let plaintext = Zeroizing::new(decrypt_with_key(
             negotiated.symmetric_algorithm,
             &keys.k_c2s,
             &confirm.encrypted_payload,
             &aad,
-        )?;
+        )?);
         let payload = PairingProvisionPayload::decode(plaintext.as_slice())?;
         if payload.csk.len() != 32 {
             return Err(ProtocolError::InvalidMessageFormat);

@@ -252,10 +252,19 @@ mod tests {
         assert_eq!(plaintext, decrypted.as_slice());
     }
 
-    /// The negotiated algorithm must round-trip under a random prepended nonce.
-    /// The defect this catches: the dispatch reaching the wrong cipher (which
-    /// would fail to decrypt), or a nonce/tag length that drifts from the
-    /// documented `nonce || ciphertext || tag` layout.
+    /// The documented `nonce || ciphertext || tag` layout, and a round-trip through
+    /// the prepended-nonce splitter, under the negotiated algorithm.
+    ///
+    /// The defect this catches: the framing drifting from the documented layout —
+    /// the nonce no longer prepended (or a length other than `AEAD_NONCE_LEN`), the
+    /// 16-byte GCM tag not appended, or `split_prepended_nonce` disagreeing with
+    /// `encrypt_aead_with_random_nonce` about where the nonce ends. It does
+    /// **not** catch "the dispatch reaching the wrong cipher": with one algorithm
+    /// per slot both sides of that comparison are the same literal, so `alg` is
+    /// passed in rather than exercised. That assertion is recorded as work a
+    /// second suite carries back — see the register on
+    /// `SUPPORTED_SYMMETRIC_ALGORITHMS` in `protocol::pairing::negotiation`
+    /// (`the_negotiated_symmetric_algorithm_reaches_the_aead`).
     #[test]
     fn test_aead_roundtrip() {
         let key = random_key();
