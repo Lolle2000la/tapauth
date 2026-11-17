@@ -128,12 +128,18 @@ internal interface PairingConfirmationCrypto {
     fun createConfirmServer(csk: ByteArray): ByteArray
 
     /**
-     * Decrypt a `PairingConfirmClient`.
+     * Whether [packet] decrypts as a `PairingConfirmClient` — the linger's retransmission
+     * predicate.
      *
-     * @return the decrypted CSK, or null when [packet] is anything else — a keepalive, an abort, a
-     *   frame that does not decrypt. Non-null therefore means "a retransmission to answer".
+     * A `Boolean` and not the decrypted CSK: the only question the linger asks is "was this frame
+     * already consumed?", and answering it by handing the key back left a plaintext copy of the CSK
+     * on the heap for every retransmission, read by nobody and cleared by nothing. The decrypt
+     * still happens (nothing else can tell a retransmission from a keepalive, a duplicate or an
+     * abort), it just does not let the key cross this boundary.
+     *
+     * @return true for a `PairingConfirmClient` of this session, false for anything else
      */
-    fun processConfirmClient(packet: ByteArray): ByteArray?
+    fun isConfirmClient(packet: ByteArray): Boolean
 
     /**
      * Conclude the session: zeroize the directional keys, the transcript hash and the ephemeral
@@ -160,7 +166,7 @@ internal interface PairingConfirmationCrypto {
  */
 internal class LiveConfirmationCrypto(
     private val buildConfirmation: (csk: ByteArray) -> ByteArray,
-    private val decryptConfirmation: (packet: ByteArray) -> ByteArray?,
+    private val decryptIsConfirmClient: (packet: ByteArray) -> Boolean,
     private val concludeSession: () -> Unit,
 ) : PairingConfirmationCrypto {
     private companion object {
@@ -170,7 +176,7 @@ internal class LiveConfirmationCrypto(
 
     override fun createConfirmServer(csk: ByteArray): ByteArray = buildConfirmation(csk)
 
-    override fun processConfirmClient(packet: ByteArray): ByteArray? = decryptConfirmation(packet)
+    override fun isConfirmClient(packet: ByteArray): Boolean = decryptIsConfirmClient(packet)
 
     override fun conclude() {
         try {
@@ -446,7 +452,8 @@ internal class PairingSessionLifecycle(
      * and a retransmitted `PairingConfirmClient` can still be decrypted; it happens once even
      * though `runSession`'s epilogue asks again.
      *
-     * @return what [persist] returned, or null when a close had already won the boundary
+     * @return the persisted device and whether the transport accepted the proof, or null when a
+     *   close had already won the boundary
      */
     suspend fun <T : Any> finish(
         phase: PairingConfirmPhase,
@@ -454,7 +461,7 @@ internal class PairingSessionLifecycle(
         csk: ByteArray,
         burstDelaysMs: List<Long>,
         persist: suspend () -> T,
-    ): T? =
+    ): PairingConfirmation<T>? =
         try {
             phase
                 .finish(
@@ -474,6 +481,33 @@ internal class PairingSessionLifecycle(
 }
 
 /**
+ * What one confirmation achieved, in the two halves that can differ.
+ *
+ * The device record is written before anything is sent, so "persisted" and "the desktop was told"
+ * are independent facts and the pair that matters is a pair: a burst every send of which the
+ * transport rejected leaves the phone paired and the desktop unpaired — it retries the same
+ * `PairingConfirmClient` into a socket this side has closed, then times out. Reporting only the
+ * persisted half is how the UI came to announce a successful pairing that existed on one side only.
+ *
+ * [proofDelivered] is monotone over the whole confirmation: the burst and every answer the linger
+ * sends are attempts, and one that the transport accepted is delivery. There is no retry protocol
+ * here and this adds none — it reports what the transport did, not what it might still do. Its
+ * meaning stops at the transport: `true` says a write was not rejected, never that the desktop
+ * received it, because neither transport acknowledges a pairing write.
+ */
+internal data class PairingConfirmation<T : Any>(
+    /** What `persist` returned: the device record, in production. */
+    val persisted: T,
+
+    /**
+     * Whether at least one `PairingConfirmServer` write was accepted by the transport — not
+     * acknowledged by the desktop. `false` means no write is known to have been accepted: no socket
+     * or endpoint, every target's send failed, or a write that timed out.
+     */
+    val proofDelivered: Boolean,
+)
+
+/**
  * The confirmation phase of a pairing over one locked transport: everything
  * [PairingSession.finishPairing] does that needs no Android `Context`.
  *
@@ -482,9 +516,9 @@ internal class PairingSessionLifecycle(
  *
  * * the frame intake, [awaitOwnFrame] — the same budgeted read every other phase uses, so a
  *   foreign-frame stream cannot keep the linger from re-reading its own clock;
- * * the retransmission predicate, which consults [PairingConfirmationCrypto.processConfirmClient]
- *   rather than comparing bytes, because the desktop re-sends the frame verbatim but a keepalive or
- *   an abort must not be answered with a second proof;
+ * * the retransmission predicate, which consults [PairingConfirmationCrypto.isConfirmClient] rather
+ *   than comparing bytes, because the desktop re-sends the frame verbatim but a keepalive or an
+ *   abort must not be answered with a second proof;
  * * the linger itself ([PairingCompletion]), reached only through the injected instance;
  * * the conclusion, [PairingConfirmationCrypto.conclude], which runs after the linger so a
  *   retransmitted `PairingConfirmClient` can still be decrypted while it lasts;
@@ -539,7 +573,8 @@ internal class PairingConfirmPhase(
      *   persisted and nothing sent. There is no suspension point between it and [persist], so no
      *   close can slip in between the two.
      * @param isClosed whether the session has been closed; the linger then ends at once
-     * @return what [persist] returned, or null when [beginCommit] refused the commit
+     * @return the persisted device and whether the transport accepted any `PairingConfirmServer`,
+     *   or null when [beginCommit] refused the commit
      */
     suspend fun <T : Any> finish(
         link: PairingLink,
@@ -548,7 +583,7 @@ internal class PairingConfirmPhase(
         persist: suspend () -> T,
         beginCommit: () -> Boolean,
         isClosed: () -> Boolean = { false },
-    ): T? =
+    ): PairingConfirmation<T>? =
         try {
             if (!beginCommit()) {
                 // A close won the boundary: the session is being released, so there is nothing to
@@ -556,26 +591,39 @@ internal class PairingConfirmPhase(
                 Log.i(TAG, "Confirmation refused: the session was released first")
                 return null
             }
-            completion.confirm(
-                burstDelaysMs = burstDelaysMs,
-                // Built before persisting: a failure here must not leave a device record for a
-                // pairing the desktop never accepted.
-                buildConfirmation = { crypto.createConfirmServer(csk) },
-                persist = persist,
-                send = { packet ->
-                    if (!link.send(packet)) {
-                        Log.w(TAG, "PairingConfirmServer write failed; device record is kept")
-                    }
-                },
-                // The linger's own budget goes through the same adapter every other phase uses,
-                // so the bound belongs to the reader and not to whoever is sending frames.
-                receive = { budgetMs -> awaitOwnFrame(link, budgetMs) },
-                // The desktop re-sends the frame verbatim, so decrypting it again is how a
-                // retransmission is told apart from a keepalive or an abort. The keys are still
-                // alive here: concluding waits for the linger to return.
-                isRetransmission = { packet -> crypto.processConfirmClient(packet) != null },
-                isClosed = isClosed,
-            )
+            // Monotone over the burst and the linger: a send the transport accepted is delivery,
+            // and a later retransmission that lands is delivery too. Nothing here retries.
+            var proofDelivered = false
+            val persisted =
+                completion.confirm(
+                    burstDelaysMs = burstDelaysMs,
+                    // Built before persisting: a failure here must not leave a device record for a
+                    // pairing the desktop never accepted.
+                    buildConfirmation = { crypto.createConfirmServer(csk) },
+                    persist = persist,
+                    send = { packet ->
+                        if (link.send(packet)) {
+                            proofDelivered = true
+                        } else {
+                            // Reported, not hidden: the record stays, the desktop never got the
+                            // proof, and the outcome says so instead of claiming success.
+                            Log.w(
+                                TAG,
+                                "PairingConfirmServer write failed; the device record is kept, " +
+                                    "the desktop was not told",
+                            )
+                        }
+                    },
+                    // The linger's own budget goes through the same adapter every other phase uses,
+                    // so the bound belongs to the reader and not to whoever is sending frames.
+                    receive = { budgetMs -> awaitOwnFrame(link, budgetMs) },
+                    // The desktop re-sends the frame verbatim, so decrypting it again is how a
+                    // retransmission is told apart from a keepalive or an abort. The keys are still
+                    // alive here: concluding waits for the linger to return.
+                    isRetransmission = crypto::isConfirmClient,
+                    isClosed = isClosed,
+                )
+            PairingConfirmation(persisted, proofDelivered)
         } finally {
             // Terminal, and after the linger: an explicit conclusion is the normal end, so the
             // Rust `Drop` stays the backstop for a session that never reaches this line (a

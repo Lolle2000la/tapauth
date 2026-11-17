@@ -68,7 +68,7 @@ class PairingSessionLifecycleTest {
             return CONFIRMATION
         }
 
-        override fun processConfirmClient(packet: ByteArray): ByteArray? = null
+        override fun isConfirmClient(packet: ByteArray): Boolean = false
 
         override fun conclude() {
             concludeCount++
@@ -157,7 +157,12 @@ class PairingSessionLifecycleTest {
             }
 
         assertTrue("A close during the commit must be deferred", deferred)
-        assertEquals("The device must be persisted and reported", "paired-device", device)
+        assertEquals(
+            "The device must be persisted and reported",
+            "paired-device",
+            device?.persisted,
+        )
+        assertTrue("The burst write was accepted, so the desktop was told", device!!.proofDelivered)
         assertEquals("The deferred close must not release", 0, effects.closes)
         assertFalse("A deferred close must not stop the linger", lifecycle.isClosed())
         assertEquals(
@@ -188,7 +193,7 @@ class PairingSessionLifecycleTest {
         val device =
             lifecycle.finish(phase(clock, FakeCrypto()), link, CSK, listOf(0L)) { "paired-device" }
 
-        assertEquals("The device must be reported", "paired-device", device)
+        assertEquals("The device must be reported", "paired-device", device?.persisted)
         assertEquals("The success path must zeroize the keys", 1, effects.zeroizes)
 
         // `runSession`'s epilogue asks again; the assembly must not run it twice.

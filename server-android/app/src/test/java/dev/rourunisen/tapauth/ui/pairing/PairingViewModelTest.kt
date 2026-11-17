@@ -176,10 +176,15 @@ class PairingViewModelTest {
             harness.viewModel.outcomesWhile {
                 session.emit(PairingUpdate.Connecting)
                 session.emit(PairingUpdate.Confirming(PairingTransport.UDP))
-                session.emit(PairingUpdate.Complete(device("desktop-a")))
+                session.emit(PairingUpdate.Complete(device("desktop-a"), proofDelivered = true))
             }
 
-        assertEquals(listOf<PairingUpdate>(PairingUpdate.Complete(device("desktop-a"))), outcomes)
+        assertEquals(
+            listOf<PairingUpdate>(
+                PairingUpdate.Complete(device("desktop-a"), proofDelivered = true),
+            ),
+            outcomes,
+        )
     }
 
     @Test
@@ -215,7 +220,9 @@ class PairingViewModelTest {
         val harness = Harness()
         harness.viewModel.beginPairing(url)
         harness.viewModel.outcomesWhile {
-            harness.factory.current.emit(PairingUpdate.Complete(device("desktop-a")))
+            harness.factory.current.emit(
+                PairingUpdate.Complete(device("desktop-a"), proofDelivered = true),
+            )
         }
         assertTrue(harness.viewModel.update.value is PairingUpdate.Complete)
 
@@ -224,9 +231,16 @@ class PairingViewModelTest {
 
         val fresh =
             harness.viewModel.outcomesWhile {
-                harness.factory.current.emit(PairingUpdate.Complete(device("desktop-b")))
+                harness.factory.current.emit(
+                    PairingUpdate.Complete(device("desktop-b"), proofDelivered = true),
+                )
             }
-        assertEquals(listOf<PairingUpdate>(PairingUpdate.Complete(device("desktop-b"))), fresh)
+        assertEquals(
+            listOf<PairingUpdate>(
+                PairingUpdate.Complete(device("desktop-b"), proofDelivered = true),
+            ),
+            fresh,
+        )
     }
 
     @Test
@@ -250,9 +264,14 @@ class PairingViewModelTest {
         // The attempt's own outcome is still reported once, after the re-attach.
         val outcome =
             harness.viewModel.outcomesWhile {
-                session.emit(PairingUpdate.Complete(device("desktop-a")))
+                session.emit(PairingUpdate.Complete(device("desktop-a"), proofDelivered = true))
             }
-        assertEquals(listOf<PairingUpdate>(PairingUpdate.Complete(device("desktop-a"))), outcome)
+        assertEquals(
+            listOf<PairingUpdate>(
+                PairingUpdate.Complete(device("desktop-a"), proofDelivered = true),
+            ),
+            outcome,
+        )
     }
 
     @Test
@@ -268,16 +287,21 @@ class PairingViewModelTest {
         // still be delivered; it must not become the current attempt's state or outcome.
         val leaked =
             harness.viewModel.outcomesWhile {
-                replaced.emit(PairingUpdate.Complete(device("desktop-a")))
+                replaced.emit(PairingUpdate.Complete(device("desktop-a"), proofDelivered = true))
             }
         assertEquals(emptyList<PairingUpdate>(), leaked)
         assertEquals(PairingUpdate.Connecting, harness.viewModel.update.value)
 
         val own =
             harness.viewModel.outcomesWhile {
-                current.emit(PairingUpdate.Complete(device("desktop-b")))
+                current.emit(PairingUpdate.Complete(device("desktop-b"), proofDelivered = true))
             }
-        assertEquals(listOf<PairingUpdate>(PairingUpdate.Complete(device("desktop-b"))), own)
+        assertEquals(
+            listOf<PairingUpdate>(
+                PairingUpdate.Complete(device("desktop-b"), proofDelivered = true),
+            ),
+            own,
+        )
     }
 
     @Test
@@ -540,8 +564,10 @@ class PairingViewModelTest {
         session.emit(PairingUpdate.Confirming(PairingTransport.BLE))
         session.committing = true
 
-        harness.viewModel.leave(PairingExit.ScreenDisposed)
-
+        assertFalse(
+            "A rotation is not a user decision, so the screen must never be held for it",
+            harness.viewModel.leave(PairingExit.ScreenDisposed),
+        )
         assertEquals("ScreenDisposed must not reach the release at all", 0, session.closeCount)
         assertEquals(0, session.rejectCount)
         assertTrue(session.scope!!.isActive)
@@ -576,6 +602,92 @@ class PairingViewModelTest {
         assertEquals("A durable pairing is not aborted", 0, session.rejectCount)
         assertTrue(
             "The deferred release must leave the confirmation running",
+            session.scope!!.isActive,
+        )
+    }
+
+    /**
+     * A back press that reaches a deferred release tells the screen to stay attached, because the
+     * pairing's outcome has not been reported yet: `outcomes` has no replay (deliberately — see
+     * [_outcomes]), so a `Complete` emitted with no screen attached is dropped, and the pairing
+     * completes headlessly with the user told neither "paired" nor "failed". The screen staying is
+     * what keeps the outcome observable.
+     *
+     * The defect this catches: a `leave` that reports nothing to its caller (the shape before this
+     * change), which lets the screen navigate away from a confirmation that is still running.
+     */
+    @Test
+    fun aBackPressInsideTheCommitWindowKeepsTheScreenForTheOutcome() {
+        val harness = Harness()
+        harness.viewModel.beginPairing(url)
+        val session = harness.factory.current
+        session.emit(PairingUpdate.Confirming(PairingTransport.UDP))
+        session.committing = true
+
+        assertTrue(
+            "The screen must stay attached while the confirmation is in flight",
+            harness.viewModel.leave(PairingExit.UserRequested),
+        )
+
+        // The outcome is still reported, because a screen is still attached to receive it.
+        val outcome =
+            harness.viewModel.outcomesWhile {
+                session.emit(PairingUpdate.Complete(device("desktop-a"), proofDelivered = true))
+            }
+        assertEquals(
+            listOf<PairingUpdate>(
+                PairingUpdate.Complete(device("desktop-a"), proofDelivered = true),
+            ),
+            outcome,
+        )
+    }
+
+    /**
+     * The complement, so the previous test is a decision and not a constant: outside the commit
+     * window nothing is in flight, so the back press releases and the screen leaves at once.
+     *
+     * The defect this catches: a `leave` that always answers "stay", which would trap the screen on
+     * any exit — the SAS never dismissed and the user unable to leave a pairing they started.
+     */
+    @Test
+    fun aBackPressOutsideTheCommitWindowLeavesTheScreen() {
+        val harness = Harness()
+        harness.viewModel.beginPairing(url)
+        val session = harness.factory.current
+        session.emit(PairingUpdate.Connecting)
+
+        assertFalse(
+            "Nothing is in flight, so the screen must not be held",
+            harness.viewModel.leave(PairingExit.UserRequested),
+        )
+        assertEquals("The release must still happen", 1, session.closeCount)
+    }
+
+    /**
+     * The stay is not a trap: a second back press leaves, even while the confirmation is still in
+     * flight. The outcome is then dropped like any other nobody is listening for — the user
+     * insisted — but the pairing itself is unaffected, because the deferred release keeps the burst
+     * and linger running.
+     *
+     * The defect this catches: a `leave` that answers "stay" on every press, which turns a bounded
+     * wait into a screen the user cannot leave while the confirmation is running.
+     */
+    @Test
+    fun aSecondBackPressInsideTheCommitWindowStillLeaves() {
+        val harness = Harness()
+        harness.viewModel.beginPairing(url)
+        val session = harness.factory.current
+        session.emit(PairingUpdate.Confirming(PairingTransport.BLE))
+        session.committing = true
+
+        assertTrue(harness.viewModel.leave(PairingExit.UserRequested))
+        assertFalse(
+            "The second press is the user insisting, so it leaves",
+            harness.viewModel.leave(PairingExit.UserRequested),
+        )
+        assertEquals("Neither press aborts a durable pairing", 0, session.rejectCount)
+        assertTrue(
+            "The confirmation must still be able to finish",
             session.scope!!.isActive,
         )
     }

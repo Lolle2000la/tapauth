@@ -46,7 +46,16 @@ fun PairingScreen(
     LaunchedEffect(Unit) {
         viewModel.outcomes.collect { outcome ->
             when (outcome) {
-                is PairingUpdate.Complete -> onPairingComplete()
+                // A `Complete` whose proof never reached the desktop is not a pairing the user can
+                // use: the desktop will report the pairing as failed while this phone has a device
+                // record. It is reported as a failure, with what happened in the message, rather
+                // than being sent home as a success.
+                is PairingUpdate.Complete ->
+                    if (outcome.proofDelivered) {
+                        onPairingComplete()
+                    } else {
+                        onPairingFailed(context.getString(R.string.pairing_proof_undelivered))
+                    }
                 is PairingUpdate.Failed -> onPairingFailed(outcome.message)
                 PairingUpdate.Cancelled ->
                     onPairingFailed(context.getString(R.string.pairing_cancelled_message))
@@ -64,10 +73,11 @@ fun PairingScreen(
 
     // A deliberate exit, by contrast, has to tell the desktop: the ViewModel aborts a live SAS
     // prompt. It no longer waits here for the abort to be written, because the session outlives
-    // this screen — leaving immediately cannot cancel it.
+    // this screen — leaving immediately cannot cancel it. The one exception is a pairing whose
+    // confirmation is in flight: the ViewModel answers "deferred", which means the outcome has not
+    // been reported yet and leaving now would drop it, so the screen stays until it arrives.
     val leavePairing: () -> Unit = {
-        viewModel.leave(PairingExit.UserRequested)
-        onBack()
+        if (!viewModel.leave(PairingExit.UserRequested)) onBack()
     }
 
     BackHandler(onBack = leavePairing)
@@ -107,7 +117,18 @@ fun PairingScreen(
                     ConfirmingView()
                 }
                 is PairingUpdate.Complete -> {
-                    SuccessView(onDone = onPairingComplete)
+                    if (state.proofDelivered) {
+                        SuccessView(onDone = onPairingComplete)
+                    } else {
+                        // The record exists on this phone and the desktop never got the proof. Say
+                        // so: "Pairing Successful!" here would be a claim the other side of the
+                        // pairing does not share.
+                        FailedView(
+                            message = stringResource(R.string.pairing_proof_undelivered),
+                            onRetry = { viewModel.retry() },
+                            onBack = leavePairing,
+                        )
+                    }
                 }
                 is PairingUpdate.Failed -> {
                     FailedView(

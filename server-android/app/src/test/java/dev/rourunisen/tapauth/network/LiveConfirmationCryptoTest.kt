@@ -4,6 +4,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -42,7 +43,7 @@ class LiveConfirmationCryptoTest {
     private fun cryptoOver(session: RefCountedSession) =
         LiveConfirmationCrypto(
             buildConfirmation = { CONFIRMATION },
-            decryptConfirmation = { null },
+            decryptIsConfirmClient = { false },
             concludeSession = { session.conclude() },
         )
 
@@ -115,7 +116,15 @@ class LiveConfirmationCryptoTest {
                     beginCommit = { true },
                 )
 
-        assertEquals("The completed pairing must still be reported", "paired-device", device)
+        assertEquals(
+            "The completed pairing must still be reported",
+            "paired-device",
+            device?.persisted,
+        )
+        assertTrue(
+            "The burst was accepted, so the desktop was told",
+            device!!.proofDelivered,
+        )
         assertEquals("The burst must still have gone out", 1, link.sends.size)
         assertEquals("The destroyed session must not be concluded", 0, session.concludeCalls)
     }
