@@ -191,6 +191,84 @@ class BleGattServiceWiringTest {
         )
     }
 
+    /**
+     * The BLE prompt path runs the process's one post-authentication limiter, after the request has
+     * been authenticated and after the gate admitted it, and before any prompt exists.
+     *
+     * Nothing else on this path throttles: with the call gone the BLE transport answers every fresh
+     * request with a prompt, so a Client that keeps sending them is throttled on UDP and not here
+     * (the defect this guard existed for). No JVM test can observe that — `handleAuthRequest` runs
+     * inside an Android `Service` on a framework `BluetoothGatt` — and the behavioural half
+     * (`BlePromptRateLimitTest`) drives the same limiter with the same key material, so a schedule
+     * change fails there while a missing, moved or mis-keyed call fails here.
+     */
+    @Test
+    fun thePromptPathRunsTheOneSharedRateLimiter() {
+        assertEquals(
+            "the prompt path must run exactly one admission check",
+            1,
+            source.split(ADMIT_CALL).size - 1,
+        )
+
+        val admit = source.indexOf(ADMIT_CALL)
+
+        // After authentication: the check must sit below the signature-verifying parse, so an
+        // unverified request cannot spend a paired Client's budget.
+        val verified = source.indexOf(VERIFIED_REQUEST_CALL)
+        assertTrue(
+            "`$ADMIT_CALL` must follow `$VERIFIED_REQUEST_CALL` (offset $admit vs $verified)",
+            verified >= 0 && admit > verified,
+        )
+
+        // After the gate's Process outcome: Claimed (another transport owns the challenge),
+        // Duplicate (a retransmission of the request the user is already answering) and Replay all
+        // return above it, so none of them spends burst allowance.
+        val process = source.indexOf(PROCESS_ARM)
+        assertTrue(
+            "`$ADMIT_CALL` must follow the gate's `$PROCESS_ARM` arm (offset $admit vs $process), " +
+                "so only an arrival that would raise a prompt is charged for one",
+            process >= 0 && admit > process,
+        )
+
+        // And before the prompt: the check is only worth anything above the prompt it refuses.
+        val submit = source.indexOf("submitRequest(", admit)
+        assertTrue(
+            "`$ADMIT_CALL` must precede `submitRequest(` (offset $admit vs $submit)",
+            submit > admit,
+        )
+
+        // Keyed on the paired Client's public key and the verified bytes — never on the temporal
+        // identifier (one value per Client per 60 s window, so keying there would throttle a
+        // Client's own second request) and never on a peer address.
+        val end = source.indexOf(')', admit)
+        assertTrue("`$ADMIT_CALL` must be a complete call", end > admit)
+        val arguments = source.substring(admit, end).normalized()
+        assertTrue(
+            "the admission check must be keyed on the paired Client's public key; call: $arguments",
+            arguments.contains(PAIRED_KEY_ARGUMENT),
+        )
+        assertTrue(
+            "the admission check must hash the verified WrapperMessage; call: $arguments",
+            arguments.contains(WRAPPER_ARGUMENT),
+        )
+        for (spoofable in UNKEYED_ARGUMENTS) {
+            assertFalse(
+                "the admission check must not key on `$spoofable`; call: $arguments",
+                arguments.contains(spoofable),
+            )
+        }
+
+        // A refusal has to end the arrival: a refused request that still leaves the link up makes
+        // the Client wait out its own deadline on a prompt that was never raised.
+        val refusal = source.substring(admit, submit)
+        assertTrue("a refused request must be logged:\n$refusal", refusal.contains("Log.w("))
+        assertTrue(
+            "a refused request must drop the link it arrived on:\n$refusal",
+            refusal.contains("disconnectGatt(gatt)"),
+        )
+        assertTrue("a refused request must return:\n$refusal", refusal.contains("return"))
+    }
+
     /** Whitespace and line breaks only, so the shape is compared and not the formatting. */
     private fun String.normalized(): String = replace(Regex("\\s+"), " ").trim()
 
@@ -359,6 +437,25 @@ class BleGattServiceWiringTest {
                 "username=\${scrubLogValue(authRequest.username)}",
                 "hostname=\${scrubLogValue(authRequest.hostname)}",
             )
+
+        /** The one post-authentication admission check the prompt path runs. */
+        const val ADMIT_CALL = "shouldAcceptAuthenticatedRequest("
+
+        /** The signature-verifying parse that must precede it. */
+        const val VERIFIED_REQUEST_CALL = "parseAndVerifyAuthRequest("
+
+        /** The gate outcome that raises a prompt, and so the one the check follows. */
+        const val PROCESS_ARM = "BleAuthRequestGate.Decision.Process -> Unit"
+
+        /** The key material the check is keyed on: the pairing, not anything per-request. */
+        const val PAIRED_KEY_ARGUMENT = "matchedDevice.publicKey"
+
+        /** The request identifier the check hashes: the verified WrapperMessage. */
+        const val WRAPPER_ARGUMENT = "wrapperMessageBytes"
+
+        /** Identifiers that rotate or are chosen by the peer, so they must not key the limiter. */
+        val UNKEYED_ARGUMENTS =
+            listOf("temporalId", "gatt.device.address", "bleDeviceAddress", "challenge")
 
         /** The same two fields logged raw — a newline in either forges a logcat line. */
         val RAW_RECEIPT_FIELDS =

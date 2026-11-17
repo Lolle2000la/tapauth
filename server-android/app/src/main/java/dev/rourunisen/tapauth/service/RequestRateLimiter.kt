@@ -7,6 +7,17 @@ import kotlin.math.min
 /**
  * Rate limiter for post-authentication requests.
  *
+ * ### One limiter, both transports
+ *
+ * There is exactly one instance per process — [getInstance] — and both post-authentication paths
+ * call it: the UDP path in [dev.rourunisen.tapauth.service.AuthenticationService] and the BLE path
+ * in [dev.rourunisen.tapauth.ble.BleGattService]. They call [shouldAcceptAuthenticatedRequest],
+ * which is where the two halves of "the same request" are fixed — the paired Client's Ed25519
+ * public key and SHA-256 of the verified `WrapperMessage` — so a Client has one budget whichever
+ * transport it hammers. A second limiter on the BLE path would be a second schedule to keep in sync
+ * and a budget that doubles for a Client alternating transports; that is why the BLE path shares
+ * this instance instead of constructing its own.
+ *
  * Implements burst-tolerant escalating backoff with request de-duplication:
  * - First [BURST_MAX] requests within [BURST_WINDOW_MS] are all accepted without penalty, allowing
  *   concurrent multi-transport delivery (BLE + UDP) and network retransmissions.
@@ -15,7 +26,12 @@ import kotlin.math.min
  * - Backoff only escalates when a request is *rejected* (sent while cooldown is active). Accepted
  *   requests after cooldown expiry reset the backoff to [INITIAL_BACKOFF_SECONDS], since paired
  *   clients are trusted and the rate limiter targets third-party replay/DoS attacks only.
- * - State is fully reset on session end (grant, cancel, deny, timeout).
+ * - [resetClient] clears a Client outright. The UDP path calls it at each point its own prompt
+ *   callback resolves: a verified grant confirmation, a verified cancel, an explicit denial, and a
+ *   timeout. The BLE path answers the same messages on its own link and does not call it, so a
+ *   BLE-only Client's budget recovers through the cooldown above (which any request spaced more
+ *   than one backoff period ago already reaches) and through [cleanup], never by a reset it did not
+ *   get.
  *
  * This prevents notification spam from malicious or malfunctioning clients without penalizing
  * legitimate multi-transport or retransmission traffic.
@@ -111,6 +127,41 @@ class RequestRateLimiter(
     }
 
     /**
+     * The post-authentication admission check both transports run.
+     *
+     * The key material and the request identifier are fixed here, once, so the two call sites
+     * cannot drift: [clientPublicKey] is the paired Client's Ed25519 public key — the only identity
+     * in a request that is neither chosen by the peer nor rotating — and [wrapperMessageBytes] is
+     * the signature-verified `WrapperMessage` (both transports decrypt to the same bytes), hashed
+     * into the de-duplication identifier. That hash is what lets one request delivered over UDP and
+     * BLE at once cost a single burst slot.
+     *
+     * Nothing spoofable pre-authentication is consulted: keying on the temporal identifier would
+     * throttle a Client's own second request inside a 60 s window (one value per Client per
+     * window), and keying on a peer address would let anyone spend another Client's budget.
+     *
+     * @param clientPublicKey The paired Client's Ed25519 public key, as stored on its pairing.
+     * @param wrapperMessageBytes The verified request's `WrapperMessage` bytes.
+     * @return true if the request may raise a prompt, false if it is rate limited.
+     */
+    fun shouldAcceptAuthenticatedRequest(
+        clientPublicKey: ByteArray,
+        wrapperMessageBytes: ByteArray,
+    ): Boolean = shouldAcceptRequest(clientPublicKey.toHex(), sha256Hex(wrapperMessageBytes))
+
+    private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
+
+    /**
+     * Hex SHA-256 of [data], used only as a stable de-duplication key.
+     *
+     * Retransmissions and multi-transport deliveries of one request decrypt to identical
+     * `WrapperMessage` bytes, so they collapse to one request id. This is not protocol crypto and
+     * deliberately has no JNI export.
+     */
+    private fun sha256Hex(data: ByteArray): String =
+        java.security.MessageDigest.getInstance("SHA-256").digest(data).toHex()
+
+    /**
      * Reset the rate limit for a client.
      *
      * Call this when:
@@ -150,6 +201,20 @@ class RequestRateLimiter(
 
     companion object {
         private const val TAG = "RequestRateLimiter"
+
+        /**
+         * The one limiter this process has, shared by the UDP and BLE paths.
+         *
+         * State lives here, in memory, for the life of the process: it is not persisted, and a
+         * service (re)start reuses whatever budget the process already holds rather than handing
+         * every Client a fresh burst allowance.
+         */
+        @Volatile private var instance: RequestRateLimiter? = null
+
+        fun getInstance(): RequestRateLimiter {
+            return instance
+                ?: synchronized(this) { instance ?: RequestRateLimiter().also { instance = it } }
+        }
 
         // Maximum requests accepted without penalty within the burst window
         private const val BURST_MAX = 3
