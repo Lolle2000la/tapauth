@@ -28,7 +28,10 @@ import org.junit.runner.RunWith
  * run as JVM unit tests because they load native libraries from jniLibs.
  *
  * ### Prerequisites
- * 1. Build native libraries: `./build-native.sh` (from server-android/ directory)
+ * 1. Nothing to build by hand: the `net.mullvad.rust-android` plugin's `cargo` block in
+ *    `app/build.gradle.kts` cross-compiles `shared` into `app/build/rustJniLibs/android/<abi>/`,
+ *    which is registered as the app's `jniLibs` source dir, and `preBuild` depends on its
+ *    `cargoBuild` task, so the library is in place before any test task runs
  * 2. Start an emulator or connect a device
  *
  * ### Run Tests
