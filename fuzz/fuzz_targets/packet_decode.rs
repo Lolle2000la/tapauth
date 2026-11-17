@@ -11,16 +11,19 @@
 //!
 //! Invariants asserted, beyond "does not panic":
 //!
-//! * Determinism: the same datagram decodes to the same packet twice.
 //! * Bounded payload: the bytes a decode yields — `temporal_identifier` and
 //!   `ciphertext`, the fields an unauthenticated sender sizes — never exceed the
-//!   datagram that produced them, and so never exceed the 16 KiB framing cap the
-//!   receive path enforces before decoding. That is the bound on what a sender can make
-//!   this process hold.
-//! * Round-trip stability: re-encoding a decoded packet and decoding it again reproduces
-//!   the same packet, so "what we accepted" and "what we would re-emit" are the same
-//!   message. This is the property a re-send (the phone's cached `PairingConfirmServer`
-//!   bytes, `tapauthd`'s retransmitted `PairingConfirmClient`) depends on.
+//!   datagram that produced them. That is the bound on what a sender can make this
+//!   process hold. It is asserted as `payload <= data.len()`; the entry gate bounds
+//!   `data.len()`, so the 16 KiB cap needs no assertion of its own.
+//! * Round-trip stability: `decode(encode(decode(b))) == decode(b)`, so "what we would
+//!   re-emit" decodes back to "what we accepted". This is the property a re-send (the
+//!   phone's cached `PairingConfirmServer` bytes, `tapauthd`'s retransmitted
+//!   `PairingConfirmClient`) depends on.
+//!
+//! Not asserted: that two decodes of the same bytes agree. `decode` is a pure function
+//! of its input over an owned value with no interior mutability, so that assertion
+//! cannot fail and is not carried.
 //!
 //! Not asserted, because it is **false**: a re-encoded packet is not always the size of
 //! the datagram it came from. A non-minimal varint for `encryption_algorithm` (the one
@@ -28,7 +31,8 @@
 //! sign-extended varint: `10ff85fc85fc9c9c62` (9 bytes) decodes to `-1061223681` and
 //! re-encodes to 11. Growth is bounded and tiny — 9 bytes for this message's single
 //! numeric field, since `bytes` fields are copied verbatim — so the payload bound above
-//! holds; see `.github/workflows/fuzz.yml` and the corpus seed of that exact input.
+//! holds; see the strategy record (`docs/design-documents/assurance-strategy.md` §5)
+//! and the corpus seed of that exact input.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -48,19 +52,11 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-    let again = EncryptedPacket::decode(data).expect("decode is a pure function of its input");
-    assert_eq!(
-        again,
-        packet,
-        "two decodes of the same {} byte datagram disagreed",
-        data.len()
-    );
-
     let encoded = packet.encode_to_vec();
     // The fields a sender chooses the size of are copied out of the datagram, never
     // inflated by decoding: each is a length-delimited slice of the input plus its own
     // tag and length prefix. So the payload a decode hands upward is at most the
-    // datagram, and the cap the receive path enforced on the datagram bounds it too.
+    // datagram.
     let payload = packet.temporal_identifier.len() + packet.ciphertext.len();
     assert!(
         payload <= data.len(),
@@ -69,13 +65,6 @@ fuzz_target!(|data: &[u8]| {
          chose the size of",
         data.len(),
         payload,
-        packet.ciphertext.len()
-    );
-    assert!(
-        datagram_within_size_cap_for_fuzz(packet.ciphertext.len()),
-        "a {} byte datagram decoded to a {} byte ciphertext, above the 16 KiB cap the \
-         receive path enforces on the datagram it came from",
-        data.len(),
         packet.ciphertext.len()
     );
 

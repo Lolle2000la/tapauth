@@ -820,55 +820,87 @@ mod tests {
         }
     }
 
-    /// Both halves of the read-then-write handoff must compare the address.
+    /// Both halves of the read-then-write handoff must compare the address, and
+    /// each defect is only visible on the path it lives on.
     ///
-    /// A refresh whose result is written but then compared against a stale
-    /// local (what a "don't hold the lock across a syscall" refactor produces)
-    /// answers `false` for every address, including the host's own. A
-    /// membership test replaced by a non-emptiness check answers `true` for
-    /// every address. Neither shows up on one execution of the other's path,
-    /// so the documentation address is asserted on the cold cache (the write
-    /// path, which nothing else in this binary warms) and again on the warm one
-    /// (the fast read path), and the host's own addresses are asserted warm.
+    /// A refresh whose result is written but then compared against a stale local
+    /// (what a "don't hold the lock across a syscall" refactor produces) answers
+    /// `false` for every non-loopback address on the one call that takes the
+    /// write path: the local it compares was read before the refresh ran, so on a
+    /// cold cache it is empty and nothing is local. That call is therefore the
+    /// first one made here, and the address it asks about is a host interface
+    /// address, whose right answer is `true` — only a stale snapshot says
+    /// otherwise. A `false`-answering address there would be vacuous: a stale
+    /// snapshot answers `false` for that too, and so does a correct cache.
+    ///
+    /// A membership test replaced by a non-emptiness check answers `true` for
+    /// every address. On the fast read path the documentation address catches it
+    /// while the cache is warm; on the write path only an expired cache reaches
+    /// the comparison, so the documentation address is asserted again once the
+    /// TTL has run out — that call re-enumerates a set it has just found
+    /// non-empty, and must still answer `false`.
+    ///
+    /// The two defects point in opposite directions, which is why the host's own
+    /// address and the documentation address are both asserted on the write path
+    /// instead of one standing in for the other.
     #[test]
     fn an_interface_address_is_local_and_a_documentation_address_is_not() {
-        // Loopback short-circuits before the cache, so this holds on any host.
+        // Loopback returns before the cache is even initialised, so this holds on
+        // any host and warms nothing.
         assert!(is_local_ip(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
         assert!(is_local_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
 
-        // TEST-NET-3 (RFC 5737) is reserved for documentation and belongs to no
-        // interface. A host that really used it would fail here, and that is the
-        // only assumption this assertion makes.
-        let documentation = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
-        assert!(
-            !is_local_ip(&documentation),
-            "the cold cache answered true for an address no interface carries"
-        );
-
-        let mut checked = 0usize;
+        // Enumerated before the cache is touched: the assertions below need the
+        // host's addresses in hand while the cache is still cold.
+        let mut local: Vec<(String, IpAddr)> = Vec::new();
         for iface in get_multicast_interfaces() {
             for addr in [iface.ipv4.map(IpAddr::V4), iface.ipv6.map(IpAddr::V6)]
                 .into_iter()
                 .flatten()
             {
-                assert!(
-                    is_local_ip(&addr),
-                    "{addr} is assigned to {} but is_local_ip said it is not local",
-                    iface.name
-                );
-                checked += 1;
+                local.push((iface.name.clone(), addr));
             }
         }
 
-        if checked == 0 {
+        if local.is_empty() {
             // No non-loopback interface on this host, so the refresh path has
             // no address to be right about and only the loopback half applies.
             return;
         }
 
+        // The first cache-touching call answers `true`. On a cold cache it goes
+        // through the write path, whose comparison is the one a stale snapshot
+        // gets wrong.
+        let (name, addr) = &local[0];
+        assert!(
+            is_local_ip(addr),
+            "{addr} is assigned to {name} but the cold cache said it is not local"
+        );
+
+        // Every other host address, now on the warm fast path.
+        for (name, addr) in &local[1..] {
+            assert!(
+                is_local_ip(addr),
+                "{addr} is assigned to {name} but is_local_ip said it is not local"
+            );
+        }
+
+        // TEST-NET-3 (RFC 5737) is reserved for documentation and belongs to no
+        // interface. A host that really used it would fail here, and that is the
+        // only assumption these assertions make.
+        let documentation = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
         assert!(
             !is_local_ip(&documentation),
             "the warm cache answered true for an address no interface carries"
+        );
+
+        // Let the cache go stale the way it does in production: this call takes
+        // the write path, refreshes a set it has just found non-empty, and must
+        // still answer `false`.
+        std::thread::sleep(INTERFACE_CACHE_TTL + Duration::from_millis(50));
+        assert!(
+            !is_local_ip(&documentation),
+            "the expired cache answered true for an address no interface carries"
         );
     }
 

@@ -11,7 +11,6 @@
 //!
 //! * The output fits the requested byte budget, whatever the budget — including the
 //!   budgets below the 3-byte ellipsis, where the cut happens without one.
-//! * The output is valid UTF-8 (same assertions as the shipped `proptest` property).
 //! * No forbidden code point survives, asserted with the module's own
 //!   `is_forbidden_context_char` via `is_forbidden_context_char_for_fuzz` — not a
 //!   re-transcription, so a code point added to the set is covered here for free.
@@ -45,13 +44,6 @@ fuzz_target!(|data: &[u8]| {
         input,
         out.len(),
         out
-    );
-
-    assert_eq!(
-        core::str::from_utf8(out.as_bytes()).ok(),
-        Some(out.as_str()),
-        "sanitizing {:?} to {budget} bytes produced invalid UTF-8",
-        input
     );
 
     if let Some(found) = out

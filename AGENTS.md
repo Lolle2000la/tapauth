@@ -19,7 +19,11 @@ shared/          # lib (cdylib + rlib), build.rs generates protobuf
 client-pam/      # cdylib -> installed as pam_tapauth.so
 client-config-gui/ # bin "tapauth-config" (iced GUI)
 tapauthd/        # bin, the systemd daemon
+fuzz/            # cargo-fuzz crate (nightly) - excluded from the workspace, `exclude = ["fuzz"]`
 ```
+
+That list is the workspace; `fuzz/` is not a member and nothing here builds it (its own
+`fuzz/Cargo.lock` pins its dependencies).
 
 ### Exact CI commands (verified)
 ```bash
@@ -76,7 +80,7 @@ cd server-android && ./gradlew connectedE2eAndroidTest
 
 | Crate | Default | Features |
 |-------|---------|----------|
-| `shared` | `[]` | `jni`, `cli`, `tpm`, `firewall`, `dev-state-override`, `dev-udp-loopback` |
+| `shared` | `[]` | `jni`, `cli`, `tpm`, `firewall`, `dev-state-override`, `dev-udp-loopback`, `fuzz-api` |
 | `tapauthd` | `["ble", "firewall"]` | `ble`, `tpm`, `firewall`, `fallback-socket`, `dev-state-override`, `dev-udp-loopback`, `dev-polkit-bypass`, `dev-firewall-bypass`, `dev-socket-override` |
 | `client-pam` | `[]` | `tpm`, `dev-socket-override` |
 | `client-config-gui` | `[]` | `tpm`, `dev-socket-override` |
@@ -95,6 +99,7 @@ environment alone:
 | `dev-socket-override` (`client-pam`, `client-config-gui`, `tapauthd`) | `TAPAUTHD_SOCK` | Redirects the IPC client to another socket. On `tapauthd` the feature only affects the `tapauth-ipc-cli` admin tool; the daemon itself always uses the systemd-activated socket in production |
 
 **Gotchas:**
+- **`fuzz-api`** exists only for the `fuzz/` crate (two `#[doc(hidden)]` delegates to crate-private predicates) and no shipped build enables it. `fuzz/` is a `cargo-fuzz` crate excluded from the workspace, so `cargo test/clippy --workspace` never compiles it.
 - `shared`'s `uniffi` dependency is pulled in only by its `jni` and `cli` features (`jni` for the exported Kotlin surface, `cli` for the `uniffi-bindgen` bin), so no other workspace crate gains it.
 - `--all-features` **is not a substitute for the per-crate feature combos CI uses** — it additionally builds the `uniffi-bindgen` binary (`cli`) and enables the entire FFI surface (`jni`), neither of which the shipped artifacts want; build the crate you are checking with its own feature set instead.
 - **`client-pam` has NO `ble` feature** (it's a thin IPC client that talks to tapauthd via Unix socket). Do not pass `--features ble` to it.
