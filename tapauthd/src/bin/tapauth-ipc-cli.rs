@@ -171,8 +171,8 @@ fn usage() {
     eprintln!("Usage: tapauth-ipc-cli <command> [args...]");
     eprintln!("Commands:");
     eprintln!("  start-pairing");
-    eprintln!("  wait-for-pairing <port>");
-    eprintln!("  complete-pairing <port>");
+    eprintln!("  wait-for-pairing [port]");
+    eprintln!("  complete-pairing [port]");
     eprintln!("  cancel-pairing --port <port> --session-id <hex>");
     eprintln!("  get-servers");
     eprintln!("  remove-device <public_key_hex>");
@@ -222,7 +222,11 @@ async fn cmd_start_pairing() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
     if let Some(ipc::admin_response::Payload::StartPairing(p)) = resp.payload {
-        println!("PORT={}", p.port);
+        // A BLE-only session has no port: absence is reported by printing no
+        // `PORT=` line at all, never by inventing `0` for one.
+        if let Some(port) = p.port {
+            println!("PORT={}", port);
+        }
         println!("URL={}", p.url);
         // Printed for harnesses that later need to address this exact
         // session to `cancel-pairing`.
@@ -231,12 +235,23 @@ async fn cmd_start_pairing() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn cmd_wait_for_pairing(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    if args.is_empty() {
-        eprintln!("Usage: tapauth-ipc-cli wait-for-pairing <port>");
-        std::process::exit(1);
+/// The optional positional port of `wait-for-pairing` / `complete-pairing`.
+///
+/// Absent is a BLE-only session (no port to name); a value must be a real UDP port,
+/// so `0` and anything past `65535` are refused instead of being read as absence.
+fn parse_optional_port(arg: Option<&String>) -> Option<u32> {
+    let arg = arg?;
+    match arg.parse::<u16>() {
+        Ok(port) if port != 0 => Some(u32::from(port)),
+        _ => {
+            eprintln!("Invalid pairing port '{arg}': expected 1..=65535");
+            std::process::exit(1);
+        }
     }
-    let port: u32 = args[0].parse()?;
+}
+
+async fn cmd_wait_for_pairing(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let port = parse_optional_port(args.first());
     let req = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::WaitForPairing(
             ipc::WaitForPairingRequest { port },
@@ -249,17 +264,15 @@ async fn cmd_wait_for_pairing(args: &[String]) -> Result<(), Box<dyn std::error:
     }
     if let Some(ipc::admin_response::Payload::WaitForPairing(p)) = resp.payload {
         println!("SAS={}", p.sas_code);
-        println!("PORT={}", p.port);
+        if let Some(port) = p.port {
+            println!("PORT={}", port);
+        }
     }
     Ok(())
 }
 
 async fn cmd_complete_pairing(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    if args.is_empty() {
-        eprintln!("Usage: tapauth-ipc-cli complete-pairing <port>");
-        std::process::exit(1);
-    }
-    let port: u32 = args[0].parse()?;
+    let port = parse_optional_port(args.first());
     let req = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::CompletePairing(
             ipc::CompletePairingRequest { port },
@@ -297,11 +310,12 @@ async fn cmd_cancel_pairing(args: &[String]) -> Result<(), Box<dyn std::error::E
 
 /// Parse `cancel-pairing`'s flags.
 ///
-/// Both flags are optional on the wire: `port = 0` and an empty session id mean
-/// "don't check that field", which is what the daemon does for a GUI that tears
-/// its screen down.
-fn parse_cancel_flags(args: &[String]) -> (u32, Vec<u8>) {
-    let mut port: u32 = 0;
+/// Both flags are optional on the wire: an absent port and an empty session id mean
+/// "don't check that field", which is what the daemon does for a GUI that tears its
+/// screen down. The port used to be spelled `0` for that; it is now absent, and a
+/// `0` on the command line is refused rather than read as the wildcard.
+fn parse_cancel_flags(args: &[String]) -> (Option<u32>, Vec<u8>) {
+    let mut port: Option<u32> = None;
     let mut session_id: Vec<u8> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -312,7 +326,11 @@ fn parse_cancel_flags(args: &[String]) -> (u32, Vec<u8>) {
                     std::process::exit(1);
                 }
                 match args[i + 1].parse::<u16>() {
-                    Ok(value) => port = u32::from(value),
+                    Ok(value) if value != 0 => port = Some(u32::from(value)),
+                    Ok(_) => {
+                        eprintln!("Invalid --port '0': expected 1..=65535");
+                        std::process::exit(1);
+                    }
                     Err(e) => {
                         eprintln!("Invalid --port '{}': {}", args[i + 1], e);
                         std::process::exit(1);

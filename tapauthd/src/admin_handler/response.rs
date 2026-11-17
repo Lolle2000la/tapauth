@@ -33,7 +33,7 @@ pub(super) fn get_servers_success(servers: Vec<ipc::PairedServerInfo>) -> ipc::A
 
 pub(super) fn start_pairing_success(
     url: String,
-    port: u32,
+    port: Option<u32>,
     session_id: Vec<u8>,
 ) -> ipc::AdminResponse {
     ipc::AdminResponse {
@@ -49,7 +49,9 @@ pub(super) fn start_pairing_success(
     }
 }
 
-pub(super) fn wait_pairing_success(sas_code: String, port: u32) -> ipc::AdminResponse {
+/// `port` is `None` for a session with no UDP socket (BLE-only): the reply leaves
+/// the field unset rather than sending the `0` sentinel this wire used to carry.
+pub(super) fn wait_pairing_success(sas_code: String, port: Option<u32>) -> ipc::AdminResponse {
     ipc::AdminResponse {
         status: ipc::AdminStatus::AdminSuccess as i32,
         error_message: String::new(),

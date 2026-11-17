@@ -186,10 +186,28 @@ pub async fn get_paired_servers() -> Result<Vec<ipc::PairedServerInfo>, GuiIpcEr
 pub struct PairingSession {
     /// The v2 `tapauth://pair?...` URL to render as a QR code.
     pub url: String,
-    /// Ephemeral UDP pairing port the daemon listens on.
-    pub port: u16,
+    /// Ephemeral UDP pairing port the daemon listens on, or `None` for a BLE-only
+    /// session, which bound no socket and therefore has no port to name. The wire
+    /// spells that absence by leaving the field unset; `0` is not a port.
+    pub port: Option<u16>,
     /// The 16-byte session identifier carried by the QR URL's `sid`.
     pub session_id: Vec<u8>,
+}
+
+/// The wire's `optional uint32 port` on the way in: absent is a BLE-only session.
+///
+/// A present value must be a real UDP port, so `0` (the sentinel this wire used to
+/// carry for "BLE-only") and anything past `65535` are rejected instead of being
+/// turned into absence behind the caller's back.
+fn pairing_port(port: Option<u32>) -> Result<Option<u16>, GuiIpcError> {
+    match port {
+        None => Ok(None),
+        Some(port) => u16::try_from(port)
+            .ok()
+            .filter(|port| *port != 0)
+            .map(Some)
+            .ok_or(GuiIpcError::UnexpectedResponse),
+    }
 }
 
 pub async fn start_pairing() -> Result<PairingSession, GuiIpcError> {
@@ -208,7 +226,7 @@ pub async fn start_pairing() -> Result<PairingSession, GuiIpcError> {
     match response.payload {
         Some(ipc::admin_response::Payload::StartPairing(resp)) => Ok(PairingSession {
             url: resp.url,
-            port: resp.port as u16,
+            port: pairing_port(resp.port)?,
             session_id: resp.session_id,
         }),
         _ => Err(GuiIpcError::UnexpectedResponse),
@@ -217,18 +235,18 @@ pub async fn start_pairing() -> Result<PairingSession, GuiIpcError> {
 
 /// Build the admin request that abandons the pairing session identified by
 /// `port` and `session_id` (see `proto/ipc.proto`'s `CancelPairingRequest`).
-fn cancel_pairing_request(port: u16, session_id: &[u8]) -> ipc::AdminRequest {
+fn cancel_pairing_request(port: Option<u16>, session_id: &[u8]) -> ipc::AdminRequest {
     ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::CancelPairing(
             ipc::CancelPairingRequest {
-                port: port as u32,
+                port: port.map(u32::from),
                 session_id: session_id.to_vec(),
             },
         )),
     }
 }
 
-pub async fn cancel_pairing(port: u16, session_id: Vec<u8>) -> Result<(), GuiIpcError> {
+pub async fn cancel_pairing(port: Option<u16>, session_id: Vec<u8>) -> Result<(), GuiIpcError> {
     let response = send_admin_request(cancel_pairing_request(port, &session_id)).await?;
 
     if response.status != ipc::AdminStatus::AdminSuccess as i32 {
@@ -238,10 +256,12 @@ pub async fn cancel_pairing(port: u16, session_id: Vec<u8>) -> Result<(), GuiIpc
     Ok(())
 }
 
-pub async fn wait_for_pairing(port: u32) -> Result<(String, u16), GuiIpcError> {
+pub async fn wait_for_pairing(port: Option<u16>) -> Result<(String, Option<u16>), GuiIpcError> {
     let request = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::WaitForPairing(
-            ipc::WaitForPairingRequest { port },
+            ipc::WaitForPairingRequest {
+                port: port.map(u32::from),
+            },
         )),
     };
 
@@ -253,16 +273,18 @@ pub async fn wait_for_pairing(port: u32) -> Result<(String, u16), GuiIpcError> {
 
     match response.payload {
         Some(ipc::admin_response::Payload::WaitForPairing(resp)) => {
-            Ok((resp.sas_code, resp.port as u16))
+            Ok((resp.sas_code, pairing_port(resp.port)?))
         }
         _ => Err(GuiIpcError::UnexpectedResponse),
     }
 }
 
-pub async fn complete_pairing(port: u32) -> Result<String, GuiIpcError> {
+pub async fn complete_pairing(port: Option<u16>) -> Result<String, GuiIpcError> {
     let request = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::CompletePairing(
-            ipc::CompletePairingRequest { port },
+            ipc::CompletePairingRequest {
+                port: port.map(u32::from),
+            },
         )),
     };
 
@@ -470,12 +492,54 @@ mod tests {
     fn cancel_pairing_request_carries_the_port_and_session_id() {
         let session_id: Vec<u8> = (0u8..16).collect();
 
-        match cancel_pairing_request(41234, &session_id).payload {
+        match cancel_pairing_request(Some(41234), &session_id).payload {
             Some(ipc::admin_request::Payload::CancelPairing(request)) => {
-                assert_eq!(request.port, 41234);
+                assert_eq!(request.port, Some(41234));
                 assert_eq!(request.session_id, session_id);
             }
             other => panic!("expected a CancelPairing payload, got {other:?}"),
         }
+    }
+
+    /// A BLE-only session has no port, and the request must say so by leaving the
+    /// field unset — not by sending `0`, which is what the daemon used to read as
+    /// "BLE-only" and now refuses as an invalid port.
+    ///
+    /// The defect this catches: a caller that serializes absence as `Some(0)`,
+    /// which the daemon answers with an "Invalid pairing port" error instead of
+    /// cancelling (or, worse, a daemon that reads `0` back as absence).
+    #[test]
+    fn cancel_pairing_request_serializes_absence_as_absence() {
+        let session_id: Vec<u8> = (0u8..16).collect();
+
+        match cancel_pairing_request(None, &session_id).payload {
+            Some(ipc::admin_request::Payload::CancelPairing(request)) => {
+                assert_eq!(request.port, None, "absence must not be sent as 0");
+                assert_eq!(request.session_id, session_id);
+            }
+            other => panic!("expected a CancelPairing payload, got {other:?}"),
+        }
+    }
+
+    /// The reply's `optional uint32 port` is read the same way: absent stays absent,
+    /// a real port survives, and the `0` sentinel is refused rather than decoded
+    /// into "BLE-only".
+    ///
+    /// The defect this catches: `resp.port as u16`, which turns both absence and `0`
+    /// into the same `0`, so a BLE-only session and a daemon that still sends the
+    /// sentinel are indistinguishable — and the GUI would then send `0` back.
+    #[test]
+    fn a_pairing_port_is_absent_or_a_real_port() {
+        assert!(matches!(pairing_port(None), Ok(None)));
+        assert!(matches!(pairing_port(Some(41234)), Ok(Some(41234))));
+        assert!(matches!(pairing_port(Some(65535)), Ok(Some(65535))));
+        assert!(matches!(
+            pairing_port(Some(0)),
+            Err(GuiIpcError::UnexpectedResponse)
+        ));
+        assert!(matches!(
+            pairing_port(Some(65536)),
+            Err(GuiIpcError::UnexpectedResponse)
+        ));
     }
 }

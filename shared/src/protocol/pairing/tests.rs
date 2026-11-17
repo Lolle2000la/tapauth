@@ -229,12 +229,15 @@ fn completion_proof_is_signed_by_ed_s_not_ed_c() {
     let csk = [0x42u8; 32];
     let confirm = phone.create_confirm_server(&csk).unwrap();
 
-    // Open the proof with the phone's own `K_s2c`, exactly as the desktop does.
+    // Open the proof with the phone's own `K_s2c`, exactly as the desktop does —
+    // under the *negotiated* algorithm, not a literal, so an algorithm the
+    // session did not select cannot still open it here.
     let keys = phone.keys().unwrap();
     let transcript_hash = *phone.transcript_hash().unwrap();
+    let negotiated = phone.negotiated().unwrap();
     let aad = context_with_hash(PAIRING_COMPLETE_AAD_CONTEXT, &transcript_hash);
     let plaintext = decrypt_with_key(
-        SymmetricAlgorithm::Aes256Gcm,
+        negotiated.symmetric_algorithm,
         &keys.k_s2c,
         &confirm.encrypted_complete,
         &aad,
@@ -447,9 +450,12 @@ fn init_offering_no_supported_algorithm_is_rejected() {
 /// A `PairingInit` whose only advertised ids are the **reserved** tag `2`
 /// (retired `CHACHA20_POLY1305` / `BLAKE3`) must be refused, not defaulted
 /// and not accepted because "something was advertised".
-/// The defect this catches: a decoder that drops ids it cannot name from the
-/// list (leaving it empty and the negotiation free to pick a suite the peer
-/// never offered), or one that maps an unknown id onto the baseline.
+/// The defect this catches: a decoder that drops ids it cannot name and then lets
+/// the negotiation fall back to a default suite (or treat the emptied list as
+/// "anything goes"), which would pair with a peer that never offered the suite.
+/// Dropping the id is correct — an advertisement may name algorithms this build
+/// does not implement — but dropping it leaves an empty list, and an empty list
+/// intersects with nothing.
 #[test]
 fn init_advertising_only_the_reserved_algorithm_tag_is_refused() {
     let mut init = init_with_algorithms(vec![2], vec![1], vec![1]);
@@ -479,9 +485,10 @@ fn init_advertising_only_the_reserved_algorithm_tag_is_refused() {
     assert!(desktop.sas().is_none());
 }
 
-/// An id this build cannot name at all (`99`) is refused for every list.
-/// The defect this catches: `try_from` collapsing an unknown id onto a
-/// default variant, which would both accept the offer and hash a different
+/// An id this build cannot name at all (`99`) is refused when it is *all* a list
+/// offers. The defect this catches: `try_from` collapsing an unknown id onto a
+/// default variant, or an empty post-skip list being negotiated as though the peer
+/// had offered something — either would both accept the offer and hash a different
 /// transcript than the peer did.
 #[test]
 fn init_advertising_only_an_unknown_algorithm_id_is_refused() {
@@ -501,6 +508,57 @@ fn init_advertising_only_an_unknown_algorithm_id_is_refused() {
             "lists {lists:?} must be refused"
         );
         assert!(desktop.response().is_none());
+    }
+}
+
+/// An **advertisement** is a compatibility surface: it may name algorithms this
+/// build does not implement, and that must not cost the peer the handshake. The
+/// unknown ids are skipped and the rest is negotiated, so `[3, 1]` still yields
+/// `AES_256_GCM` / `SHA256` / `ED25519`.
+///
+/// The defect this catches: the advertisement path decoding each id with
+/// `try_from(...)?` inside a `collect`, so a single id from a newer peer refuses a
+/// peer that also advertised the baseline — the forward compatibility
+/// `cryptography-specification.md` §1.4 promises an older Client.
+#[test]
+fn init_advertising_an_unknown_id_alongside_the_baseline_negotiates_the_baseline() {
+    let baseline = NegotiatedAlgorithms {
+        symmetric_algorithm: SymmetricAlgorithm::Aes256Gcm,
+        hash_algorithm: HashAlgorithm::Sha256,
+        signature_algorithm: SignatureAlgorithm::Ed25519,
+    };
+
+    for lists in [
+        (vec![3, 1], vec![1], vec![1]),
+        (vec![1, 3], vec![1], vec![1]),
+        (vec![1], vec![3, 1], vec![1]),
+        (vec![1], vec![1], vec![3, 1]),
+        (vec![99, 3, 1], vec![2, 99, 1], vec![1, 99]),
+    ] {
+        let (symmetric, hash, signature) = lists.clone();
+        let init = init_with_algorithms(symmetric, hash, signature);
+        let mut desktop = seeded_desktop([0x6Du8; PAIRING_SESSION_ID_LEN]);
+        let response = desktop
+            .handle_init(&init)
+            .unwrap_or_else(|e| panic!("lists {lists:?} must negotiate, got {e:?}"));
+
+        assert_eq!(
+            response.selected_symmetric_algorithm, baseline.symmetric_algorithm as i32,
+            "lists {lists:?} must negotiate the baseline symmetric algorithm"
+        );
+        assert_eq!(
+            response.selected_hash_algorithm, baseline.hash_algorithm as i32,
+            "lists {lists:?} must negotiate the baseline hash algorithm"
+        );
+        assert_eq!(
+            response.selected_signature_algorithm, baseline.signature_algorithm as i32,
+            "lists {lists:?} must negotiate the baseline signature algorithm"
+        );
+        assert_eq!(desktop.negotiated(), Some(baseline), "lists {lists:?}");
+        assert!(
+            desktop.sas().is_some(),
+            "lists {lists:?}: skipping the unknown id must establish the session"
+        );
     }
 }
 

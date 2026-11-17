@@ -56,37 +56,49 @@ pub struct PinnedAlgorithms {
     pub hash_algorithm: HashAlgorithm,
 }
 
-/// Reject unknown enum values instead of silently dropping them: the lists enter
-/// the transcript verbatim, so a value we cannot name cannot be hashed either.
+/// Decode an advertised `supported_*` list, dropping the ids this build cannot name.
+///
+/// An **advertisement is a compatibility surface**: a peer lists what it supports,
+/// and a newer build may list an algorithm this one does not implement alongside the
+/// baseline both share. Refusing the whole handshake over that extra id is what kept
+/// an older Client from pairing with a newer Server at all, against
+/// `cryptography-specification.md` §1.4. What survives here is the part of the peer's
+/// list this build can name, and [`negotiate`] intersects exactly that with
+/// `SUPPORTED_*` — so `[3, 1]` negotiates `AES_256_GCM`, while a list of nothing but
+/// unknown ids decodes empty and intersects with nothing, so it is still refused.
+///
+/// Dropping is confined to this path. A **selection is a claim**, not an
+/// advertisement: an id a peer sends as its `selected_*` is authenticated and must be
+/// one we offered, so `ServerPairingSession::verify_response` still refuses an unknown
+/// one (`shared/src/protocol/pairing/server.rs`) instead of defaulting.
+///
+/// The `Result` stays for the caller, which funnels this and the negotiation failure
+/// through one type; a list that names only unknown ids is not itself an error here.
 pub(super) fn symmetric_algorithms(
     values: &[i32],
 ) -> Result<Vec<SymmetricAlgorithm>, ProtocolError> {
-    values
+    Ok(values
         .iter()
-        .map(|value| {
-            SymmetricAlgorithm::try_from(*value).map_err(|_| ProtocolError::UnsupportedAlgorithm)
-        })
-        .collect()
+        .filter_map(|value| SymmetricAlgorithm::try_from(*value).ok())
+        .collect())
 }
 
+/// Hash counterpart of [`symmetric_algorithms`], same rule (see there).
 pub(super) fn hash_algorithms(values: &[i32]) -> Result<Vec<HashAlgorithm>, ProtocolError> {
-    values
+    Ok(values
         .iter()
-        .map(|value| {
-            HashAlgorithm::try_from(*value).map_err(|_| ProtocolError::UnsupportedAlgorithm)
-        })
-        .collect()
+        .filter_map(|value| HashAlgorithm::try_from(*value).ok())
+        .collect())
 }
 
+/// Signature counterpart of [`symmetric_algorithms`], same rule (see there).
 pub(super) fn signature_algorithms(
     values: &[i32],
 ) -> Result<Vec<SignatureAlgorithm>, ProtocolError> {
-    values
+    Ok(values
         .iter()
-        .map(|value| {
-            SignatureAlgorithm::try_from(*value).map_err(|_| ProtocolError::UnsupportedAlgorithm)
-        })
-        .collect()
+        .filter_map(|value| SignatureAlgorithm::try_from(*value).ok())
+        .collect())
 }
 
 /// First of `ours` that `theirs` also lists — i.e. our preference order wins.
@@ -156,9 +168,13 @@ pub(super) fn negotiate(
 /// required contexts in `scripts/ci/check-required-checks.sh`, so a regression here
 /// produces no signal unless someone reads that job.
 ///
-/// These harnesses pin **today's** semantics of `negotiate`. A planned change to the
-/// advertisement path (skip unknown ids instead of refusing them) and the documented
-/// algorithm-upgrade path both have to be followed by a fresh Kani run, not by assuming
+/// These harnesses pin the semantics of `negotiate` **below** the advertisement
+/// decoder. That decoder now skips ids this build cannot name (see
+/// [`super::symmetric_algorithms`]), so what reaches `negotiate` is the known part of
+/// the peer's list and not the list as it arrived: (a) and (c) still describe it, while
+/// (b) — "succeeds exactly when every slot intersects" — has to be read as "refused
+/// only when the *known* intersection is empty" before the next run. The documented
+/// algorithm-upgrade path likewise needs a fresh Kani run, not the assumption that
 /// these still hold.
 ///
 /// The peer slices are `[T; K]` arrays with a symbolic length, not `Vec`s, and the

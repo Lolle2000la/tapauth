@@ -160,7 +160,49 @@ pub(super) async fn handle_start_pairing(
         hex::encode(session_id)
     );
 
-    start_pairing_success(qr_url, u32::from(local_port), session_id.to_vec())
+    start_pairing_success(qr_url, advertised_port(local_port), session_id.to_vec())
+}
+
+/// The admin IPC's `port` field on the way **out**: a port only when the session
+/// bound a UDP socket.
+///
+/// `OpenPorts::local_port` is `0` for a BLE-only session (no socket was bound), so
+/// that is where the value is turned into absence: the reply reports a session with
+/// no port by leaving the field unset, not by sending `0`.
+pub(super) fn advertised_port(local_port: u16) -> Option<u32> {
+    (local_port != 0).then(|| u32::from(local_port))
+}
+
+/// The admin IPC's `port` field on the way **in**: check it against the session it
+/// addresses.
+///
+/// Absence means the caller is not naming a port — a BLE-only session has none to
+/// name, and a caller that holds no session (the GUI's error-screen Cancel) has
+/// nothing to compare — so it skips the check, which is the wildcard the `0`
+/// sentinel used to carry. A present value must be a real UDP port: `0` and
+/// anything above `u16::MAX` are refused as invalid instead of being read back as
+/// absence, so the deleted sentinel cannot return as a value.
+pub(super) fn check_requested_port(
+    port: Option<u32>,
+    expected: u16,
+) -> Result<(), ipc::AdminResponse> {
+    let Some(requested) = port else {
+        return Ok(());
+    };
+    match u16::try_from(requested).ok().filter(|port| *port != 0) {
+        Some(port) if port == expected => Ok(()),
+        Some(port) => Err(err_resp(
+            ipc::AdminStatus::AdminError,
+            format!("Port mismatch: expected {expected}, got {port}"),
+        )),
+        None => Err(err_resp(
+            ipc::AdminStatus::AdminError,
+            format!(
+                "Invalid pairing port: {requested} (expected 1..=65535, or no port for a \
+                 BLE-only session)"
+            ),
+        )),
+    }
 }
 
 /// Wait for the phone's `PairingInit` and return the SAS to display.
@@ -177,15 +219,8 @@ pub(super) async fn handle_wait_for_pairing(
         let Some(session) = guard.as_ref() else {
             return err_resp(ipc::AdminStatus::AdminError, "No pending pairing session");
         };
-        if req.port != 0 && req.port != u32::from(session.port()) {
-            return err_resp(
-                ipc::AdminStatus::AdminError,
-                format!(
-                    "Port mismatch: expected {}, got {}",
-                    session.port(),
-                    req.port
-                ),
-            );
+        if let Err(response) = check_requested_port(req.port, session.port()) {
+            return response;
         }
         (
             session.phase_receiver(),
@@ -202,7 +237,7 @@ pub(super) async fn handle_wait_for_pairing(
         let phase = phases.borrow().clone();
         match phase {
             SessionPhase::AwaitingSas(sas) => {
-                return wait_pairing_success(sas, u32::from(port));
+                return wait_pairing_success(sas, advertised_port(port));
             }
             SessionPhase::Finished => {
                 return err_resp(
@@ -297,15 +332,8 @@ pub(super) async fn handle_complete_pairing(
                 "No pairing session in progress",
             );
         };
-        if req.port != 0 && req.port != u32::from(current.port()) {
-            return err_resp(
-                ipc::AdminStatus::AdminError,
-                format!(
-                    "Port mismatch: expected {}, got {}",
-                    current.port(),
-                    req.port
-                ),
-            );
+        if let Err(response) = check_requested_port(req.port, current.port()) {
+            return response;
         }
         match current.phase() {
             SessionPhase::AwaitingPhone => {
@@ -365,7 +393,7 @@ pub(super) async fn handle_complete_pairing(
     let client_hostname = daemon.hostname.clone();
     let completed = match crate::pairing::request_completion(
         &session,
-        *csk.as_bytes(),
+        csk.clone(),
         username.to_string(),
         client_hostname,
     )
@@ -454,15 +482,8 @@ pub(super) async fn handle_cancel_pairing(
             // is torn down, possibly after the session already ended.
             return cancel_pairing_success();
         };
-        if req.port != 0 && req.port != u32::from(current.port()) {
-            return err_resp(
-                ipc::AdminStatus::AdminError,
-                format!(
-                    "Port mismatch: expected {}, got {}",
-                    current.port(),
-                    req.port
-                ),
-            );
+        if let Err(response) = check_requested_port(req.port, current.port()) {
+            return response;
         }
         if !req.session_id.is_empty()
             && req.session_id.as_slice() != current.session_id().as_slice()
