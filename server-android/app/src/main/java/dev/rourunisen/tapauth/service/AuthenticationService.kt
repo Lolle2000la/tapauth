@@ -84,8 +84,10 @@ class AuthenticationService : Service() {
         //   IPv6: transient link-local (ff12::/16); low 32 bits are inside the
         //         IANA "Reserved for Private Use" dynamic group-id range
         //         (0xFD000000-0xFDFFFFFF, RFC 10028).
-        private val IPV4_MULTICAST_GROUP: InetAddress = InetAddress.getByName("239.255.26.44")
-        private val IPV6_MULTICAST_GROUP: InetAddress = InetAddress.getByName("ff12::fdec:fc27")
+        // Internal, not private: `SharedProtocolLiteralsTest` pins both against the literals
+        // `shared/src/network.rs` publishes.
+        internal val IPV4_MULTICAST_GROUP: InetAddress = InetAddress.getByName("239.255.26.44")
+        internal val IPV6_MULTICAST_GROUP: InetAddress = InetAddress.getByName("ff12::fdec:fc27")
         // Debounce delay for multicast rejoin operations (milliseconds)
         private const val REJOIN_DEBOUNCE_MS = 500L
 

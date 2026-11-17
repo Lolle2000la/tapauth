@@ -673,6 +673,49 @@ mod tests {
         }
     }
 
+    /// The whole GATT table this side registers, against the specification both transports
+    /// are written from (`ble-gatt-specification.md` §2). `tapauthd`'s `transport/ble.rs`
+    /// derives its attribute table from these constants and Android's `BleGattService`
+    /// copies the same five literals, so a drifted one is served under one UUID and looked
+    /// up under another — a link that silently never matches, with no error anywhere.
+    ///
+    /// The defect this catches: a transcription slip in the service or any of the four
+    /// characteristics. Android's copy is pinned separately by `SharedProtocolLiteralsTest`.
+    #[test]
+    fn test_ble_gatt_uuids_match_the_specification() {
+        assert_eq!(ble::SERVICE_UUID, "b4ad84c0-2adb-4876-8315-b39d983b2bde");
+        assert_eq!(
+            ble::CLIENT_COMMAND_CHAR_UUID,
+            "caf54438-9d78-4697-8886-0a4cfa87ba8d"
+        );
+        assert_eq!(
+            ble::SERVER_RESPONSE_CHAR_UUID,
+            "ca6238be-c194-49b7-855b-58f41d3da626"
+        );
+        assert_eq!(
+            ble::CLIENT_CONFIRMATION_CHAR_UUID,
+            "ace3e9ad-5f0d-48bf-825a-5b7f4dc49cdf"
+        );
+        assert_eq!(
+            ble::PAIRING_CHAR_UUID,
+            "d9e8f1a2-3b4c-4d5e-8f60-7a8b9c0d1e2f"
+        );
+    }
+
+    /// The GATT payload ceiling and the MTU Android negotiates are one budget: a single
+    /// ATT PDU carries `MTU - 5` bytes of payload, so the 512-byte ceiling needs an MTU of
+    /// 517 (`BleGattService.GATT_REQUESTED_MTU`, `BlePairingClient.TARGET_MTU`).
+    ///
+    /// The defect this catches: either number moving alone — a ceiling above what the MTU
+    /// can carry makes Rust accept frames the stack must fragment or truncate, and a
+    /// lowered one silently refuses frames the desktop believes are deliverable. Android's
+    /// half of the same assertion is in `SharedProtocolLiteralsTest`.
+    #[test]
+    fn test_gatt_payload_fits_the_negotiated_mtu() {
+        assert_eq!(ble::MAX_GATT_PAYLOAD_BYTES, 512);
+        assert_eq!(ble::MAX_GATT_PAYLOAD_BYTES + 5, 517);
+    }
+
     /// A canonical `sid` and `pk`, 32 and 64 lower-case hex characters.
     const SID: &str = "00112233445566778899aabbccddeeff";
     const PK: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
