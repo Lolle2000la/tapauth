@@ -157,6 +157,13 @@ pub struct ParsedAuthRequest {
 #[derive(Clone, uniffi::Record)]
 pub struct ParsedPairingProvision {
     /// The CSK the desktop provisioned; must be persisted by the phone.
+    ///
+    /// Rust zeroizes the decrypted payload and its own `Zeroizing` copy
+    /// (`ffi/ops.rs`), then hands the bytes over as this plain `Vec`, which becomes
+    /// the Kotlin `ByteArray` the phone owns — a buffer Rust cannot reach and
+    /// cannot wipe.
+    /// The phone must clear that `ByteArray` once it has persisted the device;
+    /// nothing on the Kotlin side does today.
     pub csk: Vec<u8>,
     /// Linux account this pairing authorizes.
     pub username: String,
