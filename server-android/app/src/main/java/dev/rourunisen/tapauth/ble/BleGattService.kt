@@ -733,7 +733,7 @@ class BleGattService : Service() {
         scanPendingIntent = null
     }
 
-    private fun connectToClient(device: BluetoothDevice, csk: String) {
+    private fun connectToClient(device: BluetoothDevice) {
         if (
             ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) !=
                 PackageManager.PERMISSION_GRANTED
@@ -1992,7 +1992,7 @@ class BleGattService : Service() {
             val matchedDevice = temporalIdIndex.lookupAdvertisement(temporalIdHex)
             if (matchedDevice != null) {
                 Log.i(TAG, "Temporal ID matches paired device, connecting...")
-                withContext(Dispatchers.Main) { connectToClient(device, matchedDevice.csk.toHex()) }
+                withContext(Dispatchers.Main) { connectToClient(device) }
             } else {
                 Log.d(TAG, "Temporal ID does not match any paired device")
             }

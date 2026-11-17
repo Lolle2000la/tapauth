@@ -494,6 +494,100 @@ class BleGattServiceWiringTest {
     }
 
     /**
+     * The BLE central opens its GATT link without touching the long-term key.
+     *
+     * `connectToClient` used to take `csk: String`, fed by `matchedDevice.csk.toHex()` at the one
+     * call site. That parameter was never read, but it still copied the Client Symmetric Key into
+     * an immutable `String` on every scan match — and a Kotlin `String` cannot be zeroized, so it
+     * outlives every `fill(0)` the crypto layer does.
+     *
+     * What this can and cannot see: it is a textual read of the shipped declaration, not a type
+     * check and not a dataflow analysis. It says nothing about the runtime — no JVM test can
+     * construct this `Service` or a `BluetoothGatt`.
+     */
+    @Test
+    fun theConnectionSignatureTakesOnlyTheDevice() {
+        val (declarations, _) = connectSites()
+
+        assertEquals(
+            "`$CONNECT_CALL` must be declared exactly once; found ${declarations.size} declarations " +
+                "of it, so the signature compared here is not the one the service runs",
+            1,
+            declarations.size,
+        )
+        assertEquals(
+            "`$CONNECT_CALL` must take the device and nothing else: a `csk: String` parameter there " +
+                "is dead (nothing reads it) but still materialises the long-term key as a String " +
+                "that cannot be zeroed; declaration parameters: ${declarations.single().second}",
+            CONNECT_DECLARATION_ARGUMENTS,
+            declarations.single().second,
+        )
+    }
+
+    /**
+     * …and every call still made to it passes the device alone.
+     *
+     * Removing the use is not removing the copy: the argument is what produced it, so a `csk` that
+     * survives at a call site keeps converting the key to a `String` even after the parameter is
+     * gone.
+     *
+     * What this can and cannot see: a textual read of each call site in `BleGattService.kt`, so it
+     * compares the written arguments and follows nothing — a call that hands the `BluetoothDevice`
+     * to a helper which then takes the CSK is invisible here (that is what
+     * [noBleSourceMaterialisesTheCskAsAString] covers, and only for direct conversions).
+     */
+    @Test
+    fun everyConnectCallPassesOnlyTheDevice() {
+        val (_, invocations) = connectSites()
+
+        assertTrue("`$CONNECT_CALL` must still be called somewhere", invocations.isNotEmpty())
+        for ((offset, arguments) in invocations) {
+            assertEquals(
+                "the `$CONNECT_CALL` call at offset $offset must pass only the device — no `csk` " +
+                    "and no `.toHex()` of it, which converts the key to a String that outlives " +
+                    "every `fill(0)`; arguments found: `$arguments`",
+                CONNECT_CALL_ARGUMENTS,
+                arguments,
+            )
+        }
+    }
+
+    /**
+     * No `ble/` source converts the CSK to a `String` — the one thing the compile cannot refuse.
+     *
+     * A `String` is immutable and cannot be zeroed, so `matchedDevice.csk.toHex()` leaves a copy of
+     * the Client Symmetric Key in the heap for the rest of the process, whatever `fill(0)` the
+     * crypto layer runs afterwards. Every key stays a `ByteArray` that its owner can wipe.
+     *
+     * What this can and cannot see: it is a line-by-line textual scan for a *direct* conversion —
+     * `.toHex()`/`.joinToString()` on a `csk`, `String(...)`/`.format(...)` of one, or the CSK
+     * interpolated into a template. It does not see a CSK copied into a differently named local
+     * first, handed to a helper that returns a `String`, or read through reflection; and it cannot
+     * see test sources (the brief is the shipped package). It deliberately does not flag `toHex(`
+     * on any line that merely mentions a `csk`: `advertisementId(device.csk, …).toHex()` in
+     * `BleTemporalIdIndex` converts the derived temporal identifier, which is broadcast in the
+     * clear by design, not the key.
+     */
+    @Test
+    fun noBleSourceMaterialisesTheCskAsAString() {
+        val offenders = mutableListOf<String>()
+        for (file in bleSources()) {
+            file.readLines().forEachIndexed { lineIndex, line ->
+                if (CSK_NAME.containsMatchIn(line) && CSK_STRING_CONVERSION.containsMatchIn(line)) {
+                    offenders.add("${file.name}:${lineIndex + 1}: ${line.trim()}")
+                }
+            }
+        }
+        assertTrue(
+            "no `ble/` source may turn the CSK into a String: a Kotlin String cannot be zeroed, so " +
+                "it outlives every `fill(0)` and leaves the key in the heap. Pass the ByteArray " +
+                "through instead. Offending lines:\n" +
+                offenders.joinToString("\n"),
+            offenders.isEmpty(),
+        )
+    }
+
+    /**
      * The body of one `when (decision)` arm: from its label to the next arm's label.
      *
      * The done-with-decision check above the `when` mentions a variant too, so the label has to be
@@ -522,26 +616,97 @@ class BleGattServiceWiringTest {
     }
 
     /**
-     * The argument list of the first `call` in the source — from the call's own `(` to its matching
-     * `)` — with whitespace and line breaks collapsed, so the shape is compared and not the
-     * formatting.
+     * The argument list of the first `call` in the source — the text between the call's own `(` and
+     * its matching `)` — with whitespace and line breaks collapsed, so the shape is compared and
+     * not the formatting.
      */
     private fun argumentsOf(call: String): String {
         val start = source.indexOf(call)
         assertTrue("`$call` must exist in BleGattService.kt", start >= 0)
+        return argumentsFrom(start + call.length - 1)
+    }
+
+    /**
+     * The text between the `(` at [open] and its matching `)`, normalised: the arguments of one
+     * call or the parameters of one declaration, with nested calls and lambdas kept whole.
+     */
+    private fun argumentsFrom(open: Int): String {
+        assertTrue(
+            "offset $open must be the `(` of the call being read; re-read BleGattService.kt",
+            open in source.indices && source[open] == '(',
+        )
         var depth = 0
-        var index = start + call.length - 1
+        var index = open
         while (index < source.length) {
             when (source[index]) {
                 '(' -> depth++
                 ')' -> {
                     depth--
-                    if (depth == 0) return source.substring(start, index + 1).normalized()
+                    if (depth == 0) return source.substring(open + 1, index).normalized()
                 }
             }
             index++
         }
-        throw AssertionError("`$call` is never closed in BleGattService.kt")
+        throw AssertionError("the call opened at offset $open is never closed in BleGattService.kt")
+    }
+
+    /**
+     * Every occurrence of [call] with the argument list it is written with, in source order.
+     *
+     * The declaration is an occurrence too; a caller tells it apart by what precedes it
+     * ([DECLARATION_PREFIX]).
+     */
+    private fun callSitesOf(call: String): List<Pair<Int, String>> {
+        val sites = mutableListOf<Pair<Int, String>>()
+        var index = source.indexOf(call)
+        while (index >= 0) {
+            sites.add(index to argumentsFrom(index + call.length - 1))
+            index = source.indexOf(call, index + call.length)
+        }
+        return sites
+    }
+
+    /**
+     * The `connectToClient` declaration(s) and invocation(s) of the service source, each with the
+     * parameter or argument list it is written with.
+     *
+     * A declaration is told apart by the `fun ` in front of it, which no invocation has.
+     */
+    private fun connectSites(): Pair<List<Pair<Int, String>>, List<Pair<Int, String>>> {
+        val sites = callSitesOf(CONNECT_CALL)
+        val declared = sites.filter { source.substring(0, it.first).endsWith(DECLARATION_PREFIX) }
+        val invoked = sites.filterNot { source.substring(0, it.first).endsWith(DECLARATION_PREFIX) }
+        return declared to invoked
+    }
+
+    /**
+     * Every top-level `.kt` file of the `ble/` package, beside the service source.
+     *
+     * Fails rather than skips when the package cannot be found: a guard that silently scans nothing
+     * is the defect it exists to prevent.
+     */
+    private fun bleSources(): List<File> {
+        var directory: File? = File("").absoluteFile
+        while (directory != null) {
+            val file = File(directory, SERVICE_SOURCE_PATH)
+            if (file.isFile) {
+                val packageDirectory = file.parentFile
+                val sources = packageDirectory.listFiles { candidate ->
+                    candidate.isFile && candidate.name.endsWith(".kt")
+                }
+                assertTrue(
+                    "no `.kt` sources found beside $SERVICE_SOURCE_PATH " +
+                        "(looked in ${packageDirectory?.absolutePath}); re-read the package layout",
+                    !sources.isNullOrEmpty(),
+                )
+                return sources!!.sortedBy { it.name }
+            }
+            directory = directory.parentFile
+        }
+        throw AssertionError(
+            "$SERVICE_SOURCE_PATH was not found above ${File("").absolutePath}; the `ble/` " +
+                "package cannot be scanned from this working directory",
+        )
     }
 
     /** `STATE_DISCONNECTED` up to the grace coroutine it starts, i.e. the pre-teardown body. */
@@ -594,6 +759,28 @@ class BleGattServiceWiringTest {
         /** The effects the release arm has to run before it marks the release. */
         const val ABANDON_PEER_CALL = "pendingResponses.abandonPeer("
         const val CANCEL_BY_DISCONNECTION_CALL = "cancelRequestsByBleDisconnection("
+
+        /** The link-opening call whose parameters must stay free of the CSK. */
+        const val CONNECT_CALL = "connectToClient("
+        const val DECLARATION_PREFIX = "fun "
+
+        /** The device, and nothing else: what a connect passes, and what its declaration takes. */
+        const val CONNECT_CALL_ARGUMENTS = "device"
+        const val CONNECT_DECLARATION_ARGUMENTS = "device: BluetoothDevice"
+
+        /** What a CSK is called in this package. */
+        val CSK_NAME = Regex("""csk\b""")
+
+        /**
+         * A *direct* conversion of a `csk` to a `String`: `.toHex()`/`.joinToString()` on it,
+         * `String(...)`/`.format(...)` of it, or the CSK interpolated into a template. Deliberately
+         * not "`toHex(` anywhere on a `csk` line": `advertisementId(device.csk, …).toHex()`
+         * converts the derived temporal identifier, not the key, and a same-line rule flags it.
+         */
+        val CSK_STRING_CONVERSION =
+            Regex(
+                """csk\b\s*\.\s*(toHex|joinToString)\s*\(|String\(\s*[\w.]*csk\b|\.format\(\s*[\w.]*csk\b|\$\{?[\w.]*csk\b""",
+            )
 
         /** The variant prefix of each `BleDisconnectGrace.Outcome` arm. */
         const val OUTCOME_PREFIX = "BleDisconnectGrace.Outcome."
