@@ -29,7 +29,13 @@ jobs:
     name: Kani Proofs (shared)
     runs-on: ubuntu-latest
     # A cold `cargo kani setup` (CBMC + the Kani toolchain download) plus the job's own
-    # compile is several minutes; the harnesses themselves are ~40 s together.
+    # compile is several minutes; the seven harnesses themselves are ~51 s wall
+    # together, build included — the three `negotiate` proofs in
+    # `shared/src/protocol/pairing/negotiation.rs`,
+    # `the_truncated_name_is_the_longest_prefix_within_budget` in
+    # `shared/src/protocol/pairing/fields.rs`, and `encode_then_decode_is_the_identity`,
+    # `decode_len_never_exceeds_the_cap` and `encode_len_refuses_above_the_cap` in
+    # `shared/src/ipc/framing.rs`.
     timeout-minutes: 45
 
     steps:
