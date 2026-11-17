@@ -1,5 +1,5 @@
 {
-  "about": "Canonical vectors for the v2 pairing URL grammar. Read by the Rust test `test_pairing_url_vectors_are_honoured` in shared/src/models.rs (via include_str!) and by PairingUrlTest.kt in server-android (the same path, resolved from the Gradle test working directory server-android/app). Both parsers must agree on every case: `accept` says whether the URL is a valid v2 pairing URL, and for an accepted URL the `sid`/`pk`/`port`/`ip4`/`ip6` fields are the values it must yield (null for an absent component). Hex is written in lower case so the Rust side's decode-and-re-encode of `sid` matches the phone's verbatim text. Add a case here, never in one suite only.",
+  "about": "Canonical vectors for the v2 pairing URL grammar. Read by the Rust test `test_pairing_url_vectors_are_honoured` in shared/src/models.rs (via include_str!) and by PairingUrlTest.kt in server-android (the same path, resolved from the Gradle test working directory server-android/app). Both parsers must agree on every case: `accept` says whether the URL is a valid v2 pairing URL, and for an accepted URL the `sid`/`pk`/`port`/`ip4`/`ip6` fields are the values it must yield (null for an absent component). Hex is written in lower case so the Rust side's decode-and-re-encode of `sid` matches the phone's verbatim text, and `ip4`/`ip6` are written in the canonical text `std::net::Ipv4Addr`/`Ipv6Addr`'s `Display` produces, because the Rust side compares `ip.to_string()`: an accepted IPv6 written in any of its accepted spellings yields that one value. Add a case here, never in one suite only.",
   "cases": [
     {
       "name": "v2 with every optional component",
@@ -404,6 +404,86 @@
     {
       "name": "empty ip4 value",
       "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&ip4=",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "ip4 is an IPv4 literal",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&ip4=1.2.3.4",
+      "accept": true,
+      "sid": "00112233445566778899aabbccddeeff",
+      "pk": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "port": null,
+      "ip4": "1.2.3.4",
+      "ip6": null
+    },
+    {
+      "name": "ip4 octet above 255",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&ip4=999.1.1.1",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "ip4 is a hostname, not an IP literal",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&ip4=example.com",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "ip6 is a hostname, not an IP literal",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&ip6=example.com",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "ip6 compressed form",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&ip6=2001:db8::1",
+      "accept": true,
+      "sid": "00112233445566778899aabbccddeeff",
+      "pk": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "port": null,
+      "ip4": null,
+      "ip6": "2001:db8::1"
+    },
+    {
+      "name": "ip6 fully expanded form yields the canonical value",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&ip6=2001:0db8:0000:0000:0000:0000:0000:0001",
+      "accept": true,
+      "sid": "00112233445566778899aabbccddeeff",
+      "pk": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "port": null,
+      "ip4": null,
+      "ip6": "2001:db8::1"
+    },
+    {
+      "name": "ip6 loopback",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&ip6=::1",
+      "accept": true,
+      "sid": "00112233445566778899aabbccddeeff",
+      "pk": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "port": null,
+      "ip4": null,
+      "ip6": "::1"
+    },
+    {
+      "name": "ip6 zone id is not an IP literal",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&ip6=fe80::1%25eth0",
       "accept": false,
       "sid": null,
       "pk": null,

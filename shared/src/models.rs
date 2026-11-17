@@ -754,7 +754,7 @@ mod tests {
     /// bumping this number and `PairingUrlTest`'s together.
     #[test]
     fn test_pairing_url_vectors_are_honoured() {
-        const EXPECTED_CASES: usize = 41;
+        const EXPECTED_CASES: usize = 49;
 
         let vectors: PairingUrlVectors =
             serde_json::from_str(include_str!("../testdata/pairing_url_vectors.json"))
