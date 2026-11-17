@@ -1,8 +1,9 @@
 //! Admin & PAM IPC CLI tool for testing and administration.
 //! Connects to tapauthd via Unix socket (supports TAPAUTHD_SOCK override).
 
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 use prost::Message;
+use shared::ipc::framing;
 use shared::ipc::pb as ipc;
 use std::env;
 use std::path::Path;
@@ -46,9 +47,9 @@ async fn write_framed(
     stream: &mut UnixStream,
     msg: &[u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let len = msg.len() as u32;
+    let prefix = framing::encode_len(msg.len())?;
     let mut buf = BytesMut::with_capacity(4 + msg.len());
-    buf.put_u32(len);
+    buf.extend_from_slice(&prefix);
     buf.extend_from_slice(msg);
     stream.write_all(&buf).await?;
     Ok(())
@@ -57,10 +58,7 @@ async fn write_framed(
 async fn read_framed(stream: &mut UnixStream) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 10 * 1024 * 1024 {
-        return Err("Frame too large".into());
-    }
+    let len = framing::decode_len(len_buf)?;
     let mut data = vec![0u8; len];
     stream.read_exact(&mut data).await?;
     Ok(data)

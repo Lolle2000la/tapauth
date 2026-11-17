@@ -10,9 +10,10 @@ use crate::admin_handler::PairingState;
 use crate::auth_handler::{AuthSession, DaemonState};
 use crate::caller_context;
 use crate::DaemonError;
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use prost::Message;
+use shared::ipc::framing;
 use shared::ipc::pb as ipc;
 use std::collections::HashMap;
 use std::io;
@@ -247,14 +248,16 @@ async fn handle_pam_cancel(
 }
 
 async fn write_framed<M: Message>(stream: &mut UnixStream, msg: &M) -> Result<(), DaemonError> {
-    let mut buf = BytesMut::with_capacity(256);
-
     // Encode message to temporary buffer first to get length
     let msg_bytes = msg.encode_to_vec();
-    let len = msg_bytes.len() as u32;
+    // Refuse to emit a frame our own IPC clients would reject: the cap is
+    // enforced on the way out as well as on the way in.
+    let prefix = framing::encode_len(msg_bytes.len())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("frame too large: {e}")))?;
 
+    let mut buf = BytesMut::with_capacity(4 + msg_bytes.len());
     // Write length prefix (u32 BE)
-    buf.put_u32(len);
+    buf.extend_from_slice(&prefix);
     // Write message
     buf.extend_from_slice(&msg_bytes);
 
@@ -305,14 +308,70 @@ fn envelope_admin_response(response: ipc::AdminResponse) -> ipc::IpcEnvelope {
 async fn read_framed(stream: &mut UnixStream) -> Result<Vec<u8>, DaemonError> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-
-    if len > (10 * 1024 * 1024) {
-        // 10 MiB sanity limit
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large").into());
-    }
+    let len = framing::decode_len(len_buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("frame too large: {e}")))?;
 
     let mut data = vec![0u8; len];
     stream.read_exact(&mut data).await?;
     Ok(data)
+}
+
+// reason: test module; the crate root denies unwrap/expect/panic.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// The daemon's reader consumes exactly the bytes `shared::ipc::framing`
+    /// produces, so the socket carries the shared wire format rather than a
+    /// local copy of it.
+    #[tokio::test]
+    async fn read_framed_round_trips_a_frame_from_the_shared_encoder() {
+        let (mut tx, mut rx) = UnixStream::pair().unwrap();
+        let body = b"tapauth-envelope".to_vec();
+        let prefix = framing::encode_len(body.len()).unwrap();
+
+        tx.write_all(&prefix).await.unwrap();
+        tx.write_all(&body).await.unwrap();
+
+        assert_eq!(read_framed(&mut rx).await.unwrap(), body);
+    }
+
+    /// One byte past the shared cap is refused on the length alone, before any
+    /// body is reserved for it.
+    #[tokio::test]
+    async fn read_framed_rejects_a_frame_past_the_shared_cap() {
+        let (mut tx, mut rx) = UnixStream::pair().unwrap();
+        let over = framing::MAX_FRAME_LEN + 1;
+        tx.write_all(&(over as u32).to_be_bytes()).await.unwrap();
+
+        match read_framed(&mut rx).await.unwrap_err() {
+            DaemonError::Io(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// The daemon cannot emit a reply its own clients refuse: a body above the
+    /// shared cap is rejected and no prefix reaches the socket, so the peer is
+    /// never left waiting on a body that will not come.
+    #[tokio::test]
+    async fn write_framed_refuses_a_reply_past_the_shared_cap() {
+        let (mut tx, rx) = UnixStream::pair().unwrap();
+        let response = ipc::AdminResponse {
+            status: ipc::AdminStatus::AdminSuccess as i32,
+            error_message: "x".repeat(framing::MAX_FRAME_LEN),
+            payload: None,
+        };
+
+        match write_framed(&mut tx, &response).await.unwrap_err() {
+            DaemonError::Io(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let mut buf = [0u8; 1];
+        match rx.try_read(&mut buf) {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            other => panic!("daemon emitted bytes for a refused frame: {other:?}"),
+        }
+    }
 }

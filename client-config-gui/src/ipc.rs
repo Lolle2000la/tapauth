@@ -1,5 +1,6 @@
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 use prost::Message;
+use shared::ipc::framing;
 use shared::ipc::pb as ipc;
 use std::io;
 use std::path::Path;
@@ -90,9 +91,10 @@ pub async fn daemon_socket() -> io::Result<UnixStream> {
 }
 
 async fn write_framed(stream: &mut UnixStream, msg: &[u8]) -> io::Result<()> {
-    let len = msg.len() as u32;
+    let prefix = framing::encode_len(msg.len())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let mut buf = BytesMut::with_capacity(4 + msg.len());
-    buf.put_u32(len);
+    buf.extend_from_slice(&prefix);
     buf.extend_from_slice(msg);
     stream.write_all(&buf).await
 }
@@ -100,13 +102,8 @@ async fn write_framed(stream: &mut UnixStream, msg: &[u8]) -> io::Result<()> {
 async fn read_framed(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 10 * 1024 * 1024 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame too large",
-        ));
-    }
+    let len = framing::decode_len(len_buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let mut data = vec![0u8; len];
     stream.read_exact(&mut data).await?;
     Ok(data)
