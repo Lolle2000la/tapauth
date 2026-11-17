@@ -565,3 +565,134 @@ mod tests {
         assert_eq!(sanitize_context_string(&input, 3), "\u{20ac}");
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+mod property_tests {
+    use super::{is_forbidden_context_char, sanitize_context_string};
+    use proptest::prelude::*;
+
+    /// The characters that make the sanitizer's three passes interesting, in the
+    /// proportions that reach them: plain text, the bytes an ANSI sequence is made of,
+    /// the whitespace set, the forbidden set and multi-byte code points.
+    fn context_char() -> impl Strategy<Value = char> {
+        prop_oneof![
+            4 => prop::char::range('a', 'z'),
+            1 => prop::char::range('0', '9'),
+            2 => prop::sample::select(vec!['[', ']', ';', 'm', '\\']),
+            2 => prop::sample::select(vec![
+                '\t', '\n', '\r', ' ', '\u{a0}', '\u{3000}', '\u{85}',
+            ]),
+            2 => prop::sample::select(vec![
+                '\u{0}', '\u{1b}', '\u{7}', '\u{7f}', '\u{9f}', '\u{61c}', '\u{200b}',
+                '\u{200f}', '\u{202e}', '\u{2066}', '\u{feff}',
+            ]),
+            2 => prop::sample::select(vec!['€', '漢', '😀', 'é']),
+        ]
+    }
+
+    fn context_input() -> impl Strategy<Value = String> {
+        prop::collection::vec(context_char(), 0..24).prop_map(|chars| chars.into_iter().collect())
+    }
+
+    /// Budgets straddle every boundary the sanitizer has: `0`, the 3-byte ellipsis
+    /// threshold (`3`/`4`), and both sides of the largest field budget (128).
+    fn context_budget() -> impl Strategy<Value = usize> {
+        0usize..=140
+    }
+
+    proptest! {
+        /// The sanitized value never exceeds its byte budget, whatever the input and
+        /// whatever the budget — including the budgets below the 3-byte ellipsis, where
+        /// the result is cut without one.
+        ///
+        /// The defect this catches is an off-by-one in the ellipsis reservation, which
+        /// would put a 129-byte value into a 128-byte field.
+        #[test]
+        fn sanitized_context_string_fits_the_byte_budget(
+            input in context_input(),
+            max_bytes in context_budget(),
+        ) {
+            let out = sanitize_context_string(&input, max_bytes);
+
+            prop_assert!(
+                out.len() <= max_bytes,
+                "sanitizing {:?} to {} bytes produced {} bytes",
+                input,
+                max_bytes,
+                out.len()
+            );
+        }
+
+        /// Nothing in the forbidden set reaches the output: no control character, no
+        /// bidi formatter, no zero-width character, and therefore no `ESC` that could
+        /// open an escape sequence on the phone's prompt.
+        ///
+        /// The predicate is the module's own [`is_forbidden_context_char`], not a
+        /// re-transcription, so a code point added to the set is covered here without
+        /// editing the property.
+        #[test]
+        fn sanitized_context_string_has_no_forbidden_code_point(
+            input in context_input(),
+            max_bytes in context_budget(),
+        ) {
+            let out = sanitize_context_string(&input, max_bytes);
+
+            if let Some(found) = out.chars().find(|ch| is_forbidden_context_char(*ch)) {
+                prop_assert!(
+                    false,
+                    "sanitizing {:?} to {} bytes kept forbidden U+{:04X} in {:?}",
+                    input,
+                    max_bytes,
+                    found as u32,
+                    out
+                );
+            }
+        }
+
+        /// The output is valid UTF-8. Rust's `String` cannot hold anything else, so this
+        /// can only fail if `sanitize_context_string` stops returning one — it makes
+        /// that signature change a test failure rather than a silent loss of the
+        /// guarantee the Kotlin mirror depends on.
+        #[test]
+        fn sanitized_context_string_is_valid_utf8(
+            input in context_input(),
+            max_bytes in context_budget(),
+        ) {
+            let out = sanitize_context_string(&input, max_bytes);
+
+            prop_assert!(
+                core::str::from_utf8(out.as_bytes()) == Ok(out.as_str()),
+                "sanitizing {:?} to {} bytes produced invalid UTF-8",
+                input,
+                max_bytes
+            );
+        }
+
+        /// Sanitizing an already-sanitized value changes nothing. That is only true
+        /// above the ellipsis threshold: at a budget of 2 or 3 bytes a cut can end on
+        /// the very space the second pass would trim (`"a b"` at 2 bytes yields
+        /// `"a "`), which is why the domain starts at 4.
+        #[test]
+        fn sanitized_context_string_is_idempotent(
+            input in context_input(),
+            max_bytes in 4usize..=140,
+        ) {
+            let once = sanitize_context_string(&input, max_bytes);
+            let twice = sanitize_context_string(&once, max_bytes);
+
+            prop_assert_eq!(
+                &twice,
+                &once,
+                "re-sanitizing {:?} to {} bytes changed it",
+                input,
+                max_bytes
+            );
+        }
+    }
+}

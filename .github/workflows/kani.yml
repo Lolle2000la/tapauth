@@ -1,0 +1,58 @@
+name: Kani
+
+# Bounded-model-checking proofs for `shared`. This workflow is **deliberately not a
+# required status check**: it is not listed in
+# `scripts/ci/check-required-checks.sh`, and adding it there would gate every PR on a
+# multi-minute solver run. It exists so a regression in a proof is visible on the PR
+# that causes it rather than in a local run nobody made.
+#
+# `pull_request` carries no `paths:` filter, on purpose. The repository rule is that a
+# `pull_request` trigger is never path-filtered: a skipped run leaves a required check
+# `Pending` forever, so this file must not invite that failure mode if it is ever
+# promoted. `push` is filtered to `main` and to the crates the proofs cover, exactly as
+# `ci.yml` does — it is the post-merge safety net, not the signal.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'shared/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/kani.yml'
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  kani:
+    name: Kani Proofs (shared)
+    runs-on: ubuntu-latest
+    # A cold `cargo kani setup` (CBMC + the Kani toolchain download) plus the job's own
+    # compile is several minutes; the harnesses themselves are ~40 s together.
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Pinned to the version the harnesses were measured against (0.68.0 / CBMC
+      # 6.11.0). Kani's unwind and slicing defaults move between releases, so an
+      # unpinned upgrade can turn a verifying harness into a spurious failure.
+      - name: Install Kani
+        run: cargo install --locked kani-verifier --version 0.68.0
+
+      - name: Set up Kani (CBMC)
+        run: cargo kani setup
+
+      # `--lib` is mandatory, not cosmetic: without it Kani selects every target in the
+      # package, and `shared` declares `[[bin]] uniffi-bindgen` with
+      # `required-features = ["cli"]` (shared/Cargo.toml). That binary is not built by a
+      # plain `cargo build`, so Kani fails the run on it before reaching a single
+      # harness. `--lib` restricts the target selection to the library, which is where
+      # every `#[cfg(kani)]` harness in this crate lives.
+      - name: Prove the shared harnesses
+        run: cargo kani -p shared --lib
