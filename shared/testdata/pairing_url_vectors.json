@@ -1,0 +1,415 @@
+{
+  "about": "Canonical vectors for the v2 pairing URL grammar. Read by the Rust test `test_pairing_url_vectors_are_honoured` in shared/src/models.rs (via include_str!) and by PairingUrlTest.kt in server-android (the same path, resolved from the Gradle test working directory server-android/app). Both parsers must agree on every case: `accept` says whether the URL is a valid v2 pairing URL, and for an accepted URL the `sid`/`pk`/`port`/`ip4`/`ip6` fields are the values it must yield (null for an absent component). Hex is written in lower case so the Rust side's decode-and-re-encode of `sid` matches the phone's verbatim text. Add a case here, never in one suite only.",
+  "cases": [
+    {
+      "name": "v2 with every optional component",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&p=36692&ip4=192.168.1.5&ip6=fe80::1",
+      "accept": true,
+      "sid": "00112233445566778899aabbccddeeff",
+      "pk": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "port": 36692,
+      "ip4": "192.168.1.5",
+      "ip6": "fe80::1"
+    },
+    {
+      "name": "BLE-only v2 carries no endpoint",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "accept": true,
+      "sid": "00112233445566778899aabbccddeeff",
+      "pk": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "lowest port is a port",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&p=1",
+      "accept": true,
+      "sid": "00112233445566778899aabbccddeeff",
+      "pk": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "port": 1,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "highest port is a port",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&p=65535",
+      "accept": true,
+      "sid": "00112233445566778899aabbccddeeff",
+      "pk": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "port": 65535,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "percent-encoded sid decodes",
+      "url": "tapauth://pair?v=2&sid=%30%30112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "accept": true,
+      "sid": "00112233445566778899aabbccddeeff",
+      "pk": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "percent-encoded pk decodes",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=%30123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "accept": true,
+      "sid": "00112233445566778899aabbccddeeff",
+      "pk": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "percent-encoded key is the same key",
+      "url": "tapauth://pair?%76=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "accept": true,
+      "sid": "00112233445566778899aabbccddeeff",
+      "pk": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "percent-encoded ip6 decodes",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&p=36692&ip6=fe80%3A%3A1",
+      "accept": true,
+      "sid": "00112233445566778899aabbccddeeff",
+      "pk": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "port": 36692,
+      "ip4": null,
+      "ip6": "fe80::1"
+    },
+    {
+      "name": "unknown query key is ignored",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&p=36692&serial=9f",
+      "accept": true,
+      "sid": "00112233445566778899aabbccddeeff",
+      "pk": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "port": 36692,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "url at exactly the 512-byte cap",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&note=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "accept": true,
+      "sid": "00112233445566778899aabbccddeeff",
+      "pk": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "url one byte over the 512-byte cap",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&note=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "duplicate pk",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&pk=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "duplicate sid",
+      "url": "tapauth://pair?v=2&sid=00000000000000000000000000000000&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "duplicate version",
+      "url": "tapauth://pair?v=2&v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "duplicate unknown key",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&serial=1&serial=2",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "port zero",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&p=0",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "port above the u16 range",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&p=65536",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "port not a number",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&p=36692x",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "port with a leading plus",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&p=%2B36692",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "pk one hex char short",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "pk one hex char long",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "pk not hex",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdzz",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "pk with non-ASCII hex digits",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=０００００００００００００００００００００００００００００００００００００００００００００００００００００００００００００００",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "pk empty",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "pk missing",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "pk all zero",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0000000000000000000000000000000000000000000000000000000000000000",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "sid one hex char short",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddee&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "sid not hex",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeezz&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "sid missing",
+      "url": "tapauth://pair?v=2&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "version missing",
+      "url": "tapauth://pair?sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "version 1",
+      "url": "tapauth://pair?v=1&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&p=36692",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "version 3",
+      "url": "tapauth://pair?v=3&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "wrong scheme",
+      "url": "https://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "no query at all",
+      "url": "tapauth://pair",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "query pair without an equals sign",
+      "url": "tapauth://pair?v=2&sid00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "value with a raw equals sign",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&p=36=692",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "empty query pair",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "malformed percent escape",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&ip6=fe80%3A%3A%ZZ",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "truncated percent escape at the end",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&ip6=fe80%3A%3A%3",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "non-ASCII percent escape",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&ip6=fe80%FF",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    },
+    {
+      "name": "empty ip4 value",
+      "url": "tapauth://pair?v=2&sid=00112233445566778899aabbccddeeff&pk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&ip4=",
+      "accept": false,
+      "sid": null,
+      "pk": null,
+      "port": null,
+      "ip4": null,
+      "ip6": null
+    }
+  ]
+}

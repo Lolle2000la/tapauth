@@ -29,22 +29,43 @@ data class PairingUrl(
         private const val MAX_PORT = 65535
 
         /**
+         * Longest accepted URL, in UTF-8 bytes, mirroring `MAX_PAIRING_URL_LEN` in
+         * `shared/src/models.rs`. Measured in bytes rather than in `String.length` because that is
+         * what Rust's `url.len()` counts, so a multi-byte character cannot sit inside the cap on
+         * one side of the wire and outside it on the other.
+         */
+        private const val MAX_URL_LENGTH = 512
+
+        /**
          * Parse a scanned URL, returning null for anything that is not a well-formed v2 pairing URL
-         * (wrong scheme, `v != 2`, malformed `sid`/`pk`, an all-zero `pk`, or an out-of-range `p`).
+         * (wrong scheme, an over-long URL, `v != 2`, a malformed or repeated query key, a malformed
+         * `sid`/`pk`, an all-zero `pk`, or an out-of-range `p`).
+         *
+         * The mirror of `PairingInfo::parse` in `shared/src/models.rs`; the two are pinned together
+         * by `shared/testdata/pairing_url_vectors.json`, which both suites read.
          */
         fun parse(url: String): PairingUrl? {
+            if (url.toByteArray(Charsets.UTF_8).size > MAX_URL_LENGTH) return null
             if (!url.startsWith(PREFIX)) return null
 
             val params = LinkedHashMap<String, String>()
             for (pair in url.substringAfter('?').split('&')) {
-                if (pair.isEmpty()) continue
-                val key = percentDecode(pair.substringBefore('='))
-                val value = percentDecode(pair.substringAfter('=', ""))
-                // First occurrence wins, so a trailing duplicate cannot override `pk`.
-                if (!params.containsKey(key)) params[key] = value
+                // Every pair is `key=value`. An empty pair (a trailing `&`) has no `=`, and a
+                // value that carries a second `=` is malformed: `=` has to be percent-encoded.
+                val separator = pair.indexOf('=')
+                if (separator < 0) return null
+                val rawValue = pair.substring(separator + 1)
+                if (rawValue.contains('=')) return null
+                val key = percentDecode(pair.substring(0, separator)) ?: return null
+                val value = percentDecode(rawValue) ?: return null
+                // At most one of each key, known or not. `PairingInfo::parse` refuses a repeated
+                // key rather than picking a first or a last value, so picking one here would let
+                // one sticker pin a different `pk` on the phone than on the desktop.
+                if (params.containsKey(key)) return null
+                params[key] = value
             }
 
-            val version = params["v"]?.toIntOrNull() ?: return null
+            val version = params["v"]?.let { asciiToInt(it) } ?: return null
             if (version != REQUIRED_VERSION) return null
 
             val sessionId = params["sid"] ?: return null
@@ -52,57 +73,101 @@ data class PairingUrl(
 
             val publicKey = params["pk"] ?: return null
             if (!isHex(publicKey, PUBLIC_KEY_HEX_LENGTH)) return null
-            // Rust always compares the QR `pk` in constant time, so an all-zero value would be a
-            // legitimate pin only for a peer that really published a zero ephemeral key — which no
-            // Client does. Rejecting it here keeps a hostile sticker from pinning a predictable
-            // key.
+            // Rust rejects this value too (`validate_public_key` in `shared/src/models.rs`): an
+            // all-zero `pk` is the "skip the QR comparison" sentinel `pairingVerifyResponse`
+            // understands, so a scanned QR must not be able to request it, and no Client
+            // publishes a zero ephemeral key.
             if (publicKey.all { it == '0' }) return null
 
             val port =
                 if (params.containsKey("p")) {
-                    val parsedPort = params["p"]?.toIntOrNull() ?: return null
+                    val parsedPort = params["p"]?.let { asciiToInt(it) } ?: return null
                     if (parsedPort !in MIN_PORT..MAX_PORT) return null
                     parsedPort
                 } else {
                     null
                 }
 
+            // An empty `ip4`/`ip6` is malformed, not absent: `PairingInfo::parse` cannot parse
+            // an empty address, so accepting one would be a QR that is valid only here.
+            val ipv4 = params["ip4"]
+            if (ipv4 != null && ipv4.isEmpty()) return null
+            val ipv6 = params["ip6"]
+            if (ipv6 != null && ipv6.isEmpty()) return null
+
             return PairingUrl(
                 version = version,
                 sessionId = sessionId,
                 publicKey = publicKey,
                 port = port,
-                ipv4 = params["ip4"]?.takeIf { it.isNotEmpty() },
-                ipv6 = params["ip6"]?.takeIf { it.isNotEmpty() },
+                ipv4 = ipv4,
+                ipv6 = ipv6,
             )
         }
 
-        private fun isHex(value: String, length: Int): Boolean {
-            if (value.length != length) return false
-            return value.all { it.digitToIntOrNull(16) != null }
+        /**
+         * Parse a decimal number written only in ASCII digits.
+         *
+         * `toIntOrNull` goes through `Integer.parseInt`, which accepts any Unicode digit (`٤٢` is
+         * 42 to it) while Rust's `parse` refuses them, so the character set has to be checked here
+         * for the two sides to accept the same ports and versions.
+         */
+        private fun asciiToInt(value: String): Int? {
+            if (value.isEmpty()) return null
+            if (!value.all { it in '0'..'9' }) return null
+            return value.toIntOrNull()
         }
 
         /**
-         * Decode `%XX` escapes. Plain string splitting keeps this usable from JVM unit tests (no
-         * `android.net.Uri`), and a `+` is left alone because no field of the URL uses it as a
-         * space.
+         * Whether [value] is exactly [length] ASCII hex digits.
+         *
+         * ASCII only: `digitToIntOrNull(16)` accepts every Unicode digit (`０` is 0 to it) while
+         * `toInt(16)` in [hexToBytes] refuses them, so the non-ASCII form used to reach an
+         * exception instead of a clean rejection — and disagreed with `is_ascii_hexdigit`.
          */
-        private fun percentDecode(value: String): String {
+        private fun isHex(value: String, length: Int): Boolean {
+            if (value.length != length) return false
+            return value.all { asciiHexDigit(it) != null }
+        }
+
+        /** The value of one ASCII hex digit, or null for anything else. */
+        private fun asciiHexDigit(char: Char): Int? =
+            when (char) {
+                in '0'..'9' -> char - '0'
+                in 'a'..'f' -> char - 'a' + 10
+                in 'A'..'F' -> char - 'A' + 10
+                else -> null
+            }
+
+        /**
+         * Decode `%XX` escapes, returning null for anything malformed or non-ASCII.
+         *
+         * The same rules as `percent_decode` in `shared/src/models.rs`, applied to keys as well as
+         * values: a `%` that does not introduce two ASCII hex digits, and an escape whose byte is
+         * not ASCII, make the URL invalid. Passing a broken escape through as a literal `%` (the
+         * old behaviour) or decoding `%FF` to `ÿ` is exactly how this parser and the Rust one came
+         * to disagree about which QRs are valid. A `+` is left alone because no field of the URL
+         * uses it as a space.
+         */
+        private fun percentDecode(value: String): String? {
             if ('%' !in value) return value
             val out = StringBuilder(value.length)
             var i = 0
             while (i < value.length) {
-                if (value[i] == '%' && i + 2 < value.length) {
-                    val high = value[i + 1].digitToIntOrNull(16)
-                    val low = value[i + 2].digitToIntOrNull(16)
-                    if (high != null && low != null) {
-                        out.append((high * 16 + low).toChar())
-                        i += 3
-                        continue
-                    }
+                if (value[i] != '%') {
+                    out.append(value[i])
+                    i++
+                    continue
                 }
-                out.append(value[i])
-                i++
+                if (i + 2 >= value.length) return null
+                val high = asciiHexDigit(value[i + 1]) ?: return null
+                val low = asciiHexDigit(value[i + 2]) ?: return null
+                val decoded = high * 16 + low
+                // Every field of this grammar is ASCII, so a byte >= 0x80 cannot belong to a
+                // valid value and there is no UTF-8 question to answer.
+                if (decoded >= 0x80) return null
+                out.append(decoded.toChar())
+                i += 3
             }
             return out.toString()
         }
