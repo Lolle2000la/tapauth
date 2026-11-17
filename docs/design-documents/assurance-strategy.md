@@ -21,7 +21,7 @@ production item changed visibility to reach them.
 | :--- | :--- | :--- | :--- |
 | `a_negotiated_algorithm_is_supported_and_was_advertised` | `shared/src/protocol/pairing/negotiation.rs:323` | Whatever `negotiate` selects is an algorithm this build implements **and** one the peer advertised, in every slot — soundness on both the pinned and the unpinned path | 4.0–6.5 s verify, ~555–570 MB peak RSS |
 | `an_unpinned_negotiation_succeeds_exactly_when_every_slot_intersects` | `shared/src/protocol/pairing/negotiation.rs:368` | `Ok` iff every slot's intersection with `SUPPORTED_*` is non-empty, checked against `intersectable`, an oracle restated independently of `pick_first` | 4.0–6.5 s verify, ~555–570 MB peak RSS |
-| `a_pinned_negotiation_selects_the_pin_only_when_both_sides_admit_it` | `shared/src/protocol/pairing/negotiation.rs:403` | `Ok` iff the pin is supported *and* advertised in both pinned slots and the signature slot intersects; on `Ok` the selected ids **are** the pinned ones (the pin outvotes our order) | 4.0–6.5 s verify, ~555–570 MB peak RSS |
+| `a_pinned_negotiation_selects_the_pin_only_when_both_sides_admit_it` | `shared/src/protocol/pairing/negotiation.rs:403` | `Ok` iff the pin is supported *and* advertised in both pinned slots and the signature slot intersects, checked against an `admissible` oracle restated in the harness rather than reused from `pick_first`. The `if let Ok` equality beside it proves nothing extra while there is one algorithm per slot — the pin is then the only admissible id — so "the pin outvoted our order" is the same vacuous register as `pinned_algorithms_win_over_the_baseline` in `cryptography-specification.md` §1.4, and becomes meaningful only with a second suite. The harness's content is the `Ok`-iff-admissible half | 4.0–6.5 s verify, ~555–570 MB peak RSS |
 | `the_truncated_name_is_the_longest_prefix_within_budget` | `shared/src/protocol/pairing/fields.rs:73` | `truncate_utf8` returns the longest char-boundary prefix that fits the byte budget — it never cuts a code point that would have fit | ~20–21 s, ~693 MB |
 | `encode_then_decode_is_the_identity` | `shared/src/ipc/framing.rs:173` | A length inside the cap survives `encode_len` → `decode_len` unchanged | ~5 s for all three framing proofs together |
 | `decode_len_never_exceeds_the_cap` | `shared/src/ipc/framing.rs:194` | For **any** 4-byte prefix, a successful decode is ≤ `MAX_FRAME_LEN` — a peer can never make a reader reserve more than the cap | (as above) |
@@ -164,6 +164,7 @@ Named and unfixed:
 | `the_negotiated_symmetric_algorithm_reaches_the_aead` has **no code site** — the assertion exists only as a recorded intention | `shared/src/crypto/encryption.rs` (`test_aead_roundtrip` passes `alg` in rather than exercising a dispatch); register on `SUPPORTED_SYMMETRIC_ALGORITHMS` in `shared/src/protocol/pairing/negotiation.rs` | Vacuous with one primitive per slot: both sides of every comparison are the literal `1`. It comes back with a second suite (see `cryptography-specification.md` §1.4). |
 | A paired device's `toString()` can print the CSK | `shared/src/ffi.rs` (`ParsedPairingProvision`: `Debug` is hand-written and redacted, but UniFFI generates a Kotlin `data class` whose `toString()` is derived from the field list and cannot be influenced from Rust) | Fixing it means not exposing the CSK as a record field at all, or a Kotlin-side wrapper; neither belongs in this branch, so the rule is "Kotlin must not log that record" until then. |
 | The 500 ms verdict-reuse window is an **assumption**, not a property | `VERDICT_REUSE_WINDOW`, `client-pam/src/conclusion_cache.rs:43` | The `(username, PAM service)` key cannot distinguish a host's duplicate `pam_authenticate` from an independent authentication for the same user and service inside 500 ms. Bounded by a human-initiated retry taking seconds, but not enforceable. |
+| The per-attempt `nonce_cache` is **unbounded in what a CSK holder sends** | `wait_for_response`, `tapauthd/src/auth_handler.rs` | Since the insert moved behind the AEAD check, nothing an unauthenticated host sends is retained — but every *distinct authenticated* frame is, one entry of `temporal_identifier ++ ciphertext` (≤ 16 KiB, the framing cap) each, for the life of the attempt (`get_session_timeout`, 120 s): ~1.4 GB at line rate from a device holding the CSK, which can already mint authentic frames. Capping the set would evict entries and make a replay acceptable again, and keying it on a digest is a separate change; both trade the replay guarantee for the memory bound, so neither belongs in this fix. Shape measured, not alleged: entries = distinct authenticated frames per attempt, ≤ 16 KiB each, dropped with the attempt. |
 
 Also carried forward from §4: no `cargo-fuzz` target and no `loom` model for the
 interface cache or the nonce cache.
@@ -176,15 +177,42 @@ record (named by subject, not shown by SHA):
 * **`fix(net): a malformed datagram must not conclude an authentication attempt`** —
   an attempt now concludes only on a verified response from an authorised server, on
   its own deadline, or on an explicit local cancel/denial. Anything undecodable or
-  unauthenticated from an arbitrary source is dropped and the attempt continues, with
-  rate-limited logging so the drop path is not itself an amplification vector.
+  unauthenticated from an arbitrary source is dropped and the attempt continues.
+  **What that bounds, and what it does not** — what an attacker controls on this path
+  is its log volume, its allocation, the state it can make the session retain, and
+  whether the attempt can be held past its deadline. Three are bounded, and only the
+  first is the log:
+  * *Log.* Both drop sites report per occurrence at `debug` and the aggregate at `warn`
+    at most once per 60 s with a running count (`shared/src/network/udp.rs`,
+    `tapauthd/src/auth_handler.rs`), so a sender cannot turn one datagram into
+    unbounded output. The one drop line that stays per-occurrence is the replay
+    notice: a replayed frame is a frame that *did* authenticate, its rate is set by
+    the retransmission interval (at most one datagram ends a wait, one wait follows
+    each request: 200 ms … 6.4 s, the retry cap) rather than by the sender, and E2E
+    Phase 2c asserts that exact phrase.
+  * *Allocation.* A datagram is read into a fixed 64 KiB stack buffer and the 16 KiB
+    framing cap is checked before the protobuf decode, so nothing an unauthenticated
+    host sends can size an allocation beyond that, and the drop path itself allocates
+    nothing that outlives the call.
+  * *Retained state.* Nothing. The per-attempt nonce cache records only frames that
+    authenticated — it is checked before the AEAD work and inserted after it — so a
+    frame that fails to decode or fails AEAD occupies no memory, and an
+    unauthenticated host cannot make a later legitimate frame look like a replay.
+  * *Deadline.* Every drop branch in the receive loop yields to the scheduler before
+    reading again. Without that a sustained flood keeps `recv_from` ready, the loop
+    never returns `Pending`, and the caller's `tokio::time::timeout` never polls its
+    sleep — so the attempt would run past the deadline it is supposed to conclude on.
+    The yield is pure on every other path: it returns `Pending` once and reschedules
+    the same task, reordering nothing observable one scheduler turn later.
+  What is still unbounded is in the table above: the same cache grows with the number
+  of *distinct authenticated* frames, i.e. with what a device holding the CSK sends.
   **That commit also closes the replayed-frame backoff nit — as a consequence, not by a
   change of its own:** a replayed frame used to be classified `WaitOutcome::Timeout`,
   which counts as "the request went unanswered" and widened the retransmission
   interval, so a host that captured one datagram and replayed it could thin the
   requests aimed at the phone that may answer. It is now `WaitOutcome::Unattributable`,
-  the same classification as every other frame that does not authenticate, and a drop
-  leaves the interval alone. There is nothing left to fix here.
+  the same classification as any other frame that is not an answer to this request,
+  and a drop leaves the interval alone. There is nothing left to fix here.
 * **`feat(ble): apply post-auth rate limiting on the BLE path`** — the BLE transport
   now applies the same post-authentication limiter as UDP, keyed on the authenticated
   client public key, so a hammering client is throttled and one client's key cannot

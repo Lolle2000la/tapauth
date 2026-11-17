@@ -213,6 +213,16 @@ static DROP_WARN_AT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(N
 /// to this request, whatever host sent it, so the attempt continues waiting.
 /// The aggregate `warn` is rate limited because the log would otherwise be the
 /// place an unauthenticated host amplifies one datagram into unbounded output.
+///
+/// This is not every drop the session logs. The replay notice (`Replayed packet
+/// detected from …`) beside the nonce cache stays a `warn!` per occurrence: a
+/// replayed frame is one that *did* authenticate, so it is not this function's
+/// class, and its rate is set by our own retransmission schedule — one datagram
+/// ends a wait and one wait follows each request (200 ms … 6.4 s per attempt,
+/// the retry cap), giving at most a handful of lines per second whatever rate
+/// the sender uses.
+/// E2E Phase 2c asserts that exact phrase, so it is also the one line an
+/// aggregate limiter must not fold away.
 fn drop_unauthenticated_frame(detail: &str) {
     use std::sync::atomic::Ordering;
 
@@ -1181,8 +1191,25 @@ impl AuthSession {
                     data.extend_from_slice(&response_packet.ciphertext);
                     data
                 };
-                if !nonce_cache.insert(nonce_fingerprint) {
-                    // NOTE: This exact log phrase is asserted by E2E test Phase 2d (nonce replay check).
+                // The cache records the frames this session *acted on*; it is
+                // checked before the AEAD work, so a re-sent frame that already
+                // authenticated is refused before it is decrypted again, and
+                // inserted only once a frame has authenticated (`Ok(wrapper)`
+                // below). Inserting here — ahead of the check it is paired with —
+                // would let any host on the link retain up to
+                // `MAX_UDP_MESSAGE_SIZE` per frame it never authenticated, for
+                // the life of the session, and would buy nothing: a frame that
+                // fails AEAD cannot be a re-send of an accepted one.
+                if nonce_cache.contains(&nonce_fingerprint) {
+                    // NOTE: This exact log phrase is asserted by E2E test Phase 2c
+                    // (nonce replay check), which is why it stays a `warn!` per
+                    // occurrence instead of going through
+                    // `drop_unauthenticated_frame`. It is already bounded by our
+                    // own schedule rather than by the sender's: one datagram ends
+                    // a wait and one wait follows each request, so at most one of
+                    // these can be logged per retransmission interval (200 ms at
+                    // the floor, ~5 lines/s per attempt), however fast anything is
+                    // replayed at us.
                     tracing::warn!("Replayed packet detected from {}, ignoring", server_addr);
                     // A replayed frame is a drop, not a silence: it must not read
                     // as "the request went unanswered" and widen the interval, or
@@ -1196,7 +1223,14 @@ impl AuthSession {
                     run.csk_meta.symmetric_algorithm,
                     &response_packet,
                 ) {
-                    Ok(wrapper) => wrapper,
+                    Ok(wrapper) => {
+                        // The frame authenticated, so it is now one the session
+                        // acted on and a re-send of it is a replay. This is the
+                        // only insertion: nothing that failed the AEAD check is
+                        // retained.
+                        nonce_cache.insert(nonce_fingerprint);
+                        wrapper
+                    }
                     Err(e) => {
                         // Audit log: an authenticated-looking packet failed AEAD
                         // verification. That is the expected outcome for a
@@ -2188,20 +2222,20 @@ mod tests {
         assert!(outcome.retransmission_unanswered());
     }
 
-    /// A frame that does not authenticate must not conclude the attempt, and must
-    /// not buy the sender a wider retransmission interval either.
+    /// A frame that does not authenticate must not conclude the attempt, must not
+    /// buy the sender a wider retransmission interval, and must not be retained.
     ///
     /// Any host on the link can put such a frame on the wire — a well-formed
-    /// protobuf whose AEAD tag does not verify, and then the very same frame
-    /// again — so neither may end the wait for the phone that may answer.
+    /// protobuf whose AEAD tag does not verify — so it may neither end the wait
+    /// for the phone that may answer nor cost the session memory.
     ///
     /// The defects this catches: `wait_for_response` returning the decryption
     /// error (`Err(e.into())`), which ends the attempt — with BLE off the session
     /// is over, and with BLE up the UDP reply is discarded for the rest of the
     /// session, so a grant only that transport carries is never seen; and
-    /// classifying the replay-cache hit as `WaitOutcome::Timeout`, which reads as
-    /// "nobody answered the request" and lets one captured datagram, replayed,
-    /// thin the requests aimed at the phone that may answer.
+    /// inserting the frame's fingerprint into the nonce cache ahead of the AEAD
+    /// check, which lets an unauthenticated host retain up to one datagram's
+    /// worth of state per frame for the life of the session.
     #[tokio::test]
     async fn a_frame_that_does_not_authenticate_does_not_conclude_the_wait() {
         let (phone_a, _phone_b, key_a, _key_b) = two_phones();
@@ -2218,7 +2252,7 @@ mod tests {
             ciphertext: vec![0xAAu8; 32],
         };
 
-        let transport = Arc::new(ScriptedTransport::new(garbage.clone(), from));
+        let transport = Arc::new(ScriptedTransport::new(garbage, from));
         let run = AuthRunParams {
             keypair: Ed25519KeyPair::generate().unwrap(),
             csk: csk.clone(),
@@ -2250,25 +2284,13 @@ mod tests {
             None,
             "a frame that does not authenticate must not become the unicast target"
         );
-
-        // The same frame a second time is caught by the nonce cache. It is still
-        // a drop, not a silence.
-        transport.script(garbage, from);
-        let outcome = AuthSession::wait_for_response(
-            &transport,
-            Duration::from_millis(1),
-            &run,
-            &mut nonce_cache,
-        )
-        .await
-        .expect("a replayed frame must not conclude the wait");
         assert!(
-            matches!(outcome, WaitOutcome::Unattributable),
-            "a replayed frame is a drop, not an unanswered request"
+            nonce_cache.is_empty(),
+            "a frame that never authenticated must not be retained"
         );
-        assert!(!outcome.retransmission_unanswered());
 
-        // ...and the authorized phone's grant still concludes it.
+        // ...and the authorized phone's grant concludes it, and is the only thing
+        // the cache holds afterwards.
         let grant = create_signed_auth_grant(challenge, &key_a).unwrap();
         let packet = create_encrypted_packet_with_csk_nonce(
             &csk,
@@ -2288,6 +2310,83 @@ mod tests {
         .unwrap();
         assert!(matches!(outcome, WaitOutcome::Response(_, _)));
         assert_eq!(transport.recorded(), Some(from));
+        assert_eq!(
+            nonce_cache.len(),
+            1,
+            "only the frame that authenticated may be retained"
+        );
+    }
+
+    /// An accepted frame is retained, and a second arrival of it is refused as a
+    /// replay instead of being processed twice.
+    ///
+    /// The defect this catches: moving the nonce insertion behind the AEAD check
+    /// without keeping the check ahead of it — or dropping the insertion
+    /// altogether — which leaves nothing to compare against, so the same signed
+    /// grant is answered and acted on again on every resend.
+    #[tokio::test]
+    async fn an_accepted_frame_is_retained_and_a_replay_of_it_is_refused() {
+        let (phone_a, _phone_b, key_a, _key_b) = two_phones();
+        let csk = ClientSymmetricKey::generate().unwrap();
+        let csk_meta = CskMetadata::default();
+        let challenge = [0x4Cu8; 32];
+        let from = std::net::SocketAddr::from(([127, 0, 0, 2], 41_002));
+
+        let grant = create_signed_auth_grant(challenge, &key_a).unwrap();
+        let packet = create_encrypted_packet_with_csk_nonce(
+            &csk,
+            csk_meta.symmetric_algorithm,
+            csk_meta.hash_algorithm,
+            &grant,
+        )
+        .unwrap();
+
+        let transport = Arc::new(ScriptedTransport::new(packet.clone(), from));
+        let run = AuthRunParams {
+            keypair: Ed25519KeyPair::generate().unwrap(),
+            csk,
+            csk_meta,
+            challenge,
+            username: "bob".to_string(),
+            allowed_servers: Arc::new(vec![phone_a]),
+        };
+        let mut nonce_cache = HashSet::new();
+
+        let outcome = AuthSession::wait_for_response(
+            &transport,
+            Duration::from_millis(1),
+            &run,
+            &mut nonce_cache,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, WaitOutcome::Response(_, _)));
+        assert_eq!(
+            nonce_cache.len(),
+            1,
+            "the accepted frame must be retained, or a resend cannot be told apart"
+        );
+
+        // The same authenticated frame again: refused, not acted on twice, and no
+        // wider interval.
+        transport.script(packet, from);
+        let outcome = AuthSession::wait_for_response(
+            &transport,
+            Duration::from_millis(1),
+            &run,
+            &mut nonce_cache,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, WaitOutcome::Unattributable),
+            "a resend of an accepted frame must not be processed a second time"
+        );
+        assert!(
+            !outcome.retransmission_unanswered(),
+            "a replayed frame is a drop, not an unanswered request"
+        );
+        assert_eq!(nonce_cache.len(), 1);
     }
 
     /// A transport that answers every request with a fresh frame signed by a

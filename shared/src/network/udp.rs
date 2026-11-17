@@ -49,9 +49,10 @@ static DROP_WARN_AT: Mutex<Option<Instant>> = Mutex::new(None);
 /// nothing about the attempt, and the wait for a real response continues. Only
 /// [`DROP_WARN_INTERVAL`] bounds the `warn`, because the log would otherwise be
 /// the place an unauthenticated host amplifies one datagram into unbounded
-/// output. (The session layer applies the same rule to the frames that *do*
-/// decode but do not authenticate, and rate limits its own `warn` for the same
-/// reason.)
+/// output. (The session layer rate limits its own `warn` for the frames that
+/// *do* decode but fail to authenticate, for the same reason; its replay notice
+/// is the one line there that stays per occurrence, because its rate is set by
+/// the retransmission interval rather than by the sender.)
 fn record_dropped_datagram(reason: &str, addr: SocketAddr, len: usize) {
     let dropped = DROPPED_DATAGRAMS.fetch_add(1, Ordering::Relaxed) + 1;
     tracing::debug!(
@@ -630,6 +631,12 @@ pub async fn receive_udp_packet(
         if local_port == Some(addr.port()) && is_local_ip(&src_ip) {
             tracing::debug!("Ignored self-echoed UDP packet from {}", addr);
             // drop and continue waiting for next packet
+            //
+            // Yielding before the next read matters on the drop paths only: a
+            // sustained flood keeps `recv_from` ready, so a loop that never
+            // awaits never returns `Pending` and the caller's timeout is never
+            // polled. On any other path this is one extra scheduler turn.
+            tokio::task::yield_now().await;
             continue;
         }
 
@@ -644,6 +651,11 @@ pub async fn receive_udp_packet(
         if !skip_local_filter && is_local_ip(&src_ip) {
             tracing::debug!("Ignored self-sent UDP packet from {}", addr);
             // drop and continue waiting for next packet
+            //
+            // Same reason as the self-echo branch above: the caller's deadline
+            // is only observable at a yield point, so no drop path may loop
+            // without one.
+            tokio::task::yield_now().await;
             continue;
         }
 
