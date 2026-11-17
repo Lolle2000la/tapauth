@@ -1764,3 +1764,97 @@ fn full_pairing_round_trips_every_frame_through_the_wire_codec() {
         ProtocolError::InvalidSignature
     ));
 }
+
+// --- 12. The peer-supplied device name is bounded on receive ----------
+
+/// A `PairingInit` naming its phone with more than 64 bytes is refused, never
+/// shortened into the transcript.
+///
+/// The defect this catches: `ClientPairingState::handle_init` splicing
+/// `init.server_device_name` into `H` exactly as received while only *our* own
+/// name is cut to [`PAIRING_DEVICE_NAME_MAX_BYTES`] at build time — so the stated
+/// bound on that transcript field does not hold against a hostile peer, and a
+/// name shortened on one side (or not shortened at all) makes two peers hash
+/// different bytes for the same handshake. The 64-byte form is asserted to still
+/// pair, so the check is a bound and not a ban.
+#[test]
+fn a_pairing_init_with_an_over_long_device_name_is_refused() {
+    let (mut desktop, started) = start_desktop();
+    let mut phone =
+        ServerPairingSession::new(started.session_id, phone_identity(), "pixel").unwrap();
+    let mut init = phone.create_init().unwrap();
+
+    // 65 bytes: one byte past the budget.
+    init.server_device_name = "x".repeat(PAIRING_DEVICE_NAME_MAX_BYTES + 1);
+    assert!(matches!(
+        desktop.handle_init(&init).unwrap_err(),
+        ProtocolError::InvalidMessageFormat
+    ));
+    // The refusal is not a partial handshake: nothing was cached, derived or
+    // taken, so the session is exactly as it was before the frame arrived.
+    assert!(
+        desktop.response().is_none(),
+        "a refused init must not be cached"
+    );
+    assert!(desktop.transcript_hash().is_none(), "no H may exist");
+    assert!(desktop.sas().is_none(), "no session keys may be derived");
+    assert!(desktop.negotiated().is_none());
+    assert!(!desktop.session_keys_present());
+    assert!(
+        desktop.ephemeral_keypair_present(),
+        "the ephemeral x_C is taken only by a derivation, so a refused init keeps it"
+    );
+
+    // 66 bytes made of three-byte characters: the budget is on bytes, so this is
+    // refused even though it is only 22 chars.
+    init.server_device_name = "\u{20ac}".repeat(22);
+    assert_eq!(init.server_device_name.len(), 66);
+    assert_eq!(init.server_device_name.chars().count(), 22);
+    assert!(matches!(
+        desktop.handle_init(&init).unwrap_err(),
+        ProtocolError::InvalidMessageFormat
+    ));
+
+    // The boundary: exactly 64 bytes still pairs, and both sides agree on the SAS.
+    let at_the_limit = "x".repeat(PAIRING_DEVICE_NAME_MAX_BYTES);
+    let (mut desktop, started) = start_desktop();
+    let mut phone =
+        ServerPairingSession::new(started.session_id, phone_identity(), &at_the_limit).unwrap();
+    let init = phone.create_init().unwrap();
+    assert_eq!(init.server_device_name.len(), PAIRING_DEVICE_NAME_MAX_BYTES);
+    let response = desktop.handle_init(&init).unwrap().clone();
+    phone
+        .verify_response(&response, &started.client_x25519_public_key)
+        .unwrap();
+    assert_eq!(desktop.sas(), phone.sas());
+}
+
+/// The phone applies the same bound to the desktop's `client_device_name`, so the
+/// invariant holds symmetrically rather than on one receive path only.
+///
+/// The defect this catches: `ServerPairingSession::verify_response` hashing an
+/// over-long `response.client_device_name` verbatim, which both removes the bound
+/// on a peer-supplied transcript field and lets a desktop choose a name the phone
+/// would then display and persist.
+#[test]
+fn a_pairing_response_with_an_over_long_client_device_name_is_refused() {
+    let (desktop, mut phone, response, qr_pk) = exchange();
+
+    let mut over_long = response.clone();
+    over_long.client_device_name = "\u{e9}".repeat(33); // 66 bytes, 33 chars
+    assert_eq!(over_long.client_device_name.len(), 66);
+    assert!(matches!(
+        phone.verify_response(&over_long, &qr_pk).unwrap_err(),
+        ProtocolError::InvalidMessageFormat
+    ));
+    // Nothing was derived or cached for the refused response...
+    assert!(phone.transcript_hash().is_none(), "no H may exist");
+    assert!(phone.sas().is_none(), "no session keys may be derived");
+    assert!(!phone.session_keys_present());
+    assert!(phone.negotiated().is_none());
+
+    // ...and the genuine response still verifies afterwards, so the refusal did
+    // not consume the one response a phone may verify.
+    phone.verify_response(&response, &qr_pk).unwrap();
+    assert_eq!(desktop.sas(), phone.sas());
+}

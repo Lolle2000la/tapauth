@@ -181,6 +181,11 @@ impl ServerPairingSession {
     /// [`ProtocolError::ChallengeMismatch`] too — it can never equal the QR key,
     /// and the caller's remedy (abort with `KEY_MISMATCH`) is the same.
     ///
+    /// A `client_device_name` over [`PAIRING_DEVICE_NAME_MAX_BYTES`] is refused with
+    /// [`ProtocolError::InvalidMessageFormat`]: like the desktop's `handle_init`, this
+    /// side splices the peer's name into `H` verbatim, so a value that does not fit
+    /// must be rejected rather than shortened.
+    ///
     /// The phone must have built its `PairingInit` first (the transcript it
     /// advertised is the one it verifies against) and may verify exactly one
     /// response: while keys exist, a second response is refused with
@@ -211,6 +216,13 @@ impl ServerPairingSession {
                 &response.client_ed25519_public_key,
                 "client_ed25519_public_key",
             )?;
+            // Same rule as the desktop's `handle_init`: the peer's name is spliced
+            // into `H` as received and our own is cut to
+            // `PAIRING_DEVICE_NAME_MAX_BYTES` at build time, so the bound holds only
+            // because an over-long value is refused, never silently shortened.
+            if response.client_device_name.len() > PAIRING_DEVICE_NAME_MAX_BYTES {
+                return Err(ProtocolError::InvalidMessageFormat);
+            }
 
             let selected_symmetric =
                 SymmetricAlgorithm::try_from(response.selected_symmetric_algorithm)

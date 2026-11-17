@@ -11,7 +11,7 @@ use crate::crypto::{
     verify_ed25519, CryptoError, Ed25519KeyPair, PairingSessionKeys, PairingTranscript,
     X25519KeyPair,
 };
-use crate::models::pairing::generate_pairing_url_v2;
+use crate::models::pairing::generate_pairing_url_v2_for_key;
 use crate::protocol::messages::{ProtocolError, PROTOCOL_VERSION_V2};
 use crate::protocol::pb::*;
 use prost::Message as ProstMessage;
@@ -137,9 +137,11 @@ impl ClientPairingState {
         let client_x25519_public_key = x25519_keypair.public_key_bytes();
         let client_ed25519_public_key = client_identity.verifying_key_bytes();
         let pairing_adv_id = derive_ble_pairing_adv_id(&session_id, &client_x25519_public_key);
-        let qr_url = generate_pairing_url_v2(
+        // The QR carries the key as hex; the byte-taking form is infallible because
+        // `hex::encode` of a 32-byte key is always the 64 hex characters `pk` requires.
+        let qr_url = generate_pairing_url_v2_for_key(
             &session_id,
-            &hex::encode(client_x25519_public_key),
+            &client_x25519_public_key,
             endpoint.udp_port,
             endpoint.ipv4,
             endpoint.ipv6,
@@ -197,12 +199,26 @@ impl ClientPairingState {
     /// response; calling it with a *different* `init` after the session is
     /// established fails with [`ProtocolError::InvalidMessageFormat`], because the
     /// transcript and the derived keys are already committed.
+    ///
+    /// A `server_device_name` over [`PAIRING_DEVICE_NAME_MAX_BYTES`] is refused with
+    /// [`ProtocolError::InvalidMessageFormat`] before anything is derived or
+    /// committed: the field enters `H` verbatim, so it must either fit or be
+    /// rejected, never be shortened behind the peer's back.
     pub fn handle_init(&mut self, init: &PairingInit) -> Result<&PairingResponse, ProtocolError> {
         let live = self.live()?;
         let server_x25519_public_key =
             key_32(&init.server_x25519_public_key, "server_x25519_public_key")?;
         let server_ed25519_public_key =
             key_32(&init.server_ed25519_public_key, "server_ed25519_public_key")?;
+        // The peer's name goes into `H` exactly as it arrived, so the 64-byte budget
+        // our own name is cut to at build time holds only if an over-long peer name
+        // is *refused*. Shortening it here would be the worse failure: a conforming
+        // peer never sends one, and two peers that cut the same value differently
+        // (or one that did not cut it at all) would derive different transcripts
+        // from the same handshake.
+        if init.server_device_name.len() > PAIRING_DEVICE_NAME_MAX_BYTES {
+            return Err(ProtocolError::InvalidMessageFormat);
+        }
 
         let encoded_init = init.encode_to_vec();
         if let Some(accepted) = live.accepted_init.as_ref() {
