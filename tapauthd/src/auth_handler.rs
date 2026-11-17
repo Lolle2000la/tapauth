@@ -2,6 +2,7 @@
 
 use crate::caller_context::CallerContext;
 use crate::transport::{EnabledTransports, ReceiveResult, Transport, UdpTransport, NOTIFY_SETTLE};
+use sha2::{Digest, Sha256};
 use shared::{
     config::{ClientConfigManager, CskMetadata, PairedServer},
     crypto::{ClientSymmetricKey, CryptoError, Ed25519KeyPair},
@@ -1113,7 +1114,7 @@ impl AuthSession {
         // every send, read only when a frame ends a wait early.
         let mut next_send_at: Instant;
         let mut attempt = 0u32;
-        let mut nonce_cache: HashSet<Vec<u8>> = HashSet::new();
+        let mut nonce_cache: HashSet<[u8; 32]> = HashSet::new();
 
         loop {
             if start.elapsed() >= timeout {
@@ -1177,7 +1178,7 @@ impl AuthSession {
         transport: &Arc<T>,
         retry_interval: Duration,
         run: &AuthRunParams,
-        nonce_cache: &mut HashSet<Vec<u8>>,
+        nonce_cache: &mut HashSet<[u8; 32]>,
     ) -> Result<WaitOutcome, AuthHandlerError> {
         match transport
             .receive_response(retry_interval, &run.csk_meta)
@@ -1186,11 +1187,7 @@ impl AuthSession {
             Err(e) => Err(e),
             Ok(ReceiveResult::Timeout) => Ok(WaitOutcome::Timeout),
             Ok(ReceiveResult::Response(response_packet, server_addr)) => {
-                let nonce_fingerprint = {
-                    let mut data = response_packet.temporal_identifier.clone();
-                    data.extend_from_slice(&response_packet.ciphertext);
-                    data
-                };
+                let nonce_fingerprint = Self::frame_fingerprint(&response_packet);
                 // The cache records the frames this session *acted on*; it is
                 // checked before the AEAD work, so a re-sent frame that already
                 // authenticated is refused before it is decrypted again, and
@@ -1273,6 +1270,34 @@ impl AuthSession {
                 }
             }
         }
+    }
+
+    /// The replay key for one received frame: `SHA-256(temporal_identifier ++
+    /// ciphertext)`, the same bytes the cache has always compared, at a fixed
+    /// width.
+    ///
+    /// The digest is a content fingerprint for an in-memory set, not a secret and
+    /// not a MAC: nothing derives a key from it, the set is never serialized or
+    /// logged, it lives for one attempt and is dropped with it, and the frame it
+    /// covers is one whose AEAD tag has already verified. A collision could only
+    /// make a *different* authenticated frame look like a replay, which is exactly
+    /// the comparison the full-frame key made, so membership means the same thing
+    /// it did before (SHA-256 collision resistance aside).
+    ///
+    /// What it buys is the per-entry cost: 32 bytes inline in the set's bucket
+    /// instead of a 24-byte `Vec` header plus a heap block of up to
+    /// `shared::network::udp::MAX_UDP_MESSAGE_SIZE`. Only authenticated frames
+    /// are inserted, and those always carry a [`TEMPORAL_IDENTIFIER_LEN`]-byte
+    /// identifier, so framing the two fields by concatenation stays unambiguous
+    /// under the digest exactly as it was under the full-frame key.
+    fn frame_fingerprint(frame: &EncryptedPacket) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(frame.temporal_identifier.as_slice());
+        hasher.update(frame.ciphertext.as_slice());
+        let digest = hasher.finalize();
+        let mut fingerprint = [0u8; 32];
+        fingerprint.copy_from_slice(&digest);
+        fingerprint
     }
 
     /// Whether any Server authorized for this user signed `wrapper`.
@@ -2317,13 +2342,16 @@ mod tests {
         );
     }
 
-    /// An accepted frame is retained, and a second arrival of it is refused as a
-    /// replay instead of being processed twice.
+    /// An accepted frame is retained, a second arrival of it is refused as a
+    /// replay, and a *different* frame from the same phone is not.
     ///
-    /// The defect this catches: moving the nonce insertion behind the AEAD check
+    /// The defects this catches: moving the nonce insertion behind the AEAD check
     /// without keeping the check ahead of it — or dropping the insertion
     /// altogether — which leaves nothing to compare against, so the same signed
-    /// grant is answered and acted on again on every resend.
+    /// grant is answered and acted on again on every resend; and fingerprinting
+    /// less than the whole frame, e.g. only `temporal_identifier` — the sixteen
+    /// bytes every frame one phone sends within a 60 s window shares — which
+    /// refuses a genuinely fresh response as a replay of an earlier one.
     #[tokio::test]
     async fn an_accepted_frame_is_retained_and_a_replay_of_it_is_refused() {
         let (phone_a, _phone_b, key_a, _key_b) = two_phones();
@@ -2369,7 +2397,7 @@ mod tests {
 
         // The same authenticated frame again: refused, not acted on twice, and no
         // wider interval.
-        transport.script(packet, from);
+        transport.script(packet.clone(), from);
         let outcome = AuthSession::wait_for_response(
             &transport,
             Duration::from_millis(1),
@@ -2387,6 +2415,54 @@ mod tests {
             "a replayed frame is a drop, not an unanswered request"
         );
         assert_eq!(nonce_cache.len(), 1);
+
+        // A second frame from the same phone in the same 60 s window: the same
+        // `temporal_identifier` byte for byte, a different ciphertext (fresh
+        // random nonce). It answers this request and is not a replay of the first,
+        // so the key must cover the ciphertext as well as the identifier.
+        use prost::Message as _;
+        let second_grant = create_signed_auth_grant(challenge, &key_a).unwrap();
+        let aad = shared::crypto::encrypted_packet_aad(
+            csk_meta.symmetric_algorithm as i32,
+            &packet.temporal_identifier,
+        );
+        let distinct_frame = EncryptedPacket {
+            temporal_identifier: packet.temporal_identifier.clone(),
+            encryption_algorithm: csk_meta.symmetric_algorithm as i32,
+            ciphertext: shared::crypto::encrypt_with_csk_and_random_nonce(
+                &run.csk,
+                csk_meta.symmetric_algorithm,
+                &second_grant.encode_to_vec(),
+                &aad,
+            )
+            .unwrap(),
+        };
+        assert_eq!(
+            distinct_frame.temporal_identifier, packet.temporal_identifier,
+            "this case is only meaningful if both frames share their identifier"
+        );
+        assert_ne!(
+            distinct_frame.ciphertext, packet.ciphertext,
+            "the two frames must differ somewhere the replay key covers"
+        );
+        transport.script(distinct_frame, from);
+        let outcome = AuthSession::wait_for_response(
+            &transport,
+            Duration::from_millis(1),
+            &run,
+            &mut nonce_cache,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, WaitOutcome::Response(_, _)),
+            "a different frame from the same phone is not a replay of the accepted one"
+        );
+        assert_eq!(
+            nonce_cache.len(),
+            2,
+            "both authenticated frames must be retained, one entry each"
+        );
     }
 
     /// A transport that answers every request with a fresh frame signed by a
