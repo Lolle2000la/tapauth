@@ -97,23 +97,36 @@ check_artifact "${CARGO_TARGET_DIR}/release/tapauth-config" "${DEV_VARS_CLIENT[@
 # Positive control: prove the scan above is capable of detecting a dev build.
 # Without this, a missing/garbled strings binary would report "clean" for every
 # artifact and the guard would pass vacuously.
+#
+# EVERY tag either scanner looks for is checked here, not a sample of two. A
+# `strings` that stopped matching one tag would report "0 matches" for it in
+# every artifact, and the check would still pass while proving nothing about
+# that tag — so one tag left uncontrolled is one dev override the guard cannot
+# actually detect. DEV_VARS_DAEMON is a superset of DEV_VARS_CLIENT (it only
+# adds dev-firewall-bypass), and `--features fallback-socket` folds in all five
+# daemon dev knobs, so this one build carries every tag both lists name.
 # (Note: count matches with `grep -c` rather than `grep -q` — under `pipefail` an
 # early-exit `grep -q` closes the pipe and makes `strings` fail with SIGPIPE,
 # which turns a successful match into a false negative.)
 echo "==> Positive control: rebuilding tapauthd with fallback-socket (dev build)"
 cargo build --quiet -p tapauthd --features fallback-socket
-control_hits=$("$STRINGS_BIN" "${CARGO_TARGET_DIR}/debug/tapauthd" | grep -c "TAPAUTH_STATE_DIR" || true)
-# dev-firewall-bypass has no env var; its only detectable signature is the
-# cfg'd warning literal. It is folded into fallback-socket, so this same build
-# must carry the tag or the daemon scanner's entry for it is vacuous.
-fw_hits=$("$STRINGS_BIN" "${CARGO_TARGET_DIR}/debug/tapauthd" | grep -c "dev-firewall-bypass" || true)
-if [ "${control_hits:-0}" != "0" ] && [ "${fw_hits:-0}" != "0" ]; then
-    echo "✅ dev build contains TAPAUTH_STATE_DIR ($control_hits) and dev-firewall-bypass ($fw_hits) — the scan can detect overrides"
+control_seen=""
+control_missing=""
+for tag in "${DEV_VARS_DAEMON[@]}"; do
+    n=$("$STRINGS_BIN" "${CARGO_TARGET_DIR}/debug/tapauthd" | grep -c "$tag" || true)
+    n=${n:-0}
+    control_seen="${control_seen}${tag} (${n}) "
+    if [ "$n" = "0" ]; then
+        control_missing="${control_missing}${tag} "
+    fi
+done
+if [ -z "$control_missing" ]; then
+    echo "✅ dev build contains every scanned tag: ${control_seen}— the scan can detect overrides"
 else
-    echo "❌ ERROR: the dev reference build is missing a scanned tag"
-    echo "   (TAPAUTH_STATE_DIR=${control_hits:-0}, dev-firewall-bypass=${fw_hits:-0})."
-    echo "   The string scan is not working (check \$STRINGS_BIN); the checks above"
-    echo "   are meaningless until this positive control passes."
+    echo "❌ ERROR: the dev reference build is missing scanned tag(s): ${control_missing}"
+    echo "   (${control_seen})"
+    echo "   The string scan is not working (check \$STRINGS_BIN) for the tag(s) above;"
+    echo "   the checks above are meaningless until this positive control passes."
     fail=1
 fi
 
