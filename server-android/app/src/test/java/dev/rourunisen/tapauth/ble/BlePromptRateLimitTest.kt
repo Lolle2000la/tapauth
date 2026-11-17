@@ -3,6 +3,7 @@ package dev.rourunisen.tapauth.ble
 import dev.rourunisen.tapauth.service.RequestRateLimiter
 import java.io.File
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -213,16 +214,29 @@ class BlePromptRateLimitTest {
     }
 
     /**
-     * Both transports reach the limiter through its one shared instance.
+     * Both transports reach the limiter through its one shared instance, and that instance is the
+     * same one every time it is asked for.
      *
      * The two call sites live in separate Android services that never see each other, so the only
      * thing that can make them share a budget is [RequestRateLimiter.getInstance]. A limiter
      * constructed in either file is that transport's own state: the schedule would still match, and
      * a Client that alternates transports would get a fresh bucket from each — the bypass this
      * class exists to prevent, one instance per transport.
+     *
+     * Identity, not merely the presence of the accessor, is the property: a `getInstance()` that
+     * returned a new instance per call would hand every request a fresh burst allowance — one
+     * budget per call — and still satisfy a source scan for `RequestRateLimiter.getInstance()`. The
+     * source guard below then catches the other failure, a service constructing its own limiter,
+     * which identity alone cannot see.
      */
     @Test
     fun bothTransportsUseTheOneSharedLimiter() {
+        assertSame(
+            "getInstance() must return the process's one limiter; a fresh instance per call " +
+                "would give every request a fresh burst allowance",
+            RequestRateLimiter.getInstance(),
+            RequestRateLimiter.getInstance(),
+        )
         for (path in LIMITER_CALL_SITES) {
             val source = sourceOf(path)
             assertTrue(

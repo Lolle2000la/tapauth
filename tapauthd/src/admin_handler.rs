@@ -368,6 +368,52 @@ mod tests {
         );
     }
 
+    /// An **explicitly present** `0` and absence are two different things on the wire:
+    /// `Some(0)` writes the field and decodes back to `Some(0)`, `None` writes nothing
+    /// and decodes back to `None`.
+    ///
+    /// The defect this catches: the field reverting to a plain proto3 scalar. There
+    /// `Some(0)` would encode to nothing and an explicit `0` on the wire would decode to
+    /// `None`, so "an explicit zero is invalid" would silently become a second spelling
+    /// of "BLE-only" and `check_requested_port`'s refusal of `Some(0)` would be
+    /// unreachable — while the absence test above and every other test here stay green.
+    #[test]
+    fn a_present_zero_port_is_written_and_does_not_decode_as_absence() {
+        // Field 2, wire type 0 (varint) is tag `0x10`; an empty `sas_code` (field 1)
+        // writes nothing, so these are the whole encoding. A plain proto3 scalar omits a
+        // zero, so the written zeros in these bytes are the `optional` keyword's doing.
+        let present = ipc::WaitForPairingResponse {
+            sas_code: String::new(),
+            port: Some(0),
+        };
+        let present_bytes = present.encode_to_vec();
+        assert_eq!(
+            present_bytes,
+            vec![0x10, 0x00],
+            "a present zero port must be written as tag 0x10 + varint 0, not omitted"
+        );
+        let decoded = ipc::WaitForPairingResponse::decode(present_bytes.as_slice()).unwrap();
+        assert_eq!(
+            decoded.port,
+            Some(0),
+            "an explicit zero on the wire must decode as Some(0), never as None"
+        );
+
+        // Absence is the field not being written at all, and it decodes back to absence.
+        let absent = ipc::WaitForPairingResponse {
+            sas_code: String::new(),
+            port: None,
+        };
+        let absent_bytes = absent.encode_to_vec();
+        assert_eq!(
+            absent_bytes,
+            Vec::<u8>::new(),
+            "an absent port must not be written at all"
+        );
+        let decoded = ipc::WaitForPairingResponse::decode(absent_bytes.as_slice()).unwrap();
+        assert_eq!(decoded.port, None);
+    }
+
     /// `Some(0)` and an out-of-range value are **invalid**, not a second spelling of
     /// "BLE-only", and a real port must still match the session's.
     ///

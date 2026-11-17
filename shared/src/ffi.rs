@@ -2735,6 +2735,43 @@ mod tests {
         ));
     }
 
+    /// `ParsedPairingProvision`'s hand-written `Debug` prints a fixed redaction where
+    /// the CSK is, so no `{:?}` of the record (a failed assertion, a `tracing` field)
+    /// can put the key in a log, while the non-secret fields stay readable.
+    ///
+    /// The defect this catches: dropping the hand-written impl back to a derived one,
+    /// which formats the CSK as `[171, 171, ...]` and leaks it the moment anyone logs
+    /// or asserts on the record.
+    #[test]
+    fn a_debug_of_the_parsed_provision_redacts_the_csk() {
+        const CSK_BYTE: u8 = 0xAB;
+        let provision = ParsedPairingProvision {
+            csk: vec![CSK_BYTE; 32],
+            username: "luca".to_string(),
+            client_hostname: "thinkpad".to_string(),
+        };
+
+        let rendered = format!("{provision:?}");
+        assert!(
+            rendered.contains("\"<redacted>\""),
+            "the CSK must be printed as a redaction, got {rendered}"
+        );
+        // Those are the two spellings a leaking impl would produce: `u8`'s `Debug`
+        // decimal list and a hex formatter. Neither appears in the struct name, the
+        // username or the hostname, so their presence can only be the key.
+        assert!(
+            !rendered.contains(&CSK_BYTE.to_string()),
+            "the CSK must not appear as its decimal bytes, got {rendered}"
+        );
+        assert!(
+            !rendered.to_lowercase().contains("ab"),
+            "the CSK must not appear in hex, got {rendered}"
+        );
+        // The point of the redaction is that the record still diagnoses itself.
+        assert!(rendered.contains("luca"), "got {rendered}");
+        assert!(rendered.contains("thinkpad"), "got {rendered}");
+    }
+
     /// The pre-decryption temporal-identifier read requires the 16-byte UDP/GATT form.
     #[test]
     fn encrypted_packet_temporal_identifier_requires_16_bytes() {

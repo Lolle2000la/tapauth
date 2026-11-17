@@ -13,7 +13,7 @@ import kotlin.math.min
  * call it: the UDP path in [dev.rourunisen.tapauth.service.AuthenticationService] and the BLE path
  * in [dev.rourunisen.tapauth.ble.BleGattService]. They call [shouldAcceptAuthenticatedRequest],
  * which is where the two halves of "the same request" are fixed — the paired Client's Ed25519
- * public key and SHA-256 of the verified `WrapperMessage` — so a Client has one budget whichever
+ * public key and SHA-256 of the decrypted `WrapperMessage` — so a Client has one budget whichever
  * transport it hammers. A second limiter on the BLE path would be a second schedule to keep in sync
  * and a budget that doubles for a Client alternating transports; that is why the BLE path shares
  * this instance instead of constructing its own.
@@ -132,16 +132,23 @@ class RequestRateLimiter(
      * The key material and the request identifier are fixed here, once, so the two call sites
      * cannot drift: [clientPublicKey] is the paired Client's Ed25519 public key — the only identity
      * in a request that is neither chosen by the peer nor rotating — and [wrapperMessageBytes] is
-     * the signature-verified `WrapperMessage` (both transports decrypt to the same bytes), hashed
-     * into the de-duplication identifier. That hash is what lets one request delivered over UDP and
-     * BLE at once cost a single burst slot.
+     * the decrypted `WrapperMessage` (both transports decrypt to the same bytes), hashed into the
+     * de-duplication identifier. That hash is what lets one request delivered over UDP and BLE at
+     * once cost a single burst slot.
+     *
+     * This function verifies nothing, so what it requires is those two inputs and not a verified
+     * signature, and the call sites order it differently: BLE runs it after signature verification
+     * (`BleGattServiceWiringTest` pins that order), UDP runs it before `parseAndVerifyAuthRequest`.
+     * The consequence on UDP is that a request whose signature then fails has already spent the
+     * client's burst allowance — that only lets a Client throttle itself, since reaching the site
+     * requires the CSK to decrypt the packet in the first place.
      *
      * Nothing spoofable pre-authentication is consulted: keying on the temporal identifier would
      * throttle a Client's own second request inside a 60 s window (one value per Client per
      * window), and keying on a peer address would let anyone spend another Client's budget.
      *
      * @param clientPublicKey The paired Client's Ed25519 public key, as stored on its pairing.
-     * @param wrapperMessageBytes The verified request's `WrapperMessage` bytes.
+     * @param wrapperMessageBytes The decrypted `WrapperMessage` bytes, verified or not.
      * @return true if the request may raise a prompt, false if it is rate limited.
      */
     fun shouldAcceptAuthenticatedRequest(
