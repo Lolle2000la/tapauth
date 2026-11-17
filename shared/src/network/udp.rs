@@ -13,8 +13,8 @@
 use prost::Message;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 
@@ -25,6 +25,61 @@ use super::NetworkError;
 use crate::protocol::pb::EncryptedPacket;
 
 const MAX_UDP_MESSAGE_SIZE: usize = 16 * 1024; // 16KB, matches TCP pairing path
+
+/// How often the aggregate "dropped a datagram" warning may fire.
+///
+/// The receive port is reachable by every host on the link, so the rate of
+/// datagrams that never become a response is set by an attacker, not by the
+/// phone. A `warn!` per drop would therefore make the log the amplification
+/// target of a single unauthenticated packet: one host could fill the journal at
+/// line rate, leaving journald's own rate limiter as the only bound, and each
+/// line would say no more than the aggregate does. Per-drop detail is logged at
+/// `debug`; the aggregate is reported at `warn` at most once per this interval.
+const DROP_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Datagrams dropped before they could become a response, since process start.
+static DROPPED_DATAGRAMS: AtomicU64 = AtomicU64::new(0);
+
+/// When the last aggregate drop warning was emitted (`None`: never).
+static DROP_WARN_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Record a datagram that was dropped instead of being returned to the caller.
+///
+/// Dropping is not the same decision as failing: a datagram we cannot read says
+/// nothing about the attempt, and the wait for a real response continues. Only
+/// [`DROP_WARN_INTERVAL`] bounds the `warn`, because the log would otherwise be
+/// the place an unauthenticated host amplifies one datagram into unbounded
+/// output. (The session layer applies the same rule to the frames that *do*
+/// decode but do not authenticate, and rate limits its own `warn` for the same
+/// reason.)
+fn record_dropped_datagram(reason: &str, addr: SocketAddr, len: usize) {
+    let dropped = DROPPED_DATAGRAMS.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::debug!(
+        "Dropped a datagram from {} ({} bytes): {}; still waiting for a response",
+        addr,
+        len,
+        reason
+    );
+
+    let mut last_warn = DROP_WARN_AT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let due = match *last_warn {
+        Some(at) => at.elapsed() >= DROP_WARN_INTERVAL,
+        None => true,
+    };
+    if due {
+        *last_warn = Some(Instant::now());
+        tracing::warn!(
+            "Dropped {} unusable UDP datagram(s) so far (most recent: {} bytes from {}: {}); \
+             still waiting for a response",
+            dropped,
+            len,
+            addr,
+            reason
+        );
+    }
+}
 
 // Track whether IPv6 is available (cached after first check)
 static IPV6_AVAILABLE: AtomicBool = AtomicBool::new(true);
@@ -529,6 +584,14 @@ pub async fn send_udp_unicast(
 }
 
 /// Receive an encrypted packet from UDP - async
+///
+/// Returns the first datagram that decodes; every datagram that does not is
+/// dropped here rather than reported, so an undecodable frame can neither end
+/// the caller's wait nor be mistaken for a reply. Attribution — whether the
+/// decoded frame really answers the request in flight — happens above this
+/// layer, and only an attributed answer may conclude an attempt. A dropped
+/// datagram is counted and logged at `debug`, with one aggregate `warn` per
+/// [`DROP_WARN_INTERVAL`] so the log cannot be used as an amplifier.
 pub async fn receive_udp_packet(
     socket: &UdpSocket,
 ) -> Result<(EncryptedPacket, SocketAddr), NetworkError> {
@@ -598,13 +661,30 @@ pub async fn receive_udp_packet(
             ))
         })?;
         if packet_bytes.len() > MAX_UDP_MESSAGE_SIZE {
-            tracing::warn!(
-                "UDP packet too large ({} bytes), dropping",
-                packet_bytes.len()
+            record_dropped_datagram(
+                "larger than the maximum datagram size",
+                addr,
+                packet_bytes.len(),
             );
+            // Back off to the scheduler before reading again: `recv_from` can
+            // keep returning data without ever yielding, and the caller's
+            // timeout only fires at a yield point.
+            tokio::task::yield_now().await;
             continue;
         }
-        let packet = EncryptedPacket::decode(packet_bytes)?;
+        // A datagram that does not decode is not a response to us: drop it and
+        // keep waiting for one that is. Returning the error here would let any
+        // host on the link end the attempt with a single malformed datagram.
+        let packet = match EncryptedPacket::decode(packet_bytes) {
+            Ok(packet) => packet,
+            Err(e) => {
+                record_dropped_datagram(&e.to_string(), addr, packet_bytes.len());
+                // Same reason as above: a sustained flood must not be able to
+                // hold this loop away from the caller's deadline.
+                tokio::task::yield_now().await;
+                continue;
+            }
+        };
         return Ok((packet, addr));
     }
 }

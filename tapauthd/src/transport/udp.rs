@@ -353,4 +353,53 @@ mod tests {
             "an unauthenticated on-the-wire datagram became the unicast target"
         );
     }
+
+    /// A malformed datagram on the wire must not conclude the attempt.
+    ///
+    /// This build (`--no-default-features --features dev-udp-loopback`) has BLE
+    /// off, so the UDP reply is the only way this attempt can succeed: an attacker
+    /// on the link that could end the wait with one undecodable datagram ends the
+    /// authentication itself. The wait must run to its own deadline instead, and
+    /// the phone's real answer must still be delivered afterwards.
+    ///
+    /// The defect this catches: `receive_udp_packet` propagating the protobuf
+    /// decode error out of the receive loop (`EncryptedPacket::decode(bytes)?`),
+    /// which surfaces as `AuthHandlerError::Network` and concludes the session
+    /// instead of dropping the datagram.
+    #[cfg(feature = "dev-udp-loopback")]
+    #[tokio::test]
+    async fn a_malformed_datagram_does_not_conclude_the_attempt() {
+        std::env::set_var("TAPAUTH_DEV_MODE", "1");
+        let (transport, peer, local, peer_addr) = transport_and_peer().await;
+
+        // Not an `EncryptedPacket` at all: an invalid wire type as the first byte.
+        peer.send_to(b"not an encrypted packet", local)
+            .await
+            .unwrap();
+
+        match transport
+            .receive_response(Duration::from_millis(300), &CskMetadata::default())
+            .await
+            .expect("an undecodable datagram must not conclude the attempt")
+        {
+            ReceiveResult::Timeout => {}
+            ReceiveResult::Response(..) => {
+                panic!("a malformed datagram was delivered to the session as a response")
+            }
+        }
+
+        // The attempt is still in flight, so the grant the phone sends next must
+        // reach the session and be the answer that concludes it.
+        peer.send_to(&sample_packet().encode_to_vec(), local)
+            .await
+            .unwrap();
+        match transport
+            .receive_response(Duration::from_millis(500), &CskMetadata::default())
+            .await
+            .expect("the valid response must be delivered")
+        {
+            ReceiveResult::Response(_, source) => assert_eq!(source, peer_addr),
+            ReceiveResult::Timeout => panic!("the valid response was never delivered"),
+        }
+    }
 }

@@ -190,6 +190,52 @@ impl WaitOutcome {
     }
 }
 
+/// How often the aggregate "dropped an unauthenticated frame" warning may fire.
+///
+/// Any host on the link can put a frame on the wire, so the rate of frames that
+/// do not authenticate is chosen by an attacker rather than by the phone. A
+/// `warn!` per drop would therefore make the log the amplification target of a
+/// single unauthenticated datagram: one host could fill the journal at line
+/// rate, with journald's own rate limiter as the only bound, and every line
+/// would say no more than the aggregate does. Per-drop detail is logged at
+/// `debug`; the aggregate is reported at `warn` at most once per this interval.
+const DROP_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Frames that were dropped instead of answered, since process start.
+static DROPPED_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// When the last aggregate drop warning was emitted (`None`: never).
+static DROP_WARN_AT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// Record a frame the session dropped because it does not authenticate.
+///
+/// Dropping is not failing: a frame that does not authenticate is not a response
+/// to this request, whatever host sent it, so the attempt continues waiting.
+/// The aggregate `warn` is rate limited because the log would otherwise be the
+/// place an unauthenticated host amplifies one datagram into unbounded output.
+fn drop_unauthenticated_frame(detail: &str) {
+    use std::sync::atomic::Ordering;
+
+    let dropped = DROPPED_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::debug!("{}; dropping it and continuing to wait", detail);
+
+    let mut last_warn = DROP_WARN_AT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let due = match *last_warn {
+        Some(at) => at.elapsed() >= DROP_WARN_INTERVAL,
+        None => true,
+    };
+    if due {
+        *last_warn = Some(Instant::now());
+        tracing::warn!(
+            "{} ({} unauthenticated frame(s) dropped so far); dropping it and continuing to wait",
+            detail,
+            dropped
+        );
+    }
+}
+
 /// Shared state for daemon - loaded once at startup
 pub struct DaemonState {
     pub config_manager: Arc<ClientConfigManager>,
@@ -1138,7 +1184,11 @@ impl AuthSession {
                 if !nonce_cache.insert(nonce_fingerprint) {
                     // NOTE: This exact log phrase is asserted by E2E test Phase 2d (nonce replay check).
                     tracing::warn!("Replayed packet detected from {}, ignoring", server_addr);
-                    return Ok(WaitOutcome::Timeout);
+                    // A replayed frame is a drop, not a silence: it must not read
+                    // as "the request went unanswered" and widen the interval, or
+                    // a host that captures one datagram off the wire could thin
+                    // the requests aimed at the phone that may answer.
+                    return Ok(WaitOutcome::Unattributable);
                 }
 
                 let wrapper = match decrypt_encrypted_packet_with_csk_nonce(
@@ -1148,16 +1198,24 @@ impl AuthSession {
                 ) {
                     Ok(wrapper) => wrapper,
                     Err(e) => {
-                        // Audit log: an authenticated-looking packet failed AEAD verification.
-                        // This is the expected outcome for tampered/corrupted datagrams.
-                        // NOTE: This exact log phrase ("Failed to decrypt response packet") is asserted by E2E test Phase 2d.
-                        tracing::warn!(
-                            "Failed to decrypt response packet from {} ({} ciphertext bytes): {}; rejecting it",
+                        // Audit log: an authenticated-looking packet failed AEAD
+                        // verification. That is the expected outcome for a
+                        // tampered or forged datagram, and it says nothing about
+                        // the attempt: a frame that does not authenticate is not
+                        // a response to this request, whichever host sent it.
+                        // Ending the wait here is what an attacker on the link
+                        // wants — with BLE off it concludes the attempt, and with
+                        // BLE up it discards the UDP reply for the rest of the
+                        // session.
+                        // NOTE: This exact log phrase ("Failed to decrypt response
+                        // packet") is asserted by E2E test Phase 2d.
+                        drop_unauthenticated_frame(&format!(
+                            "Failed to decrypt response packet from {} ({} ciphertext bytes): {}",
                             server_addr,
                             response_packet.ciphertext.len(),
                             e
-                        );
-                        return Err(e.into());
+                        ));
+                        return Ok(WaitOutcome::Unattributable);
                     }
                 };
                 let addr_str = server_addr.to_string();
@@ -2128,6 +2186,108 @@ mod tests {
         .unwrap();
         assert!(matches!(outcome, WaitOutcome::Timeout));
         assert!(outcome.retransmission_unanswered());
+    }
+
+    /// A frame that does not authenticate must not conclude the attempt, and must
+    /// not buy the sender a wider retransmission interval either.
+    ///
+    /// Any host on the link can put such a frame on the wire — a well-formed
+    /// protobuf whose AEAD tag does not verify, and then the very same frame
+    /// again — so neither may end the wait for the phone that may answer.
+    ///
+    /// The defects this catches: `wait_for_response` returning the decryption
+    /// error (`Err(e.into())`), which ends the attempt — with BLE off the session
+    /// is over, and with BLE up the UDP reply is discarded for the rest of the
+    /// session, so a grant only that transport carries is never seen; and
+    /// classifying the replay-cache hit as `WaitOutcome::Timeout`, which reads as
+    /// "nobody answered the request" and lets one captured datagram, replayed,
+    /// thin the requests aimed at the phone that may answer.
+    #[tokio::test]
+    async fn a_frame_that_does_not_authenticate_does_not_conclude_the_wait() {
+        let (phone_a, _phone_b, key_a, _key_b) = two_phones();
+        let csk = ClientSymmetricKey::generate().unwrap();
+        let csk_meta = CskMetadata::default();
+        let challenge = [0x4Bu8; 32];
+        let from = std::net::SocketAddr::from(([127, 0, 0, 2], 41_001));
+
+        // Well-formed protobuf, random ciphertext and temporal identifier: no
+        // AEAD tag can verify under this session's CSK.
+        let garbage = EncryptedPacket {
+            temporal_identifier: vec![0x11u8; 16],
+            encryption_algorithm: csk_meta.symmetric_algorithm as i32,
+            ciphertext: vec![0xAAu8; 32],
+        };
+
+        let transport = Arc::new(ScriptedTransport::new(garbage.clone(), from));
+        let run = AuthRunParams {
+            keypair: Ed25519KeyPair::generate().unwrap(),
+            csk: csk.clone(),
+            csk_meta,
+            challenge,
+            username: "bob".to_string(),
+            allowed_servers: Arc::new(vec![phone_a]),
+        };
+        let mut nonce_cache = HashSet::new();
+
+        let outcome = AuthSession::wait_for_response(
+            &transport,
+            Duration::from_millis(1),
+            &run,
+            &mut nonce_cache,
+        )
+        .await
+        .expect("a frame that does not authenticate must not conclude the wait");
+        assert!(
+            matches!(outcome, WaitOutcome::Unattributable),
+            "an unauthenticated frame is not a response to this request"
+        );
+        assert!(
+            !outcome.retransmission_unanswered(),
+            "a dropped frame must not advance the backoff"
+        );
+        assert_eq!(
+            transport.recorded(),
+            None,
+            "a frame that does not authenticate must not become the unicast target"
+        );
+
+        // The same frame a second time is caught by the nonce cache. It is still
+        // a drop, not a silence.
+        transport.script(garbage, from);
+        let outcome = AuthSession::wait_for_response(
+            &transport,
+            Duration::from_millis(1),
+            &run,
+            &mut nonce_cache,
+        )
+        .await
+        .expect("a replayed frame must not conclude the wait");
+        assert!(
+            matches!(outcome, WaitOutcome::Unattributable),
+            "a replayed frame is a drop, not an unanswered request"
+        );
+        assert!(!outcome.retransmission_unanswered());
+
+        // ...and the authorized phone's grant still concludes it.
+        let grant = create_signed_auth_grant(challenge, &key_a).unwrap();
+        let packet = create_encrypted_packet_with_csk_nonce(
+            &csk,
+            csk_meta.symmetric_algorithm,
+            csk_meta.hash_algorithm,
+            &grant,
+        )
+        .unwrap();
+        transport.script(packet, from);
+        let outcome = AuthSession::wait_for_response(
+            &transport,
+            Duration::from_millis(1),
+            &run,
+            &mut nonce_cache,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, WaitOutcome::Response(_, _)));
+        assert_eq!(transport.recorded(), Some(from));
     }
 
     /// A transport that answers every request with a fresh frame signed by a
