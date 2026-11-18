@@ -387,6 +387,206 @@ race_prompt_check() {
     return 0
 }
 
+# ── Daemon-log window helpers ─────────────────────────────────────────────────
+#
+# Both of these read the daemon log from a line offset taken before the request,
+# so a match left behind by an earlier phase cannot satisfy a later assertion.
+# They are defined here, before their first consumer (Phase 2), and not beside
+# Phase 2c where they used to live: this file is top-level sequential code, so a
+# function is only a command once the interpreter has reached its definition
+# line. A call above the definition is not a failed assertion — it is
+# `bash: grant_transport_since: command not found` and, under `set -e`, exit
+# 127, which reports a harness defect as though it were a test verdict.
+# `TAPAUTH_E2E_SELFTEST=helper-order` (below) keeps that from recurring.
+
+# Helper: assert a pattern is present in the daemon log AFTER a given line
+# offset (window-scoped, so stale matches from earlier phases don't count).
+assert_log_since() {
+    local base=$1 pattern=$2 label=$3
+    if tail -n +"$((base + 1))" "$DAEMON_LOG" 2>/dev/null | grep -q "$pattern"; then
+        echo "✅ ${label}"
+    else
+        echo "❌ ERROR (${label}): pattern '$pattern' not found in the daemon log for this phase."
+        exit 1
+    fi
+}
+
+# Print the transport named by the newest "Authentication granted over …" line
+# after a given line offset, or nothing when that window holds none.
+grant_transport_since() {
+    local base=$1
+    tail -n +"$((base + 1))" "$DAEMON_LOG" 2>/dev/null \
+        | grep -o "Authentication granted over [A-Za-z]*" \
+        | tail -n 1 \
+        | awk '{print $NF}'
+}
+
+# ── Helper definition order ──────────────────────────────────────────────────
+#
+# This suite is top-level sequential code with `set -e`: a shell function is a
+# command only from the line its definition was read onwards. Calling one above
+# its definition is neither a compile error nor a failed assertion — bash prints
+# `command not found` and, because the call sits in an assignment or a bare
+# command, `set -e` aborts the run with status 127. `bash -n` accepts it (the
+# name is a perfectly good word) and no assertion ever renders a verdict, so the
+# CI job reports a harness defect in the shape of a test failure. That is what
+# happened to the Phase 2 transport assertion when it was added beside the
+# phase instead of above it.
+#
+# helper_order_violations <file> prints one line per call site that can run
+# before the callee is defined, and returns 1 when it printed any. Execution
+# order is computed, not guessed:
+#
+#   * a call at top level runs at its own line, because the file is sequential;
+#   * a call inside a function body runs whenever that function is first
+#     reached, so it is charged to the enclosing function's earliest execution
+#     line — which is why a helper called from a function that only runs later
+#     is correctly *not* a violation, and why the same body is a violation as
+#     soon as its caller is reached too early;
+#   * a function that is never reached from top level cannot run at all, so
+#     nothing inside it is a violation.
+#
+# A function is recognised by a `name() {` definition line, and the call sites
+# are the command words of the line: the first word of each fragment split on
+# `| & ; ( ) { }`, after dropping leading keywords (`if`, `then`, `!`, …) and
+# leading `VAR=` assignments — the last of which is the `X=$(helper)` shape that
+# actually broke CI. The scan is deliberately structural rather than a git diff:
+# it reads the file as bash would encounter it.
+helper_order_violations() {
+    local target=${1:?helper_order_violations needs a file}
+    awk '
+    BEGIN {
+        INF = 1000000000
+        KW = "if|then|else|elif|while|until|do|!|time|command|builtin|exec"
+        KWRE = "^(" KW ")[ \t]+"
+        SQ = sprintf("%c", 39)
+        DQ = sprintf("%c", 34)
+        # Built rather than written out so this program cannot match itself: a
+        # literal home-of-a-heredoc pattern in here would be found by the very
+        # scan that reads this file.
+        HRE = "<<-?[ \t]*[" SQ DQ "]?[A-Za-z_][A-Za-z0-9_]*"
+    }
+    { src[NR] = $0 }
+    END {
+        n = NR
+
+        # Pass 0: mark heredoc bodies. They are data written somewhere, not
+        # shell this file runs, so a line inside one is neither a definition
+        # nor a call — that is also why this self-test can build its fixtures
+        # with heredocs without the scan treating them as part of the suite.
+        # An unterminated heredoc would make the scan skip the rest of the
+        # file, but `bash -n` already rejects that shape, so it cannot arrive
+        # here as a silent pass.
+        for (i = 1; i <= n; i++) {
+            if (skip[i]) continue
+            line = src[i]
+            if (line ~ /^[ \t]*#/) continue
+            if (!match(line, HRE)) continue
+            d = substr(line, RSTART, RLENGTH)
+            sub(/^<<-?[ \t]*/, "", d)
+            gsub(SQ, "", d)
+            gsub(DQ, "", d)
+            for (j = i + 1; j <= n; j++) {
+                skip[j] = 1
+                if (src[j] == d) break
+            }
+            i = j
+        }
+
+        # Pass 1: definitions and the line range of each body. A body ends at
+        # the first line that is nothing but a closing brace at the definition
+        # line indentation or less; the definition lines themselves are skipped
+        # so a brace inside a body cannot be mistaken for another definition.
+        for (i = 1; i <= n; i++) {
+            if (skip[i]) continue
+            line = src[i]
+            if (line ~ /^[ \t]*#/) continue
+            if (line !~ /^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)[ \t]*\{/) continue
+            nm = line
+            sub(/^[ \t]*/, "", nm)
+            sub(/[ \t]*\(\)[ \t]*\{.*/, "", nm)
+            if (nm in defline) continue
+            lead = line
+            sub(/[^ \t].*$/, "", lead)
+            ind = length(lead)
+            defline[nm] = i
+            deforder[++ndefs] = nm
+            after = line
+            sub(/^[^{]*\{/, "", after)
+            if (after ~ /\}/) { endline[nm] = i; continue }
+            endline[nm] = n
+            for (j = i + 1; j <= n; j++) {
+                if (src[j] !~ /^[ \t]*\}[ \t]*$/) continue
+                lead2 = src[j]
+                sub(/[^ \t].*$/, "", lead2)
+                if (length(lead2) <= ind) { endline[nm] = j; break }
+            }
+            i = endline[nm]
+        }
+
+        # Pass 2: call sites, each tagged with the function body it sits in.
+        for (i = 1; i <= n; i++) {
+            if (skip[i]) continue
+            line = src[i]
+            if (line ~ /^[ \t]*#/) continue
+            nseg = split(line, segs, /[|&;(){}]/)
+            for (s = 1; s <= nseg; s++) {
+                seg = segs[s]
+                sub(/^[ \t]+/, "", seg)
+                while (1) {
+                    if (seg ~ KWRE) { sub(KWRE, "", seg); continue }
+                    if (seg ~ /^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*/) {
+                        sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*/, "", seg)
+                        continue
+                    }
+                    break
+                }
+                w = seg
+                sub(/[ \t].*$/, "", w)
+                if (w == "") continue
+                if (!(w in defline)) continue
+                if (i == defline[w]) continue
+                ncalls++
+                callline[ncalls] = i
+                callname[ncalls] = w
+                enc = ""
+                for (d = 1; d <= ndefs; d++) {
+                    dn = deforder[d]
+                    if (i > defline[dn] && i <= endline[dn]) { enc = dn; break }
+                }
+                callenc[ncalls] = enc
+            }
+        }
+
+        # Pass 3: earliest line at which each function can be reached, to a
+        # fixpoint so a chain of calls propagates.
+        for (d = 1; d <= ndefs; d++) earliest[deforder[d]] = INF
+        for (it = 0; it <= ndefs + 1; it++) {
+            changed = 0
+            for (c = 1; c <= ncalls; c++) {
+                g = callenc[c]
+                t = (g == "") ? callline[c] : earliest[g]
+                if (t < earliest[callname[c]]) { earliest[callname[c]] = t; changed = 1 }
+            }
+            if (!changed) break
+        }
+
+        # Pass 4: report.
+        for (c = 1; c <= ncalls; c++) {
+            f = callname[c]
+            g = callenc[c]
+            t = (g == "") ? callline[c] : earliest[g]
+            if (t >= defline[f]) continue
+            where = (g == "") ? "top level" : ("inside " g)
+            printf "line %d: %s is called at line %d (%s) but is only defined at line %d\n",
+                t, f, callline[c], where, defline[f]
+            nviol++
+        }
+        exit (nviol > 0)
+    }
+    ' "$target"
+}
+
 # ── Registry self-test (dry run; needs no device, daemon or emulator) ────────
 #
 # Only entered when TAPAUTH_E2E_SELFTEST is set; the normal path ignores it
@@ -408,6 +608,16 @@ race_prompt_check() {
 #     challenge, two prompts for two challenges (a legitimate retry), two prompts
 #     for the SAME challenge, no prompt at all, and an earlier phase's
 #     same-challenge duplicate. The first two must pass, the last three must fail.
+#
+#   TAPAUTH_E2E_SELFTEST=helper-order
+#     Assert that no line this suite can reach calls a shell function defined
+#     further down (helper_order_violations, above) — the shape that makes a
+#     phase abort with `command not found` / exit 127 instead of rendering a
+#     verdict — then exercise that check on synthetic files: three that must be
+#     accepted (a call after the definition; a call inside a function that runs
+#     later; a call in a function nothing calls) and three that must be rejected
+#     (a bare call before the definition; the `X=$(helper)` assignment shape
+#     that broke CI; a call inside a function that is itself reached too early).
 #
 # Placed before cleanup() is trapped and before any environment is touched, so a
 # dry run cannot alter the host.
@@ -587,8 +797,109 @@ case "${TAPAUTH_E2E_SELFTEST:-}" in
         echo "✅ PROMPT-GROUPING SELF-TEST PASSED: 3 accepted (single, retry, earlier-phase duplicate), 3 rejected (same-challenge duplicate, no prompt, no challenge= field)."
         exit 0
         ;;
+    helper-order)
+        # helper_order_violations (above) is exercised on synthetic files here,
+        # not just on this suite: a check that has only ever been run against a
+        # clean input is indistinguishable from one that always passes.
+        ho_fail() {
+            echo "❌ HELPER-ORDER SELF-TEST FAILED: $1"
+            exit 1
+        }
+        HO_DIR=$(mktemp -d -t tapauth-e2e-helper-order.XXXXXX)
+        trap 'rm -rf "$HO_DIR"' EXIT
+        ho_case() {
+            local want=$1 label=$2 file=$3 out="" rc=0
+            set +e
+            out=$(helper_order_violations "$file")
+            rc=$?
+            set -e
+            if [ "$want" = "pass" ] && [ "$rc" -ne 0 ]; then
+                ho_fail "${label} was reported out of order (status ${rc}): ${out}"
+            fi
+            if [ "$want" = "fail" ] && [ "$rc" -eq 0 ]; then
+                ho_fail "${label} was accepted; the check cannot fail"
+            fi
+            echo "✅ helper_order_violations: ${label} → ${want} (status ${rc})"
+        }
+
+        # 1. The suite itself. This is the assertion that would have stopped the
+        #    defect instead of letting CI report exit 127 with no verdict: the
+        #    Phase 2 transport assertion calls grant_transport_since, which used
+        #    to be defined only beside Phase 2c, ~170 lines further down.
+        HO_REAL=$(helper_order_violations "$SCRIPT_DIR/test-e2e.sh") || true
+        if [ -n "$HO_REAL" ]; then
+            echo "❌ HELPER-ORDER SELF-TEST FAILED: this suite reaches a helper before defining it:"
+            printf '%s\n' "$HO_REAL"
+            exit 1
+        fi
+        echo "✅ helper_order_violations: test-e2e.sh defines every helper before any line that can reach it."
+
+        # 2. Definition then call, at top level: the healthy shape.
+        cat > "$HO_DIR/defined-first.sh" <<'EOF'
+helper_a() { echo a; }
+helper_a
+EOF
+        ho_case pass "a helper called after its definition" "$HO_DIR/defined-first.sh"
+
+        # 3. Call then definition, at top level: the defect.
+        cat > "$HO_DIR/called-first.sh" <<'EOF'
+helper_b
+helper_b() { echo b; }
+EOF
+        ho_case fail "a helper called before its definition" "$HO_DIR/called-first.sh"
+
+        # 4. The exact shape that broke CI: the call is the command substitution
+        #    of an assignment, so no assertion renders a verdict and `set -e`
+        #    aborts the run with 127 instead.
+        cat > "$HO_DIR/assignment-call.sh" <<'EOF'
+TRANSPORT=$(helper_c "$1")
+helper_c() { echo c; }
+EOF
+        ho_case fail "a helper called from an assignment before its definition" \
+            "$HO_DIR/assignment-call.sh"
+
+        # 5. A call inside a function body is charged to the caller, not to the
+        #    body's own line: here the caller runs after the definition, so this
+        #    must be accepted rather than flagged.
+        cat > "$HO_DIR/late-caller.sh" <<'EOF'
+run_phase_d() {
+    helper_d
+}
+helper_d() { echo d; }
+run_phase_d
+EOF
+        ho_case pass "a helper reached from a function that runs after its definition" \
+            "$HO_DIR/late-caller.sh"
+
+        # 6. ...and the same body is a defect once that caller is reached too
+        #    early. Without this the enclosing-function rule would excuse every
+        #    call that sits inside any function.
+        cat > "$HO_DIR/early-caller.sh" <<'EOF'
+run_phase_e() {
+    helper_e
+}
+run_phase_e
+helper_e() { echo e; }
+EOF
+        ho_case fail "a helper reached from a function that runs before its definition" \
+            "$HO_DIR/early-caller.sh"
+
+        # 7. A function nothing reaches cannot run, so what it calls is not a
+        #    violation: reporting it would make the check cry wolf on dead code.
+        cat > "$HO_DIR/unreached-caller.sh" <<'EOF'
+never_called() {
+    helper_f
+}
+helper_f() { echo f; }
+EOF
+        ho_case pass "a helper reached only from a function nothing calls" \
+            "$HO_DIR/unreached-caller.sh"
+
+        echo "✅ HELPER-ORDER SELF-TEST PASSED: 3 accepted (defined-first, late caller, unreached caller), 3 rejected (bare call before definition, assignment call before definition, early caller)."
+        exit 0
+        ;;
     *)
-        echo "❌ ERROR: unknown TAPAUTH_E2E_SELFTEST value '$TAPAUTH_E2E_SELFTEST' (expected summary|fail-after-record|race-prompts)" >&2
+        echo "❌ ERROR: unknown TAPAUTH_E2E_SELFTEST value '$TAPAUTH_E2E_SELFTEST' (expected summary|fail-after-record|race-prompts|helper-order)" >&2
         exit 2
         ;;
 esac
@@ -2745,27 +3056,10 @@ else
     phase_skip "2e" "pamtester missing, pam_tapauth.so absent, or /etc/pam.d not writable"
 fi
 
-# Helper: assert a pattern is present in the daemon log AFTER a given line
-# offset (window-scoped, so stale matches from earlier phases don't count).
-assert_log_since() {
-    local base=$1 pattern=$2 label=$3
-    if tail -n +"$((base + 1))" "$DAEMON_LOG" 2>/dev/null | grep -q "$pattern"; then
-        echo "✅ ${label}"
-    else
-        echo "❌ ERROR (${label}): pattern '$pattern' not found in the daemon log for this phase."
-        exit 1
-    fi
-}
-
-# Print the transport named by the newest "Authentication granted over …" line
-# after a given line offset, or nothing when that window holds none.
-grant_transport_since() {
-    local base=$1
-    tail -n +"$((base + 1))" "$DAEMON_LOG" 2>/dev/null \
-        | grep -o "Authentication granted over [A-Za-z]*" \
-        | tail -n 1 \
-        | awk '{print $NF}'
-}
+# The daemon-log window helpers (assert_log_since, grant_transport_since) are
+# defined near the top of the file, before their first consumer — see the
+# "Daemon-log window helpers" section above. They used to live here, beside
+# Phase 2c, which put the first of their consumers above their definitions.
 
 # ── BLE scan resiliency helpers ───────────────────────────────────────────────
 #
