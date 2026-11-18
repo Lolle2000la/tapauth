@@ -7,6 +7,9 @@
 # How long the PAM module waits for the daemon to complete an authentication
 # attempt (including phone discovery, BLE/UDP exchange, and user interaction).
 # After this, the PAM module falls through to the next method (e.g., password).
+# Maximum: 600 (ten minutes). A longer value is refused at load: the phone prunes
+# the authentication challenge it is retransmitting after 600 s, and a later
+# retransmission of it would be answered as a replay and drop the link.
 # Default: 120
 pam_operation_timeout_secs = 120
 
@@ -17,7 +20,7 @@ pam_operation_timeout_secs = 120
 # Graphical hosts whose conversation can be driven from a worker thread are
 # bounded by pam_operation_timeout_secs instead.
 # Clamped to pam_operation_timeout_secs, and only for a sequential host without
-# a terminal.
+# a terminal. Maximum: 600, like the operation timeout.
 # Default: 30
 pam_gui_timeout_secs = 30
 

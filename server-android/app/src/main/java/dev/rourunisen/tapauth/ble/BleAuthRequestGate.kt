@@ -218,7 +218,8 @@ internal class BleAuthRequestGate(
      * Drop entries that outlived any plausible prompt.
      *
      * A link that never reports its disconnect leaves its entry behind; the TTL bounds that leak
-     * and is far longer than the longest session timeout, so a live prompt is never pruned.
+     * and is at least the longest PAM deadline a deployment may configure, so a live prompt is
+     * never pruned (see [IN_FLIGHT_MAX_AGE_MS]).
      */
     private fun pruneExpired() {
         val cutoff = elapsedMillis() - IN_FLIGHT_MAX_AGE_MS
@@ -228,7 +229,14 @@ internal class BleAuthRequestGate(
     private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 
     companion object {
-        /** Longer than any prompt lifetime (default session timeout is 120 s). */
-        private const val IN_FLIGHT_MAX_AGE_MS = 600_000L
+        /**
+         * Longer than any prompt lifetime (default session timeout is 120 s), and at least the
+         * longest PAM deadline a deployment may configure (`MAX_PAM_TIMEOUT_SECS`,
+         * `shared/src/config/toml_config.rs`): an attempt allowed to outlast this age would have
+         * its claim pruned while the Client is still retransmitting, and that retransmission is
+         * then a `Replay` — which disconnects. Internal, not private: `SharedProtocolLiteralsTest`
+         * pins that relationship against the Rust bound.
+         */
+        internal const val IN_FLIGHT_MAX_AGE_MS = 600_000L
     }
 }

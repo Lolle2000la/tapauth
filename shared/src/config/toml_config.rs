@@ -18,6 +18,49 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/tapauth/config.toml";
 /// Default PAM authentication session timeout in seconds
 const DEFAULT_PAM_TIMEOUT_SECS: u64 = 120;
 
+/// The longest PAM authentication deadline a deployment may configure, in seconds.
+///
+/// A configured deadline is a hard ceiling on how long one authentication attempt
+/// lives, and the phone holds one claim per in-flight challenge for a fixed age
+/// (`IN_FLIGHT_MAX_AGE_MS`, `server-android/.../ble/BleAuthRequestGate.kt`): once a
+/// claim is pruned there, the Client's next retransmission of that challenge is
+/// answered as a replay and the GATT link is torn down, so an attempt permitted to
+/// outlast the prune would be disconnected in the middle of its prompt. Ten minutes
+/// is also the point past which a PAM deadline stops bounding a login and becomes a
+/// hang. The relationship is asserted from the phone's side
+/// (`SharedProtocolLiteralsTest`, server-android), which reads this constant out of
+/// this file, so neither side can move alone.
+pub const MAX_PAM_TIMEOUT_SECS: u64 = 600;
+
+/// [`MAX_PAM_TIMEOUT_SECS`] applied to one configured PAM deadline as it is parsed.
+///
+/// Every crate that reads `/etc/tapauth/config.toml` applies it at its own
+/// `Deserialize`, so the daemon's [`TapAuthConfig`] and the PAM module's `PamConfig`
+/// cannot disagree about the ceiling.
+///
+/// The value is refused with a warning rather than rejected: a TOML error sends the
+/// whole file back to its defaults ([`TapAuthConfig::load_from_path`]), so rejecting
+/// it would also silently reset `udp_port`, the transport toggles and the TPM
+/// settings over a timeout an operator can simply lower.
+pub fn bounded_pam_timeout<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let configured = u64::deserialize(deserializer)?;
+    if configured <= MAX_PAM_TIMEOUT_SECS {
+        return Ok(configured);
+    }
+    tracing::warn!(
+        "A PAM timeout of {}s exceeds the {}s maximum: the phone prunes an in-flight \
+         authentication challenge after that age, so a longer attempt would have its \
+         retransmissions refused as replays. Using {}s.",
+        configured,
+        MAX_PAM_TIMEOUT_SECS,
+        MAX_PAM_TIMEOUT_SECS
+    );
+    Ok(MAX_PAM_TIMEOUT_SECS)
+}
+
 /// Default PAM authentication timeout for GUI contexts whose conversation the
 /// module cannot drive (the sequential path — a host the rule table in
 /// `client-pam/src/policy/table.rs` does not classify as threaded), in seconds.
@@ -111,6 +154,8 @@ pub struct TapAuthConfig {
     ///
     /// Must be at least as long as the transport-level timeout so the daemon has
     /// time to complete BLE/UDP discovery and receive the phone's response.
+    /// At most [`MAX_PAM_TIMEOUT_SECS`]; a longer value is refused at parse time.
+    #[serde(deserialize_with = "bounded_pam_timeout")]
     pub pam_operation_timeout_secs: u64,
 
     /// Authentication timeout for graphical PAM contexts whose conversation the
@@ -127,6 +172,8 @@ pub struct TapAuthConfig {
     /// This field must exist here (not only in the PAM module's own parser)
     /// because the daemon rewrites the whole config file on SaveConfig; a
     /// missing field would silently delete the user's setting.
+    /// At most [`MAX_PAM_TIMEOUT_SECS`], like the operation timeout.
+    #[serde(deserialize_with = "bounded_pam_timeout")]
     pub pam_gui_timeout_secs: u64,
 
     /// Additional PAM service names the module must refuse to take part in.
@@ -501,5 +548,64 @@ mod tests {
             "SaveConfig must not delete the configured refused services"
         );
         assert!(rewritten.contains("sshd-renamed"));
+    }
+
+    /// The ceiling keeps its own value and refuses the next second.
+    ///
+    /// The defect this catches: a bound written as `configured < MAX` (or as a
+    /// separate literal that has drifted from [`MAX_PAM_TIMEOUT_SECS`]), which
+    /// rejects a deadline that is exactly the permitted maximum, or a clamp that
+    /// only guards one of the two fields and leaves the other unbounded.
+    #[test]
+    fn the_pam_deadline_ceiling_keeps_the_boundary_and_refuses_past_it() {
+        for (configured, expected) in [
+            (0_u64, 0_u64),
+            (DEFAULT_PAM_TIMEOUT_SECS, DEFAULT_PAM_TIMEOUT_SECS),
+            (MAX_PAM_TIMEOUT_SECS, MAX_PAM_TIMEOUT_SECS),
+            (MAX_PAM_TIMEOUT_SECS + 1, MAX_PAM_TIMEOUT_SECS),
+            (u64::MAX, MAX_PAM_TIMEOUT_SECS),
+        ] {
+            let toml = format!(
+                "pam_operation_timeout_secs = {configured}\npam_gui_timeout_secs = {configured}"
+            );
+            let config: TapAuthConfig = toml::from_str(&toml).unwrap();
+            assert_eq!(
+                config.pam_operation_timeout_secs, expected,
+                "pam_operation_timeout_secs = {configured} must parse as {expected}"
+            );
+            assert_eq!(
+                config.pam_gui_timeout_secs, expected,
+                "pam_gui_timeout_secs = {configured} must parse as {expected}"
+            );
+        }
+    }
+
+    /// Refusing an overlong deadline must not cost the rest of the file.
+    ///
+    /// The defect this catches: the ceiling implemented as a TOML parse error,
+    /// which sends every other setting back to its defaults — a deployment that
+    /// only got `pam_operation_timeout_secs` wrong would silently lose its
+    /// `udp_port` and its transport toggles as well.
+    #[test]
+    fn an_overlong_pam_deadline_leaves_the_rest_of_the_file_intact() {
+        let toml = r#"
+            pam_operation_timeout_secs = 3600
+            pam_gui_timeout_secs = 3600
+            pam_refused_services = ["sshd", "sshd-renamed"]
+            udp_port = 40000
+            enable_network = false
+            enable_ble = false
+        "#;
+        let config: TapAuthConfig = toml::from_str(toml).unwrap();
+
+        assert_eq!(config.pam_operation_timeout_secs, MAX_PAM_TIMEOUT_SECS);
+        assert_eq!(config.pam_gui_timeout_secs, MAX_PAM_TIMEOUT_SECS);
+        assert_eq!(config.udp_port, 40000);
+        assert!(!config.enable_network);
+        assert!(!config.enable_ble);
+        assert_eq!(
+            config.pam_refused_services,
+            vec!["sshd".to_string(), "sshd-renamed".to_string()]
+        );
     }
 }
