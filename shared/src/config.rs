@@ -1016,4 +1016,157 @@ mod tests {
         manager.remove_paired_server("cc").unwrap();
         assert!(!manager.has_csk_metadata_file());
     }
+
+    /// The on-disk state a v0.12.0 daemon left in `/var/lib/tapauth` still loads.
+    ///
+    /// Provenance: `shared/testdata/legacy-v0.12.0-state/` is the exact text tag
+    /// v0.12.0 (`f30e43c`, the last release before the v2 state additions) wrote —
+    /// `serde_json::to_vec_pretty` of `ClientConfig` (`save_config`) and of the
+    /// `HashMap<String, PairedServer>` (`save_paired_servers`), with no
+    /// `signature_algorithm` in the paired-server record and no `csk_meta.json`
+    /// anywhere in the directory. The two raw 32-byte key files are synthesised
+    /// below rather than checked in, because v0.12.0 wrote them un-framed
+    /// (`save_keypair` / `save_csk`): `0x00..=0x1f` is the Ed25519 signing seed,
+    /// `0xc0..=0xdf` the CSK. Nothing here is or was a real secret.
+    ///
+    /// Defects this catches: an upgrade that loses the existing pairing (the v1
+    /// record refused, the new algorithm field defaulting to other than Ed25519,
+    /// or `allowed_users` dropped), one that refuses to start because the absent
+    /// `csk_meta.json` is not defaulted, one that no longer reads the existing CSK
+    /// (the material that makes the pairing usable at all), and one that reads a
+    /// *retired* algorithm name — which v0.12.0 never wrote — as the live primitive
+    /// instead of refusing the file.
+    #[test]
+    fn an_existing_v0_12_0_state_directory_still_loads() {
+        use std::os::unix::fs::PermissionsExt;
+
+        /// v0.12.0's `PairedServer`, field for field and in the same order: the
+        /// oracle the fixture is re-serialised through, so a fixture that drifts
+        /// from what `save_paired_servers` produced (compact form, a renamed or
+        /// reordered key, a numeric `paired_at`) cannot pass this test.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct PairedServerV0120 {
+            name: String,
+            public_key: String,
+            allowed_users: Vec<String>,
+            paired_at: chrono::DateTime<chrono::Utc>,
+        }
+
+        const LEGACY_CONFIG: &str =
+            include_str!("../testdata/legacy-v0.12.0-state/client_config.json");
+        const LEGACY_SERVERS: &str =
+            include_str!("../testdata/legacy-v0.12.0-state/paired_servers.json");
+        /// The synthetic server key: both the map key and `public_key`, as
+        /// `add_paired_server(hex::encode(server_public_key), …)` writes them.
+        const LEGACY_SERVER_KEY: &str =
+            "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f";
+        const LEGACY_CLIENT_KEY: [u8; 32] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+        const LEGACY_CSK: [u8; 32] = [
+            0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd,
+            0xce, 0xcf, 0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xdb,
+            0xdc, 0xdd, 0xde, 0xdf,
+        ];
+
+        // A copy of the install, owned by the test user, in the 0700 directory and
+        // 0600 files `ensure_secure_directory` / `write_secure_file` leave behind —
+        // the ownership `read_secure_file` accepts for a `TAPAUTH_STATE_DIR` (and
+        // the only one an unprivileged test can produce). No permission check is
+        // relaxed: the fixture is installed as the daemon would have left it.
+        fn install(dir: &std::path::Path, name: &str, contents: &[u8]) {
+            let path = dir.join(name);
+            fs::write(&path, contents).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let scratch = ScratchStateDir::new("legacy-v0-12-0");
+        fs::set_permissions(&scratch.path, fs::Permissions::from_mode(0o700)).unwrap();
+        install(&scratch.path, CLIENT_CONFIG_FILE, LEGACY_CONFIG.as_bytes());
+        install(
+            &scratch.path,
+            PAIRED_SERVERS_FILE,
+            LEGACY_SERVERS.as_bytes(),
+        );
+        install(&scratch.path, CLIENT_KEY_FILE, &LEGACY_CLIENT_KEY);
+        install(&scratch.path, CLIENT_SYMMETRIC_KEY_FILE, &LEGACY_CSK);
+        let manager = scratch.manager();
+
+        // `client_config.json`: loaded, and byte-identical to what the writer emits.
+        let config = manager.load_config().unwrap();
+        assert_eq!(config.hostname, "legacy-laptop");
+        assert_eq!(
+            serde_json::to_vec_pretty(&config).unwrap(),
+            LEGACY_CONFIG.as_bytes(),
+            "the fixture must be exactly what `save_config` wrote"
+        );
+
+        // `paired_servers.json`: the pairing survives with Ed25519 and its users.
+        let servers = manager.load_paired_servers().unwrap();
+        assert_eq!(servers.len(), 1, "the v1 pairing must not be dropped");
+        let server = servers
+            .get(LEGACY_SERVER_KEY)
+            .expect("the pairing is keyed by the server's hex public key");
+        assert_eq!(server.name, "Pixel 6");
+        assert_eq!(server.public_key, LEGACY_SERVER_KEY);
+        assert_eq!(
+            server.signature_algorithm,
+            SignatureAlgorithm::Ed25519,
+            "a v1 record stored no algorithm, and the v1 wire format is Ed25519"
+        );
+        assert_eq!(server.allowed_users, vec!["alice".to_string()]);
+        assert!(server.is_user_allowed("alice"));
+        assert_eq!(
+            server.paired_at,
+            chrono::DateTime::parse_from_rfc3339("2024-03-05T08:15:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        );
+        assert!(
+            !LEGACY_SERVERS.contains("signature_algorithm"),
+            "v0.12.0 wrote no signature_algorithm; a fixture that has one is not a v1 record"
+        );
+        let legacy: HashMap<String, PairedServerV0120> =
+            serde_json::from_str(LEGACY_SERVERS).unwrap();
+        assert_eq!(
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+            LEGACY_SERVERS.as_bytes(),
+            "the fixture must be exactly what `save_paired_servers` wrote"
+        );
+
+        // No `csk_meta.json` in a v0.12.0 directory: the default pair is the v1
+        // wire behaviour, not an error and not a different suite.
+        assert!(!scratch.path.join(CSK_META_FILE).exists());
+        let metadata = manager.load_csk_metadata().unwrap();
+        assert_eq!(metadata, CskMetadata::default());
+        assert_eq!(metadata.symmetric_algorithm, SymmetricAlgorithm::Aes256Gcm);
+        assert_eq!(metadata.hash_algorithm, HashAlgorithm::Sha256);
+
+        // The key material that makes the stored pairing usable.
+        assert_eq!(manager.load_csk().unwrap().as_bytes(), &LEGACY_CSK);
+        assert_eq!(
+            ClientSymmetricKey::from_bytes(LEGACY_CSK).as_bytes(),
+            &LEGACY_CSK
+        );
+        assert_eq!(
+            manager.load_keypair().unwrap().signing_key_bytes(),
+            LEGACY_CLIENT_KEY
+        );
+
+        // Retired pre-release names were never written by v0.12.0, so they stay
+        // refused rather than being aliased onto the one live primitive.
+        for refused in [
+            r#"{"symmetric_algorithm": "CHACHA20_POLY1305", "hash_algorithm": "SHA256"}"#,
+            r#"{"symmetric_algorithm": "AES_256_GCM", "hash_algorithm": "Blake3"}"#,
+            r#"{"symmetric_algorithm": "AES_256_GCM", "hash_algorithm": "BLAKE3"}"#,
+        ] {
+            install(&scratch.path, CSK_META_FILE, refused.as_bytes());
+            assert!(
+                manager.load_csk_metadata().is_err(),
+                "{refused} must not load"
+            );
+        }
+    }
 }
