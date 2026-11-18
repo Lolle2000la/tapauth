@@ -22,7 +22,10 @@ mod storage;
 mod toml_config;
 
 pub use storage::{ensure_secure_directory, get_config_dir, read_secure_file, write_secure_file};
-pub use toml_config::{TapAuthConfig, DEFAULT_CONFIG_PATH, DEFAULT_PAM_REFUSED_SERVICES};
+pub use toml_config::{
+    bounded_pam_timeout, TapAuthConfig, DEFAULT_CONFIG_PATH, DEFAULT_PAM_REFUSED_SERVICES,
+    MAX_PAM_TIMEOUT_SECS,
+};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
