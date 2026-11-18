@@ -5,6 +5,6 @@
     "allowed_users": [
       "alice"
     ],
-    "paired_at": "2024-03-05T08:15:00Z"
+    "paired_at": "2024-03-05T08:15:00.123456789Z"
   }
 }

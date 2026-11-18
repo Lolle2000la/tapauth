@@ -918,6 +918,21 @@ mod tests {
         }
     }
 
+    /// Install one file into a scratch state directory as the daemon leaves it.
+    ///
+    /// The file is mode 0600 — the posture `write_secure_file` establishes and the
+    /// one `read_secure_file` accepts — and owned by the test user, the only
+    /// ownership an unprivileged test can produce (and the one accepted for a
+    /// `TAPAUTH_STATE_DIR`). No permission check is relaxed: the directory is
+    /// installed as a real daemon would have left it.
+    fn install_state_file(dir: &std::path::Path, name: &str, contents: &[u8]) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join(name);
+        fs::write(&path, contents).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
     /// A rotation deletes every paired device, so nothing is left that the
     /// negotiated algorithm pair could be pinned to.
     ///
@@ -1019,23 +1034,30 @@ mod tests {
 
     /// The on-disk state a v0.12.0 daemon left in `/var/lib/tapauth` still loads.
     ///
-    /// Provenance: `shared/testdata/legacy-v0.12.0-state/` is the exact text tag
-    /// v0.12.0 (`f30e43c`, the last release before the v2 state additions) wrote —
-    /// `serde_json::to_vec_pretty` of `ClientConfig` (`save_config`) and of the
-    /// `HashMap<String, PairedServer>` (`save_paired_servers`), with no
+    /// Provenance: `shared/testdata/legacy-v0.12.0-state/` is the exact text
+    /// v0.12.0 wrote — `serde_json::to_vec_pretty` of `ClientConfig` (`save_config`)
+    /// and of the `HashMap<String, PairedServer>` (`save_paired_servers`), with no
     /// `signature_algorithm` in the paired-server record and no `csk_meta.json`
-    /// anywhere in the directory. The two raw 32-byte key files are synthesised
-    /// below rather than checked in, because v0.12.0 wrote them un-framed
-    /// (`save_keypair` / `save_csk`): `0x00..=0x1f` is the Ed25519 signing seed,
-    /// `0xc0..=0xdf` the CSK. Nothing here is or was a real secret.
+    /// anywhere in the directory. The writers are byte-identical at the release tag
+    /// `v0.12.0` (`bb9d3cd`) and at `f30e43c` (`v0.12.0-10-gf30e43c`, this branch's
+    /// merge base): `git diff bb9d3cd f30e43c -- shared/src/config.rs
+    /// tapauthd/src/admin_handler.rs` differs only in one `pub use` line, so the
+    /// fixture describes both revisions. `paired_at` carries nanoseconds because the
+    /// daemon's only writer is `chrono::Utc::now()` (`handle_complete_pairing`,
+    /// `tapauthd/src/admin_handler.rs:614` in OLD), which serialises with
+    /// `SecondsFormat::AutoSi` — full precision, not a whole second.
+    ///
+    /// The two raw 32-byte key files are synthesised below rather than checked in,
+    /// because v0.12.0 wrote them un-framed (`save_keypair` / `save_csk`):
+    /// `0x00..=0x1f` is the Ed25519 signing seed, `0xc0..=0xdf` the CSK. Nothing
+    /// here is or was a real secret.
     ///
     /// Defects this catches: an upgrade that loses the existing pairing (the v1
     /// record refused, the new algorithm field defaulting to other than Ed25519,
-    /// or `allowed_users` dropped), one that refuses to start because the absent
-    /// `csk_meta.json` is not defaulted, one that no longer reads the existing CSK
-    /// (the material that makes the pairing usable at all), and one that reads a
-    /// *retired* algorithm name — which v0.12.0 never wrote — as the live primitive
-    /// instead of refusing the file.
+    /// `allowed_users` dropped, or `paired_at` narrowed to whole seconds, which no
+    /// real record satisfies), one that refuses to start because the absent
+    /// `csk_meta.json` is not defaulted, and one that no longer reads the existing
+    /// CSK (the material that makes the pairing usable at all).
     #[test]
     fn an_existing_v0_12_0_state_directory_still_loads() {
         use std::os::unix::fs::PermissionsExt;
@@ -1072,26 +1094,17 @@ mod tests {
         ];
 
         // A copy of the install, owned by the test user, in the 0700 directory and
-        // 0600 files `ensure_secure_directory` / `write_secure_file` leave behind —
-        // the ownership `read_secure_file` accepts for a `TAPAUTH_STATE_DIR` (and
-        // the only one an unprivileged test can produce). No permission check is
-        // relaxed: the fixture is installed as the daemon would have left it.
-        fn install(dir: &std::path::Path, name: &str, contents: &[u8]) {
-            let path = dir.join(name);
-            fs::write(&path, contents).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        }
-
+        // 0600 files `ensure_secure_directory` / `write_secure_file` leave behind.
         let scratch = ScratchStateDir::new("legacy-v0-12-0");
         fs::set_permissions(&scratch.path, fs::Permissions::from_mode(0o700)).unwrap();
-        install(&scratch.path, CLIENT_CONFIG_FILE, LEGACY_CONFIG.as_bytes());
-        install(
+        install_state_file(&scratch.path, CLIENT_CONFIG_FILE, LEGACY_CONFIG.as_bytes());
+        install_state_file(
             &scratch.path,
             PAIRED_SERVERS_FILE,
             LEGACY_SERVERS.as_bytes(),
         );
-        install(&scratch.path, CLIENT_KEY_FILE, &LEGACY_CLIENT_KEY);
-        install(&scratch.path, CLIENT_SYMMETRIC_KEY_FILE, &LEGACY_CSK);
+        install_state_file(&scratch.path, CLIENT_KEY_FILE, &LEGACY_CLIENT_KEY);
+        install_state_file(&scratch.path, CLIENT_SYMMETRIC_KEY_FILE, &LEGACY_CSK);
         let manager = scratch.manager();
 
         // `client_config.json`: loaded, and byte-identical to what the writer emits.
@@ -1120,9 +1133,10 @@ mod tests {
         assert!(server.is_user_allowed("alice"));
         assert_eq!(
             server.paired_at,
-            chrono::DateTime::parse_from_rfc3339("2024-03-05T08:15:00Z")
+            chrono::DateTime::parse_from_rfc3339("2024-03-05T08:15:00.123456789Z")
                 .unwrap()
-                .with_timezone(&chrono::Utc)
+                .with_timezone(&chrono::Utc),
+            "the sub-second part `Utc::now()` writes must survive, not be truncated or refused"
         );
         assert!(
             !LEGACY_SERVERS.contains("signature_algorithm"),
@@ -1144,25 +1158,56 @@ mod tests {
         assert_eq!(metadata.symmetric_algorithm, SymmetricAlgorithm::Aes256Gcm);
         assert_eq!(metadata.hash_algorithm, HashAlgorithm::Sha256);
 
-        // The key material that makes the stored pairing usable.
-        assert_eq!(manager.load_csk().unwrap().as_bytes(), &LEGACY_CSK);
+        // The key material that makes the stored pairing usable: the CSK file is
+        // still the raw 32 bytes `ClientSymmetricKey::from_bytes` takes, and the
+        // Ed25519 seed is still the pairing's `Ed_C`.
         assert_eq!(
-            ClientSymmetricKey::from_bytes(LEGACY_CSK).as_bytes(),
-            &LEGACY_CSK
+            manager.load_csk().unwrap().as_bytes(),
+            &LEGACY_CSK,
+            "`client_symmetric_key` must still yield the stored pairing's CSK"
         );
         assert_eq!(
             manager.load_keypair().unwrap().signing_key_bytes(),
             LEGACY_CLIENT_KEY
         );
+    }
 
-        // Retired pre-release names were never written by v0.12.0, so they stay
-        // refused rather than being aliased onto the one live primitive.
+    /// A *present* `csk_meta.json` loads as the baseline suite, but a retired
+    /// pre-release name in one is refused rather than aliased.
+    ///
+    /// Defects this catches: a loader that errors on any present metadata file —
+    /// `tapauthd` turns that into a failed authentication for every device paired
+    /// by a v2 build (`auth_handler`, the `load_csk_metadata` error arm) — and one
+    /// that reads `CHACHA20_POLY1305` or `BLAKE3`, which no shipped release wrote,
+    /// as the one live primitive instead of refusing the file.
+    #[test]
+    fn csk_metadata_loads_the_baseline_from_a_present_file_but_refuses_retired_names() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = ScratchStateDir::new("csk-meta");
+        fs::set_permissions(&scratch.path, fs::Permissions::from_mode(0o700)).unwrap();
+        let manager = scratch.manager();
+
+        // Positive control: a present, valid file is the everyday case.
+        install_state_file(
+            &scratch.path,
+            CSK_META_FILE,
+            br#"{"symmetric_algorithm": "AES_256_GCM", "hash_algorithm": "SHA256"}"#,
+        );
+        assert!(manager.has_csk_metadata_file());
+        let metadata = manager.load_csk_metadata().unwrap();
+        assert_eq!(metadata, CskMetadata::default());
+        assert_eq!(metadata.symmetric_algorithm, SymmetricAlgorithm::Aes256Gcm);
+        assert_eq!(metadata.hash_algorithm, HashAlgorithm::Sha256);
+
+        // Retired pre-release names stay refused rather than being aliased onto the
+        // one live primitive.
         for refused in [
             r#"{"symmetric_algorithm": "CHACHA20_POLY1305", "hash_algorithm": "SHA256"}"#,
             r#"{"symmetric_algorithm": "AES_256_GCM", "hash_algorithm": "Blake3"}"#,
             r#"{"symmetric_algorithm": "AES_256_GCM", "hash_algorithm": "BLAKE3"}"#,
         ] {
-            install(&scratch.path, CSK_META_FILE, refused.as_bytes());
+            install_state_file(&scratch.path, CSK_META_FILE, refused.as_bytes());
             assert!(
                 manager.load_csk_metadata().is_err(),
                 "{refused} must not load"
