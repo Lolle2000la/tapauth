@@ -1,0 +1,9 @@
+# `cargo fuzz` build output and run output. The seed corpora under `corpus/` are
+# checked in on purpose — they are the inputs the targets were last run against, and
+# they are small; only what a run *grows* is ignored, and `cargo fuzz` writes new units
+# to the first corpus directory it is given (a scratch one outside the tree), so a run
+# does not touch the checked-in seeds.
+target
+artifacts
+coverage
+corpus/*-run/

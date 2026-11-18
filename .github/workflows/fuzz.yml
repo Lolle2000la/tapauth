@@ -1,0 +1,99 @@
+name: Fuzz
+
+# `cargo-fuzz` targets for the three parsers a peer or a scanned sticker can reach:
+# `PairingInfo::parse`, the daemon's `EncryptedPacket` decode path and
+# `sanitize_context_string` (`fuzz/fuzz_targets/`). The `fuzz/` crate is excluded from
+# the repository workspace (`Cargo.toml`), so nothing here is built by
+# `cargo build/test/clippy --workspace`.
+#
+# This workflow is **deliberately not a required status check**: it is not listed in
+# `scripts/ci/check-required-checks.sh` (eight contexts), and it must never be added
+# there. It has no `pull_request:` and no `push:` trigger at all — a fuzz run is
+# non-deterministic (the mutation schedule and the corpus growth depend on the machine)
+# and three 180 s ASAN runs on every PR would gate merges on it while proving nothing
+# the weekly run on the checked-in corpus does not. `workflow_dispatch` is the manual
+# knob; the schedule is the safety net. With no `pull_request:` trigger there is no
+# path-filtered run that could leave a check `Pending` either.
+#
+# A failure here is a finding, not a merge blocker: `cargo fuzz` writes the offending
+# input to `fuzz/artifacts/<target>/`, which the last step uploads.
+on:
+  workflow_dispatch:
+  schedule:
+    # Mondays, 04:17 UTC — off the top of the hour, when GitHub's cron queue is longest.
+    - cron: '17 4 * * 1'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz shared parsers (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    # The target itself is 180 s; the rest is a cold nightly + `cargo-fuzz` install and
+    # one release build of `shared` behind ASAN.
+    timeout-minutes: 40
+    strategy:
+      # One crashing target must not cancel the other two: each is a separate finding.
+      fail-fast: false
+      matrix:
+        include:
+          # `max_len` is the target's own domain, not a tuning knob: a URL longer than
+          # the 512-byte cap is refused before anything else, so 600 lets the parser see
+          # both sides of that boundary; anything above the 16 KiB datagram cap is
+          # dropped by the receive path before `EncryptedPacket::decode` and so is not in
+          # the decode target's domain; 512 is ample for a context string.
+          - target: pairing_url
+            max_len: 600
+          - target: packet_decode
+            max_len: 16384
+          - target: context_sanitizer
+            max_len: 512
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      # `cargo fuzz` needs a nightly: it passes `-Zsanitizer=address` and the
+      # `-Cpasses=sancov-module` instrumentation. The checked-in `fuzz/Cargo.lock` pins
+      # `libfuzzer-sys`; the toolchain itself is unpinned, because a pinned nightly
+      # expires out of the rustup channel list and would fail the run for a reason
+      # unrelated to the code under test.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      # `shared/build.rs` runs prost-build, which shells out to `protoc`; without it the
+      # dependency of the fuzz targets fails to compile. Same idiom as every other job
+      # that builds `shared`: the distro package, unpinned.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      # Pinned to the version the targets and the checked-in corpus were last run
+      # against (0.13.2); `cargo-fuzz` writes the corpus layout, so an unpinned upgrade
+      # can change where a crashing input lands.
+      - name: Install cargo-fuzz
+        run: cargo install --locked cargo-fuzz --version 0.13.2
+
+      # Two corpus directories, in this order: libFuzzer writes every unit it discovers
+      # into the FIRST one, so a run's growth lands in the git-ignored `-run` directory
+      # and the checked-in seeds under `fuzz/corpus/<target>/` stay exactly as committed.
+      - name: Fuzz ${{ matrix.target }}
+        run: |
+          mkdir -p "fuzz/corpus/${{ matrix.target }}-run"
+          cargo +nightly fuzz run "${{ matrix.target }}" \
+            "fuzz/corpus/${{ matrix.target }}-run" \
+            "fuzz/corpus/${{ matrix.target }}" \
+            -- -max_total_time=180 -max_len=${{ matrix.max_len }}
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

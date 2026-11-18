@@ -291,6 +291,55 @@ class PairingUrlTest {
         assertNull(PairingUrl.parse("tapauth://pair?v=2&sid=$sessionId&pk=$publicKey&ip6="))
     }
 
+    /**
+     * `ip4`/`ip6` must be the IP literals `PairingInfo::parse` reads them as, and an accepted one
+     * is kept in the canonical text Rust renders.
+     *
+     * The defect this catches: the phone accepting an `ip4`/`ip6` that is not an address at all — a
+     * hostname, or a zone-id form — so a QR the desktop refuses becomes a pairing URL here and the
+     * session opens against an endpoint the desktop never advertised. The last two assertions catch
+     * the other half: keeping the verbatim text, so the fully expanded and the compressed spelling
+     * of one address reach the transport as two different strings.
+     */
+    @Test
+    fun testAddressFieldsMustBeIpLiterals() {
+        for (bad in
+            listOf(
+                "example.com",
+                "1.2.3",
+                "999.1.1.1",
+                "01.2.3.4",
+                "1.2.3.4 ",
+            )) {
+            assertNull(
+                "ip4 '$bad' must be refused",
+                PairingUrl.parse("tapauth://pair?v=2&sid=$sessionId&pk=$publicKey&ip4=$bad"),
+            )
+        }
+        // `%25` is a literal `%`, so the zone id reaches the address check instead of failing the
+        // percent-escape check first.
+        for (bad in listOf("example.com", "fe80::1%25eth0", "[::1]", "1:2:3:4:5:6:7:8:9")) {
+            assertNull(
+                "ip6 '$bad' must be refused",
+                PairingUrl.parse("tapauth://pair?v=2&sid=$sessionId&pk=$publicKey&ip6=$bad"),
+            )
+        }
+
+        // The accepted spellings of one address all yield the one canonical value.
+        val compressed =
+            PairingUrl.parse("tapauth://pair?v=2&sid=$sessionId&pk=$publicKey&ip6=2001:db8::1")
+        val expanded =
+            PairingUrl.parse(
+                "tapauth://pair?v=2&sid=$sessionId&pk=$publicKey" +
+                    "&ip6=2001:0db8:0000:0000:0000:0000:0000:0001",
+            )
+        assertEquals("2001:db8::1", compressed!!.ipv6)
+        assertEquals("2001:db8::1", expanded!!.ipv6)
+
+        val ipv4 = PairingUrl.parse("tapauth://pair?v=2&sid=$sessionId&pk=$publicKey&ip4=1.2.3.4")
+        assertEquals("1.2.3.4", ipv4!!.ipv4)
+    }
+
     /** An unknown key is ignored, so a future extension stays forward-compatible. */
     @Test
     fun testUnknownQueryKeyIgnored() {
@@ -390,6 +439,6 @@ class PairingUrlTest {
         val VECTORS_FILE = File("../../shared/testdata/pairing_url_vectors.json")
 
         /** Must equal `EXPECTED_CASES` in `models.rs`; see [testSharedVectorsAreHonoured]. */
-        const val EXPECTED_VECTOR_CASES = 41
+        const val EXPECTED_VECTOR_CASES = 49
     }
 }

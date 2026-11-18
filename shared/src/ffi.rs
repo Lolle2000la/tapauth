@@ -161,9 +161,11 @@ pub struct ParsedPairingProvision {
     /// Rust zeroizes the decrypted payload and its own `Zeroizing` copy
     /// (`ffi/ops.rs`), then hands the bytes over as this plain `Vec`, which becomes
     /// the Kotlin `ByteArray` the phone owns — a buffer Rust cannot reach and
-    /// cannot wipe.
-    /// The phone must clear that `ByteArray` once it has persisted the device;
-    /// nothing on the Kotlin side does today.
+    /// cannot wipe, so clearing it is the phone's job, and the phone does it:
+    /// `PairingProvision.zeroize()` (`network/PairingProvision.kt`) fills the
+    /// transient array with zeros and refuses a later `copyCsk()`, and
+    /// `PairingSession.finishPairing` calls it from a `finally` once the device
+    /// record has its own copy, so what the repository persists is unchanged.
     pub csk: Vec<u8>,
     /// Linux account this pairing authorizes.
     pub username: String,

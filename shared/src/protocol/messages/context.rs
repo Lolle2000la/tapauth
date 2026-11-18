@@ -380,6 +380,17 @@ fn is_forbidden_context_char(ch: char) -> bool {
     )
 }
 
+/// `fuzz-api` only: [`is_forbidden_context_char`], so the `fuzz/` sanitizer target
+/// asserts "no forbidden code point survived" with this module's own predicate instead
+/// of a re-transcription of the set. One delegate, no logic; uncompiled in every other
+/// configuration. Re-exported by `messages`/`protocol`, so the target reaches it as
+/// `shared::protocol::is_forbidden_context_char_for_fuzz`.
+#[cfg(feature = "fuzz-api")]
+#[doc(hidden)]
+pub fn is_forbidden_context_char_for_fuzz(ch: char) -> bool {
+    is_forbidden_context_char(ch)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,

@@ -97,6 +97,14 @@ dev-state-override = []
 # addresses (loopback/NAT) so a daemon can be tested against a locally emulated
 # peer. For testing/dev only; production builds must NOT enable it.
 dev-udp-loopback = []
+# fuzz-api: the `fuzz/` targets at the repository root drive the shipped entry
+# points (`PairingInfo::parse`, `EncryptedPacket::decode`, `sanitize_context_string`).
+# Two of the predicates those targets assert against are crate-private, and nothing
+# may become public in a shipped configuration, so this feature adds one
+# `#[doc(hidden)]` one-line delegate beside each (`is_forbidden_context_char_for_fuzz`,
+# `datagram_within_size_cap_for_fuzz`). No other crate and no packaging build enables
+# it: `fuzz/` is excluded from the workspace and is the only dependent.
+fuzz-api = []
 
 # `#[cfg(kani)]` is how the in-file Kani harnesses (pairing/negotiation.rs,
 # pairing/fields.rs) gate themselves. Kani sets that cfg; no other build does, so it

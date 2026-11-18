@@ -4,18 +4,36 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.util.Base64
 import android.util.Log
+import java.io.IOException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Repository for managing paired devices Stores device information in encrypted SharedPreferences
+ * Repository for managing paired devices.
+ *
+ * The store is a `MODE_PRIVATE` `SharedPreferences` file (`tapauth_devices`) holding the paired
+ * devices, CSK included, as plain JSON. It is not encrypted: what keeps it from other apps is the
+ * app sandbox (`MODE_PRIVATE` means only this UID can open the file), not the Keystore, so anything
+ * that can read the app's data directory reads the CSKs.
  */
 class DeviceRepository(context: Context) {
 
     private val prefs: SharedPreferences =
         context.getSharedPreferences("tapauth_devices", Context.MODE_PRIVATE)
+
+    /**
+     * The one durable write of the paired-device list.
+     *
+     * `commit()` and not `apply()`: the synchronous call is the one that answers *whether* the data
+     * reached the disk, and that answer is what a pairing has to know before it tells the desktop
+     * it succeeded. [PairedDeviceWrite] turns a rejected write into an error instead of a silent
+     * no-op.
+     */
+    private val write: PairedDeviceWrite = PairedDeviceWrite { json ->
+        prefs.edit().putString(KEY_DEVICES, json).commit()
+    }
 
     companion object {
         private const val KEY_DEVICES = "paired_devices"
@@ -47,6 +65,20 @@ class DeviceRepository(context: Context) {
         }
     }
 
+    /**
+     * Persist [device], or fail.
+     *
+     * The write is durable before this returns, and a write that did **not** become durable is an
+     * error rather than a silent success: this used to call `commit()` and drop its answer, so a
+     * rejected write left no device row on the phone while the desktop went on to persist its
+     * `PairedServer`. That split is the worst of the two states — the desktop believes it is
+     * paired, every authentication it sends fails on the phone, and the user was told the pairing
+     * succeeded. A throw reaches `PairingSession.runSession`, which reports it as
+     * [dev.rourunisen.tapauth.network.PairingUpdate.Failed] with
+     * [PairedDeviceWrite.UNSAVED_MESSAGE], before any `PairingConfirmServer` is sent.
+     *
+     * @throws IOException when the write was rejected, so nothing was persisted
+     */
     suspend fun savePairedDevice(device: PairedDevice) =
         withContext(Dispatchers.IO) {
             val devices = getAllPairedDevices().toMutableList()
@@ -56,7 +88,7 @@ class DeviceRepository(context: Context) {
             val json = JSONArray()
             devices.forEach { json.put(deviceToJson(it)) }
 
-            prefs.edit().putString(KEY_DEVICES, json.toString()).commit()
+            write.write(json.toString())
             notifyListeners()
         }
 
@@ -177,6 +209,47 @@ class DeviceRepository(context: Context) {
             signatureAlgorithm = json.optInt("signatureAlgorithm", 1),
             protocolVersion = json.optInt("protocolVersion", 1),
         )
+    }
+}
+
+/**
+ * One durable write of the paired-device list, with the failure made explicit.
+ *
+ * `SharedPreferences.commit()` returns whether the data reached the disk; `apply()` cannot answer
+ * that, and neither can a `commit()` whose result is dropped. [DeviceRepository.savePairedDevice]
+ * used to do the latter, which is how a failed write produced no device row while `PairingSession`
+ * went on to confirm the pairing to the desktop — a phone the desktop believes is paired and a CSK
+ * the phone does not have. The write is therefore a class with one job, and the `(String) ->
+ * Boolean` it takes is the commit itself, so the answer cannot be discarded at the call site: an
+ * `apply()` cannot be passed here at all.
+ *
+ * The commit is injected rather than reached through Android's `SharedPreferences`, which is a stub
+ * in the JVM unit tests (`unitTests.isReturnDefaultValues`): this is the one decision of the
+ * persist path that is worth a test, and it is the one that was missing.
+ */
+internal class PairedDeviceWrite(private val commit: (String) -> Boolean) {
+
+    companion object {
+        /**
+         * What the user is told when the pairing could not be saved.
+         *
+         * Rendered by the pairing screen itself: the throw reaches `PairingSession.runSession`,
+         * which emits `PairingUpdate.Failed(message)`, and `PairingScreen`'s failure view draws
+         * that message. (The host's `onPairingFailed` callback is a no-op today, so the rendering
+         * is the whole of the delivery — do not count on the callback.) It is written as a sentence
+         * and a next step, not as a code, for that reason.
+         */
+        const val UNSAVED_MESSAGE =
+            "Could not save the paired device on this phone. Nothing was paired — try again."
+    }
+
+    /**
+     * Write [json], or fail.
+     *
+     * @throws IOException when the write did not become durable; nothing is persisted in that case
+     */
+    fun write(json: String) {
+        if (!commit(json)) throw IOException(UNSAVED_MESSAGE)
     }
 }
 

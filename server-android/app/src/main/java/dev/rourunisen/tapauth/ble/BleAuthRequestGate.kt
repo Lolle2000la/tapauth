@@ -17,18 +17,33 @@ import java.util.concurrent.ConcurrentHashMap
  * replay check and is rejected there exactly as before.
  *
  * "In flight" means: the challenge was accepted for processing from that peer and no repeat of it
- * has to be re-examined yet. An entry is released when the Client abandons the challenge
+ * has to be re-examined yet. An entry is concluded when the Client abandons the challenge
  * ([conclude] — a verified `AuthenticationCancel` from the peer, or the daemon's own cancel of that
- * challenge), when its GATT link has stayed away past the reconnection grace ([concludePeer],
- * driven by the grace timer `BleGattService` starts on `STATE_DISCONNECTED` — deliberately *not* by
- * the disconnect itself), when the service stops ([clear]), and — for a link that never reports its
- * teardown — once it is older than [IN_FLIGHT_MAX_AGE_MS].
+ * challenge), when the service stops ([clear]), and — for a link that never reports its teardown —
+ * once it is older than [IN_FLIGHT_MAX_AGE_MS]. The disconnect grace does *not* conclude an entry:
+ * it releases the peer's claims for a retry ([releaseForRetry], driven by the grace timer
+ * `BleGattService` starts on `STATE_DISCONNECTED` — deliberately *not* by the disconnect itself).
  *
- * A disconnect is therefore not a release: the Client reconnects to deliver the request it is still
- * retransmitting, and that reconnect presents the same challenge from the same peer on a new GATT
- * handle. With the claim held that arrival is a silent [Verdict.DUPLICATE_IN_FLIGHT] and the prompt
- * the user is answering survives; releasing it on the disconnect would send the arrival to the
- * replay cache, which reports the retransmitted challenge as a replay and tears the new link down.
+ * A disconnect is therefore not a release either: the Client reconnects to deliver the request it
+ * is still retransmitting, and that reconnect presents the same challenge from the same peer on a
+ * new GATT handle. With the claim held that arrival is a [Decision.Duplicate] and the prompt the
+ * user is answering survives; concluding it on the disconnect would send the arrival to the replay
+ * cache, which reports the retransmitted challenge as a replay and tears the new link down.
+ *
+ * There are two flavours of that duplicate, and the `releasedForRetry` mark separates them. A claim
+ * the grace has not released answers a repeat silently while its prompt is open, or re-delivers the
+ * answer already held for it when the Client lost the link the answer was written to. A claim
+ * released at a past grace expiry has no prompt left to answer, so the service answers its repeat
+ * with a fresh prompt instead ([retryStarted] consumes the mark, so exactly one retry follows each
+ * release) — in both cases without the replay cache ever being consulted.
+ *
+ * The release covers a claim whose prompt was *answered* too, because "answered" would only ever
+ * mean the grant or denial was built: the bytes can be recorded for an answer the user gave while
+ * the link was down and then fail to write on the handle that was already dead. A Client that
+ * retransmits after the grace is a Client that did not get the verdict, so its challenge is
+ * released for a retry like an unanswered one, and the completed approval is not thrown away on top
+ * of what would otherwise be a permanent outage. Nothing but [conclude], [clear] and
+ * [IN_FLIGHT_MAX_AGE_MS] concludes a challenge.
  *
  * A concluded challenge is deliberately *not* released at the moment the grant, denial or timeout
  * is sent, and [BleGattService]'s `releaseLock` call sites say so. The Client keeps retransmitting
@@ -50,7 +65,10 @@ import java.util.concurrent.ConcurrentHashMap
  *    because that is the order the service ran the two in; nothing is admitted to [inFlight] and
  *    the replay cache is never asked.
  * 2. [Decision.Duplicate] — same peer, same challenge, still in flight. Answered *before* the
- *    replay cache, which is the whole point: its answer for those bytes is "replay".
+ *    replay cache, which is the whole point: its answer for those bytes is "replay". What the
+ *    service does with it is [BleDisconnectGrace]'s question — a re-delivery when an answer is
+ *    held, silence while the prompt is open, or a fresh prompt when the claim was released for a
+ *    retry.
  * 3. [Decision.Replay] — the cache rejected the request. A different peer holding the same bytes
  *    lands here, which is what keeps a captured request from being replayed from another phone.
  * 4. [Decision.Process] — fresh; the caller raises the prompt.
@@ -70,7 +88,10 @@ internal class BleAuthRequestGate(
         /** Another transport owns this challenge: drop the link without touching anything here. */
         data object Claimed : Decision()
 
-        /** Same peer, same challenge, still in flight: ignore without touching the replay cache. */
+        /**
+         * Same peer, same challenge, still in flight: the service answers it — a re-delivery or a
+         * fresh prompt — and the replay cache is never asked.
+         */
         data object Duplicate : Decision()
 
         /** The replay cache rejected the request: reject and disconnect exactly as before. */
@@ -80,7 +101,15 @@ internal class BleAuthRequestGate(
         data object Process : Decision()
     }
 
-    private class InFlight(val peerAddress: String, val startedAtMillis: Long)
+    private class InFlight(val peerAddress: String, val startedAtMillis: Long) {
+
+        /**
+         * The disconnect grace released this claim for a retry. The claim stays, so the challenge
+         * never reaches the replay cache; the flag only says the prompt behind it is gone and the
+         * next arrival has to raise a new one.
+         */
+        @Volatile var releasedForRetry: Boolean = false
+    }
 
     private val inFlight = ConcurrentHashMap<String, InFlight>()
 
@@ -141,17 +170,44 @@ internal class BleAuthRequestGate(
     }
 
     /**
-     * Forget everything in flight for [peerAddress], whose link is gone for good.
+     * Handle the end of the disconnect grace for [peerAddress], whose link is gone.
      *
-     * Called at the end of the reconnection grace that `BleGattService` starts when a link drops,
-     * and only if the device did not come back: until then the claim has to survive, because the
-     * reconnect that carries the Client's retransmission of the same request arrives as a duplicate
-     * from the same peer. Once the grace has passed the request is treated as concluded — the same
-     * destination a grant, denial or timeout eventually reaches — so no claim outlives its link.
+     * Every claim that peer holds is marked released for a retry, and none is removed — including
+     * one whose prompt the user already answered. An answer being *built* is not the Client
+     * receiving it: the write fails on the handle the link died under, so the verdict can be lost
+     * while the claim looks concluded. A Client that retransmits after the grace is a Client that
+     * did not get the verdict, so its challenge has to stay away from the replay cache — whose
+     * "replay" answer disconnects the fresh link — and the arriving copy raises a fresh prompt
+     * instead. The reconnect is scan-driven and routinely outlasts this grace ([BleDisconnectGrace]
+     * documents the bound).
+     *
+     * Only a verified `AuthenticationCancel` (and the daemon's own cancel) concludes a challenge
+     * outright ([conclude]).
      */
-    fun concludePeer(peerAddress: String) {
-        inFlight.entries.removeIf { it.value.peerAddress == peerAddress }
+    fun releaseForRetry(peerAddress: String) {
+        inFlight.forEach { (_, entry) ->
+            if (entry.peerAddress == peerAddress) entry.releasedForRetry = true
+        }
     }
+
+    /** Whether [challenge]'s claim was released for a retry, i.e. its next arrival re-prompts. */
+    fun wasReleasedForRetry(challenge: ByteArray): Boolean =
+        inFlight[challenge.toHex()]?.releasedForRetry ?: false
+
+    /**
+     * Consume [challenge]'s released mark: the retry it announced is being raised now, so exactly
+     * one fresh prompt follows each release.
+     */
+    fun retryStarted(challenge: ByteArray) {
+        inFlight[challenge.toHex()]?.releasedForRetry = false
+    }
+
+    /**
+     * Whether any challenge is still claimed for [peerAddress]; the disconnect grace's `claimHeld`
+     * input.
+     */
+    fun holdsClaimFor(peerAddress: String): Boolean =
+        inFlight.values.any { it.peerAddress == peerAddress }
 
     /** Forget every entry; the service is going away. */
     fun clear() {

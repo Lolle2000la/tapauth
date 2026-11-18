@@ -177,6 +177,16 @@ internal class BleResponseHandoff<H : Any>(
         pending.entries.removeIf { it.value.peerAddress == peerAddress }
     }
 
+    /**
+     * Whether an answer is held for [challengeKey] on [peerAddress]'s behalf.
+     *
+     * The duplicate-in-flight decision needs this to tell an open prompt from one that was already
+     * answered: a release drops the prompt while the claim stays for a retry, and only the second
+     * case may raise a new prompt instead of writing the held bytes again.
+     */
+    fun holdsAnswerFor(challengeKey: String, peerAddress: String): Boolean =
+        pending[challengeKey]?.peerAddress == peerAddress
+
     /** Drop every answer; the service is going away. */
     fun clear() {
         pending.clear()

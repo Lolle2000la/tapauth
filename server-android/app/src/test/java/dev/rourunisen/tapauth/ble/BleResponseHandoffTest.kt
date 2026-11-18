@@ -133,6 +133,45 @@ class BleResponseHandoffTest {
         assertEquals(0, handoff.pendingCount)
     }
 
+    /**
+     * The question the duplicate decision asks to tell an open prompt from an answered one: is an
+     * answer held for this challenge, for this peer?
+     *
+     * Answering `true` for another peer would hand a released claim the wrong verdict — a challenge
+     * released for a retry would resolve to a re-delivery, which is a no-op with nothing held, and
+     * the retry the whole release exists for would never be raised.
+     */
+    @Test
+    fun holdsAnswerForIsTrueOnlyForThePeerTheAnswerWasRecordedFor() {
+        handoff.record(challengeKey, peer, deadHandle, deadHandle, response)
+
+        assertTrue(handoff.holdsAnswerFor(challengeKey, peer))
+        assertFalse(
+            "another device's answer is not this peer's",
+            handoff.holdsAnswerFor(challengeKey, otherPeer),
+        )
+        // Asking about it retires nothing: the record is still there and still re-deliverable.
+        assertEquals(1, handoff.pendingCount)
+        assertNotNull(handoff.redeliverOn(challengeKey, peer, liveHandle))
+    }
+
+    /**
+     * A `true` here for a challenge nothing was recorded for would make every released claim look
+     * answered: the duplicate resolves to a re-delivery instead of a retry, and the released
+     * challenge is silently swallowed with every other test in the suite green.
+     */
+    @Test
+    fun holdsAnswerForIsFalseForAChallengeWithNoAnswer() {
+        assertFalse(handoff.holdsAnswerFor(challengeKey, peer))
+
+        handoff.record(challengeKey, peer, deadHandle, deadHandle, response)
+        assertFalse(
+            "a challenge nobody answered holds nothing",
+            handoff.holdsAnswerFor("0d0e0f", peer),
+        )
+        assertEquals(1, handoff.pendingCount)
+    }
+
     @Test
     fun confirmedDeliveryIsRetiredAndNoLongerRedelivered() {
         val delivery = handoff.record(challengeKey, peer, deadHandle, deadHandle, response)
