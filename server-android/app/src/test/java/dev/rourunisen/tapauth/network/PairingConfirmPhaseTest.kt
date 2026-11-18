@@ -2,6 +2,7 @@ package dev.rourunisen.tapauth.network
 
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -80,9 +81,9 @@ class PairingConfirmPhaseTest {
             return confirmation
         }
 
-        override fun processConfirmClient(packet: ByteArray): ByteArray? {
+        override fun isConfirmClient(packet: ByteArray): Boolean {
             decrypted += packet
-            return if (packet.contentEquals(confirmClient)) packet else null
+            return packet.contentEquals(confirmClient)
         }
 
         override fun conclude() {
@@ -170,7 +171,7 @@ class PairingConfirmPhaseTest {
                     beginCommit = { true },
                 )
 
-        assertEquals("The persisted device must be returned", "paired-device", device)
+        assertEquals("The persisted device must be returned", "paired-device", device?.persisted)
         assertEquals("The device must be persisted exactly once", 1, persists)
         assertEquals(1, link.sends.size)
         assertSame("Foreign frames must not be answered", CONFIRMATION, link.sends.single())
@@ -456,5 +457,108 @@ class PairingConfirmPhaseTest {
         assertEquals("The refused phase must report nothing persisted", null, device)
         assertEquals("The linger must not run", 0L, clock.now)
         assertEquals("The session must still be concluded", 1, crypto.concludeCount)
+    }
+
+    /**
+     * A transport that rejects every `PairingConfirmServer` write is reported as **undelivered**,
+     * not as a successful pairing: the record is kept, so this phone is paired and the desktop is
+     * not — the split the UI used to announce as "Pairing Successful!".
+     *
+     * The defect this catches: an outcome that only carries the persisted device (what the code
+     * reported before), which cannot distinguish "the desktop has the proof" from "the desktop will
+     * time out retrying into a closed socket".
+     */
+    @Test
+    fun aRejectedBurstIsReportedAsUndelivered() = runBlocking {
+        val clock = FakeClock()
+        val log = mutableListOf<String>()
+        val crypto = FakeCrypto(CONFIRMATION, CONFIRM_CLIENT, log)
+        var attempts = 0
+        val link =
+            object : PairingLink {
+                override suspend fun send(packet: ByteArray): Boolean {
+                    attempts += 1
+                    return false
+                }
+
+                override suspend fun receive(timeoutMs: Long): ByteArray? {
+                    clock.advance(timeoutMs)
+                    return null
+                }
+
+                override fun close() = Unit
+            }
+
+        val result =
+            phase(clock, crypto, belongsToSession = { true })
+                .finish(
+                    link = link,
+                    csk = CSK,
+                    burstDelaysMs = listOf(0L, 100L, 150L),
+                    persist = { "paired-device" },
+                    beginCommit = { true },
+                )
+
+        assertEquals("The device record must still be reported", "paired-device", result?.persisted)
+        assertFalse(
+            "Every write was rejected, so the proof was not delivered",
+            result!!.proofDelivered,
+        )
+        assertEquals(
+            "Every frame of the three-send burst must be attempted, not abandoned on the first " +
+                "failure",
+            3,
+            attempts,
+        )
+        assertEquals("The session must still be concluded", 1, crypto.concludeCount)
+    }
+
+    /**
+     * A burst whose writes are all rejected but whose *retransmission* answer lands is delivered:
+     * the desktop re-sends `PairingConfirmClient` verbatim and a later answer is the same proof, so
+     * delivery is monotone over the whole confirmation.
+     *
+     * The defect this catches: `proofDelivered` computed from the first send only (a plausible
+     * reading of "did the burst go out"), which would tell the user the desktop was never told
+     * although it received the proof during the linger.
+     */
+    @Test
+    fun aRetransmissionThatLandsCountsAsDelivery() = runBlocking {
+        val clock = FakeClock()
+        val log = mutableListOf<String>()
+        val crypto = FakeCrypto(CONFIRMATION, CONFIRM_CLIENT, log)
+        val link =
+            object : PairingLink {
+                var sends = 0
+
+                // The burst write is rejected; the answer to the retransmission at 400 ms is not.
+                override suspend fun send(packet: ByteArray): Boolean {
+                    sends += 1
+                    return sends > 1
+                }
+
+                override suspend fun receive(timeoutMs: Long): ByteArray? {
+                    clock.advance(timeoutMs)
+                    return if (clock.now == 400L) CONFIRM_CLIENT else null
+                }
+
+                override fun close() = Unit
+            }
+
+        val result =
+            phase(clock, crypto, belongsToSession = { true })
+                .finish(
+                    link = link,
+                    csk = CSK,
+                    burstDelaysMs = listOf(0L),
+                    persist = { "paired-device" },
+                    beginCommit = { true },
+                )
+
+        assertTrue(
+            "The retransmission was answered, so the desktop received the proof",
+            result!!.proofDelivered,
+        )
+        assertEquals("The device must be persisted exactly once", "paired-device", result.persisted)
     }
 }

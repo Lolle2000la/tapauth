@@ -4,7 +4,6 @@ import android.content.Context
 import android.os.Build
 import android.util.Log
 import dev.rourunisen.tapauth.crypto.PairingSession as CryptoPairingSession
-import dev.rourunisen.tapauth.crypto.ParsedPairingProvision
 import dev.rourunisen.tapauth.crypto.ParsedPairingResponse
 import dev.rourunisen.tapauth.crypto.TapauthException
 import dev.rourunisen.tapauth.crypto.deriveBlePairingAdvId
@@ -44,7 +43,16 @@ sealed class PairingUpdate {
 
     data class Confirming(val transport: PairingTransport) : PairingUpdate()
 
-    data class Complete(val device: PairedDevice) : PairingUpdate()
+    /**
+     * The pairing is over and the device record is written.
+     *
+     * [proofDelivered] is the other half of the outcome, and the UI needs it: the record is
+     * persisted before the `PairingConfirmServer` burst, so a transport that rejected every send
+     * leaves this phone paired and the desktop unpaired. `true` means the desktop was told; `false`
+     * means it was not, and the desktop will time out retrying while this phone has a device record
+     * — a state the user has to be told about rather than congratulated on.
+     */
+    data class Complete(val device: PairedDevice, val proofDelivered: Boolean) : PairingUpdate()
 
     /** User-facing reason; safe to render as-is. */
     data class Failed(val message: String) : PairingUpdate()
@@ -202,8 +210,10 @@ class PairingSession(
                     buildConfirmation = { csk -> requireSession().createConfirmServer(csk) },
                     // Reuses this session's own decrypt path (and its "not a confirm client"
                     // handling), so the retransmission predicate and `awaitProvision` cannot
-                    // disagree about a frame.
-                    decryptConfirmation = { packet -> processConfirmClient(packet)?.csk },
+                    // disagree about a frame. Only "did this decrypt" is asked, and a Boolean is
+                    // all it answers: the transient the decrypt produces is cleared here, so no
+                    // plaintext CSK is left on the heap per retransmission.
+                    decryptIsConfirmClient = ::isConfirmClient,
                     concludeSession = { synchronized(sessionLock) { pairingSession }?.conclude() },
                 ),
             frameReader = frameReader,
@@ -372,7 +382,8 @@ class PairingSession(
             emit(PairingUpdate.Confirming(locked.transport))
 
             when (val outcome = awaitProvision(locked)) {
-                is ProvisionOutcome.Completed -> emit(PairingUpdate.Complete(outcome.device))
+                is ProvisionOutcome.Completed ->
+                    emit(PairingUpdate.Complete(outcome.device, outcome.proofDelivered))
                 is ProvisionOutcome.Aborted -> emitFailure(REMOTE_ABORT_MESSAGE)
                 is ProvisionOutcome.TimedOut ->
                     emitFailure("The desktop did not finish pairing in time")
@@ -700,11 +711,14 @@ class PairingSession(
      *
      * The AEAD AAD is `"tapauth-pair-v2-provision" || H` built inside the session, so Kotlin cannot
      * get it wrong and cannot be tricked into reusing the wrong transcript.
+     *
+     * The generated record Rust returns is converted here and nowhere else: it has no redacting
+     * `toString()`, so the [PairingProvision] it becomes is the only form that may be handed on.
      */
-    private fun processConfirmClient(packet: ByteArray): ParsedPairingProvision? {
+    private fun processConfirmClient(packet: ByteArray): PairingProvision? {
         val session = synchronized(sessionLock) { pairingSession } ?: return null
         return try {
-            session.processConfirmClient(packet)
+            PairingProvision.from(session.processConfirmClient(packet))
         } catch (e: TapauthException.Security) {
             Log.d(TAG, "Not a decryptable PairingConfirmClient: ${e.rawMessage()}")
             null
@@ -717,30 +731,60 @@ class PairingSession(
         }
     }
 
+    /**
+     * Whether [packet] is a `PairingConfirmClient` of this session.
+     *
+     * The linger's retransmission predicate, and the only caller of [processConfirmClient] that
+     * does not want the plaintext: it answers a Boolean so the transient the decrypt produces is
+     * cleared here instead of being handed on. A frame that decrypts is a retransmission to answer;
+     * anything else — a keepalive, an abort, a duplicate of the already-consumed payload, a foreign
+     * frame — is not.
+     */
+    private fun isConfirmClient(packet: ByteArray): Boolean {
+        val provision = processConfirmClient(packet) ?: return false
+        provision.zeroize()
+        return true
+    }
+
     /** Persist the device, confirm to the desktop, and report completion. */
     private suspend fun finishPairing(
         locked: Locked,
-        provision: ParsedPairingProvision,
-    ): ProvisionOutcome =
-        lifecycle
-            .finish(
-                phase = confirmPhase,
-                link = locked.link,
-                csk = provision.csk,
-                burstDelaysMs =
-                    when (locked.transport) {
-                        PairingTransport.UDP -> UDP_CONFIRM_BURST_DELAYS_MS
-                        PairingTransport.BLE -> BLE_CONFIRM_BURST_DELAYS_MS
-                    },
-                // The commit boundary (and the zeroization after the linger) is the lifecycle's:
-                // it hands the phase its own `beginCommit`/`isClosed`, so a close that already won
-                // refuses the persist outright and a close during the confirmation is deferred.
-                persist = { persistDevice(locked.response, provision) },
-            )
-            // A close reached the boundary first, so nothing was persisted and nothing was sent.
-            // `Cancelled` is what every other "the session was released" path in this class reports
-            // (`awaitApproval`, `awaitProvision`), so the UI treats it the same.
-            ?.let { ProvisionOutcome.Completed(it) } ?: ProvisionOutcome.Cancelled
+        provision: PairingProvision,
+    ): ProvisionOutcome {
+        // Two buffers hold the CSK here and both are dead once `finish` returns: this copy, which
+        // builds the completion proof (the proof bytes are then cached and re-sent verbatim), and
+        // the transient inside `provision`, which the device record is copied out of by
+        // `persist`. So both are cleared in the `finally` below — after those two readers, never
+        // before one — and the record keeps working because it owns a different array. See
+        // [PairingProvision].
+        val csk = provision.copyCsk()
+        return try {
+            lifecycle
+                .finish(
+                    phase = confirmPhase,
+                    link = locked.link,
+                    csk = csk,
+                    burstDelaysMs =
+                        when (locked.transport) {
+                            PairingTransport.UDP -> UDP_CONFIRM_BURST_DELAYS_MS
+                            PairingTransport.BLE -> BLE_CONFIRM_BURST_DELAYS_MS
+                        },
+                    // The commit boundary (and the zeroization after the linger) is the
+                    // lifecycle's: it hands the phase its own `beginCommit`/`isClosed`, so a close
+                    // that already won refuses the persist outright and a close during the
+                    // confirmation is deferred.
+                    persist = { persistDevice(locked.response, provision) },
+                )
+                // A close reached the boundary first, so nothing was persisted and nothing was
+                // sent. `Cancelled` is what every other "the session was released" path in this
+                // class reports (`awaitApproval`, `awaitProvision`), so the UI treats it the same.
+                ?.let { ProvisionOutcome.Completed(it.persisted, it.proofDelivered) }
+                ?: ProvisionOutcome.Cancelled
+        } finally {
+            csk.fill(0)
+            provision.zeroize()
+        }
+    }
 
     /** The live Rust pairing session, or an error explaining that a release won the race. */
     private fun requireSession(): CryptoPairingSession =
@@ -759,7 +803,7 @@ class PairingSession(
      */
     private suspend fun persistDevice(
         response: ParsedPairingResponse,
-        provision: ParsedPairingProvision,
+        provision: PairingProvision,
     ): PairedDevice {
         val deviceId = response.clientEd25519PublicKey.toHex()
         val existing = runCatching { deviceRepository.getPairedDevice(deviceId) }.getOrNull()
@@ -778,7 +822,11 @@ class PairingSession(
             PairedDevice(
                 deviceId = deviceId,
                 publicKey = response.clientEd25519PublicKey,
-                csk = provision.csk,
+                // A copy, not the transient: this record is read on every later authentication
+                // (temporal identifiers, the BLE advertisement index, the AEAD), while the
+                // transient is cleared as soon as the confirmation is over. See
+                // [PairingProvision].
+                csk = provision.copyCsk(),
                 displayName = displayName,
                 pairedAt = System.currentTimeMillis(),
                 allowedUsers = allowedUsers,
@@ -969,7 +1017,12 @@ class PairingSession(
     }
 
     private sealed class ProvisionOutcome {
-        data class Completed(val device: PairedDevice) : ProvisionOutcome()
+        /**
+         * The device record is written. [proofDelivered] says whether the desktop was told, which
+         * is a separate fact: the burst can fail on every send.
+         */
+        data class Completed(val device: PairedDevice, val proofDelivered: Boolean) :
+            ProvisionOutcome()
 
         /** A verified `PairingAbort` from the desktop. */
         data object Aborted : ProvisionOutcome()
@@ -1035,6 +1088,16 @@ internal class PairingFrameReader(
  * asked of it — the slice of the confirmation linger included.
  */
 internal interface PairingLink {
+    /**
+     * Write one frame, reporting whether the transport took it.
+     *
+     * `true` means a write the transport did not reject; `false` means no write is known to have
+     * been accepted — no socket, no port, no target, every send throwing, or a write that timed
+     * out. Neither is "the peer received it": neither transport acknowledges a pairing write, so a
+     * caller that reports delivery is reporting the transport's answer, not the desktop's.
+     *
+     * @return true when the transport did not reject the frame
+     */
     suspend fun send(packet: ByteArray): Boolean
 
     suspend fun receive(timeoutMs: Long): ByteArray?
@@ -1045,11 +1108,10 @@ internal interface PairingLink {
 private class UdpPairingLink(private val client: PairingClient) : PairingLink {
     suspend fun open() = withContext(Dispatchers.IO) { client.open() }
 
+    // The socket's own answer, not a hopeful `true`: `PairingClient.send` is what knows that an
+    // unbound socket, a missing QR port or a rejected datagram means the frame went nowhere.
     override suspend fun send(packet: ByteArray): Boolean =
-        withContext(Dispatchers.IO) {
-            client.send(packet)
-            true
-        }
+        withContext(Dispatchers.IO) { client.send(packet) }
 
     override suspend fun receive(timeoutMs: Long): ByteArray? = client.receive(timeoutMs)
 

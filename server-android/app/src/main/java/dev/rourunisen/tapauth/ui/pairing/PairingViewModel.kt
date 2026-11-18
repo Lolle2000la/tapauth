@@ -191,25 +191,35 @@ class PairingViewModel(
         abort()
     }
 
-    /** Record that the screen went away, for the reason in [reason]. */
-    fun leave(reason: PairingExit) {
+    /**
+     * Record that the screen went away, for the reason in [reason].
+     *
+     * @return true when the screen must stay attached: the pairing's confirmation is still in
+     *   flight (the device record is written and the `PairingConfirmServer` burst and linger have
+     *   not finished), so the outcome the user is waiting for has not been reported yet. Leaving
+     *   now would drop it — [outcomes] has no replay, by design — and the pairing would complete
+     *   headlessly: the user sees neither "paired" nor a failure. It is bounded by the confirmation
+     *   (burst + linger), after which the session reports and the screen leaves normally.
+     */
+    fun leave(reason: PairingExit): Boolean {
         when (reason) {
             // The composition went away but the ViewModel did not: the session keeps running and
             // the desktop is left waiting for the user, not for a packet.
-            PairingExit.ScreenDisposed -> return
+            PairingExit.ScreenDisposed -> return false
             PairingExit.UserRequested -> Unit
         }
-        if (exitRequested) return
+        if (exitRequested) return false
         exitRequested = true
         if (_update.value is PairingUpdate.AwaitingSas) {
             // Leaving an unanswered SAS is the rejection the protocol describes. Closing the
             // session instead would leave the desktop waiting out its own deadline.
             abort()
-        } else {
-            // Nothing was keyed yet (or the attempt is over), so there is nothing to tell the
-            // desktop: release the transports and let the screen go.
-            releaseSession()
+            return false
         }
+        // Nothing was keyed yet (or the attempt is over), so there is nothing to tell the desktop:
+        // release the transports and let the screen go. A deferred release means the confirmation
+        // is still running and its outcome has a listener only if the screen stays.
+        return releaseSession() == CloseOutcome.Deferred
     }
 
     /**
@@ -273,16 +283,26 @@ class PairingViewModel(
         abortRequested = session?.rejectSas() == true
     }
 
-    private fun releaseSession() {
-        if (sessionClosed) return
+    /**
+     * Release the current attempt's session, if it has not been released yet.
+     *
+     * @return the session's answer — [CloseOutcome.Deferred] when the pairing confirmation is still
+     *   in flight and will report its own outcome later, [CloseOutcome.Released] when this call
+     *   released everything — or null when this attempt was already released, so there is nothing
+     *   left to wait for
+     */
+    private fun releaseSession(): CloseOutcome? {
+        if (sessionClosed) return null
         sessionClosed = true
         // A deferred close means the confirmation is still in flight: the device record is written
         // but the burst and linger that tell the desktop have not finished, so cancelling the
         // attempt scope here would cut them and leave the phone paired with a desktop that timed
         // out. The session bounds that itself and releases when it ends — after which a close
         // releases normally instead of deferring again.
-        if (session?.close() != CloseOutcome.Deferred) attemptScope?.cancel()
+        val outcome = session?.close()
+        if (outcome != CloseOutcome.Deferred) attemptScope?.cancel()
         attemptScope = null
+        return outcome
     }
 
     companion object {

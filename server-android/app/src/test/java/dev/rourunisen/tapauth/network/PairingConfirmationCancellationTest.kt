@@ -88,7 +88,7 @@ class PairingConfirmationCancellationTest {
             return CONFIRMATION
         }
 
-        override fun processConfirmClient(packet: ByteArray): ByteArray? = null
+        override fun isConfirmClient(packet: ByteArray): Boolean = false
 
         override fun conclude() {
             concludeCount++

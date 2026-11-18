@@ -47,8 +47,9 @@ class PairingClient(private val pairingUrl: PairingUrl) {
     /**
      * The socket [open] bound, or null before [open] and after [close].
      *
-     * Exposed so a test can observe the binding itself: [send] is best-effort and swallows a
-     * failure, so it cannot tell an open socket from a missing one.
+     * Exposed so a test can observe the binding itself: [send]'s answer says whether a datagram was
+     * handed to a target, which is not the same as proving *which* socket bound *which* port — a
+     * send that fails on every target answers the same as an unbound one.
      */
     internal val boundSocket: DatagramSocket?
         get() = socket
@@ -95,20 +96,29 @@ class PairingClient(private val pairingUrl: PairingUrl) {
     /**
      * Send one serialized `PairingPacket` to every reachable QR endpoint at the QR's port.
      *
-     * Best effort: a send failure to one address never stops the others, and a closed socket is a
-     * no-op. Call off the main thread.
+     * Best effort in the *other* direction: a send failure to one address never stops the others.
+     *
+     * @return whether the transport accepted the datagram — true when at least one target's `send`
+     *   returned without throwing, false when there is no bound socket, no QR port, no resolved
+     *   target, or every target's send failed. This is the only delivery signal a UDP pairing has:
+     *   there is no acknowledgement, so `true` means "handed to the socket", not "the desktop got
+     *   it". It answers `false` for the states that make a send a no-op, which is what lets the
+     *   completion report an undelivered proof instead of a silent success.
      */
-    fun send(packetBytes: ByteArray) {
-        val bound = socket ?: return
-        val port = pairingUrl.port ?: return
+    fun send(packetBytes: ByteArray): Boolean {
+        val bound = socket ?: return false
+        val port = pairingUrl.port ?: return false
+        var sent = false
         for (target in targets) {
             val datagram = DatagramPacket(packetBytes, packetBytes.size, target, port)
             try {
                 bound.send(datagram)
+                sent = true
             } catch (e: IOException) {
                 Log.d(TAG, "Sending ${packetBytes.size} B to $target:$port failed: ${e.message}")
             }
         }
+        return sent
     }
 
     /**

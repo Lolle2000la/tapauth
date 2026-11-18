@@ -23,6 +23,7 @@
     <string name="pairing_finalizing">Finalizing pairing…</string>
     <string name="pairing_success">Pairing Successful!</string>
     <string name="pairing_success_message">Your device is now paired and ready for authentication</string>
+    <string name="pairing_proof_undelivered">This phone saved the pairing, but it could not confirm that your computer received it, so your computer may not be paired. If it is not paired, remove the device here and pair again.</string>
     <string name="pairing_failed">Pairing Failed</string>
     <string name="pairing_user_cancelled">User cancelled</string>
     <string name="pairing_no_ip">No IP address available</string>

@@ -46,11 +46,22 @@ class TemporalIdCache(
      */
     @Volatile private var devicesLoaded = false
 
-    private data class CachedDevice(
+    /**
+     * One paired device, reduced to what the temporal-identifier computation needs.
+     *
+     * [csk] is the key itself, so [toString] is hand-written and redacts it: the compiler's derived
+     * form would print the bytes through `java.util.Arrays.toString` as `csk=[12, 255, …]`. Nothing
+     * logs this class today, and the override is what keeps a future log line from being the leak.
+     * `internal` rather than `private` so a JVM unit test can pin that rendering.
+     */
+    internal data class CachedDevice(
         val deviceId: String,
         val csk: ByteArray,
         val hashAlgorithm: Int,
-    )
+    ) {
+        override fun toString(): String =
+            "CachedDevice(deviceId=$deviceId, csk=<redacted>, hashAlgorithm=$hashAlgorithm)"
+    }
 
     /**
      * Stable instance, so [stop] can unregister exactly this observer: the device-change registry

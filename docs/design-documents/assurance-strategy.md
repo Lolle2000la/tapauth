@@ -150,20 +150,24 @@ No harness in §1–§4 says **anything** about:
   (`SharedProtocolLiteralsTest`), the shared vector corpora it re-reads
   (`ContextSanitizerTest`, `PairingUrlTest`) and one cancellation test
   (`PairingConfirmationCancellationTest`). That covers the *copied* logic and the
-  commit/cancel interleaving; it says nothing about Kotlin's own crypto, its JNI
-  boundary, or the derived `toString()` on data classes (see §6).
+  commit/cancel interleaving; it says nothing about Kotlin's own crypto or its JNI
+  boundary. The derived `toString()` on data classes (see §6) is closed for the two
+  CSK carriers — both overrides are hand-written and pinned by
+  `PairedDeviceRedactionTest` and `CachedDeviceRedactionTest` — and remains open for
+  `ServerKeypair`, whose `privateKey` a derived `toString()` still prints.
 
 ***
 
 ## 6. Backlog, and what this branch closes
 
-Named and unfixed:
+Named and unfixed, except the two CSK rows, which this branch closes — for those two
+the third column records how, rather than why they were left:
 
-| Gap | Where | Why it is left |
+| Gap | Where | Why it is left / how it was closed |
 | :--- | :--- | :--- |
 | `the_negotiated_symmetric_algorithm_reaches_the_aead` has **no code site** — the assertion exists only as a recorded intention | `shared/src/crypto/encryption.rs` (`test_aead_roundtrip` passes `alg` in rather than exercising a dispatch); register on `SUPPORTED_SYMMETRIC_ALGORITHMS` in `shared/src/protocol/pairing/negotiation.rs` | Vacuous with one primitive per slot: both sides of every comparison are the literal `1`. It comes back with a second suite (see `cryptography-specification.md` §1.4). |
-| A paired device's `toString()` prints the CSK, not an identity hash | `ParsedPairingProvision` (`shared/src/ffi.rs:158`, whose Kotlin form is the generated `data class` at `server-android/app/build/generated/uniffi/dev/rourunisen/tapauth/crypto/shared.kt:2091`) and `PairedDevice` (`server-android/app/src/main/java/dev/rourunisen/tapauth/data/Models.kt:200`). Neither has a `toString()` override, and the Kotlin compiler's derived one renders a `ByteArray` field through `java.util.Arrays.toString`, so `csk=[12, 255, …]` is the key itself rather than `[B@…` | Rust's hand-written `Debug` redacts the CSK (`shared/src/ffi.rs:167`) but cannot influence the Kotlin side. The fix is Kotlin-side — an override on `PairedDevice` and a holder for the generated record, or not exposing the CSK as a record field at all — so the rule is "Kotlin must not log either record" until then. No call site logs them today, so it is latent. |
-| Kotlin's copy of the provisioned CSK is never cleared | `server-android/app/src/main/java/dev/rourunisen/tapauth/network/PairingSession.kt:781` hands `provision.csk` into `PairedDevice` by reference (no copy), and `zeroizeEphemeralState` (`:882`) clears only `initPacket` and `acceptedResponsePacket` (`:894`, `:896`); nothing under `server-android/app/src/main` fills the CSK, which lives on as a base64 string (`data/DeviceRepository.kt:137`) | Rust zeroizes the decrypted payload and its own `Zeroizing` copy (`shared/src/ffi/ops.rs:729`, `:173`) and cannot reach the Kotlin `ByteArray` that `to_vec()` (`shared/src/ffi.rs:216`) produced. A clear after `savePairedDevice` (`PairingSession.kt:790`) has to leave the live `PairedDevice` intact — it holds that same array, and every later authentication reads it — so the fix needs an ownership decision (copy at persist, wrapper, or clearing on device removal) rather than a `fill(0)` beside the save. |
+| A paired device's `toString()` printed the CSK, not an identity hash | `ParsedPairingProvision` (`shared/src/ffi.rs`, whose Kotlin form is the generated `data class` in `server-android/app/build/generated/uniffi/`) and `PairedDevice` (`server-android/app/src/main/java/dev/rourunisen/tapauth/data/Models.kt:420`) | **Closed in this branch, Kotlin-side, because only Kotlin could be reached.** The generated record is no longer held at all: `PairingProvision.from` (`server-android/app/src/main/java/dev/rourunisen/tapauth/network/PairingProvision.kt`) is its single reader — it takes the CSK array, drops the record, and redacts in its own `toString()` — and both CSK carriers have a hand-written `toString()`: `PairedDevice` (device id plus an 8-byte hex prefix of the public key, `csk=<redacted>`) and `TemporalIdCache.CachedDevice` (`service/TemporalIdCache.kt:62`). Pinned by `PairedDeviceRedactionTest`, `CachedDeviceRedactionTest` and `PairingProvisionTest`. This is a redaction of the carriers, not of the whole class: `ServerKeypair`'s `privateKey` (`data/KeypairRepository.kt:23`) is still a live same-class instance whose derived `toString()` prints it, so the rule for that one remains "do not log it". |
+| Kotlin's copy of the provisioned CSK was never cleared | `server-android/app/src/main/java/dev/rourunisen/tapauth/network/PairingSession.kt` — the device record used to receive `provision.csk` by reference, and `zeroizeEphemeralState` only ever cleared the packets | **Closed by the ownership decision the row asked for: copy at persist.** The record now gets its own array (`csk = provision.copyCsk()`, in `persistDevice`) and `finishPairing` clears both dead buffers in its `finally` — the provision's transient (`provision.zeroize()`) and the proof-only copy (`csk.fill(0)`), taken by `finishPairing` from `provision.copyCsk()` — which is safe precisely because the copy is a different array from the one the live `PairedDevice` reads on every later authentication. `PairingProvision.copyCsk()` refuses after `zeroize()`, and the two rejected alternatives (hand the transient over by reference; clear only on device removal) are written into the `PairingProvision` KDoc so neither is re-simplified into. Pinned by `PairingProvisionTest.theDurableCopyIsNotTheTransientAndSurvivesItsClearing` and `aClearedTransientCannotBeCopiedAgain`. |
 | The 500 ms verdict-reuse window is an **assumption**, not a property | `VERDICT_REUSE_WINDOW`, `client-pam/src/conclusion_cache.rs:43` | The `(username, PAM service)` key cannot distinguish a host's duplicate `pam_authenticate` from an independent authentication for the same user and service inside 500 ms. Bounded by a human-initiated retry taking seconds, but not enforceable. |
 | The per-attempt `nonce_cache` is **unbounded in what a CSK holder sends** | `wait_for_response`, `tapauthd/src/auth_handler.rs` | Since the insert moved behind the AEAD check, nothing an unauthenticated host sends is retained — but every *distinct authenticated* frame is, one entry of `temporal_identifier ++ ciphertext` (≤ 16 KiB, the framing cap) each, for the life of the attempt (`get_session_timeout`, 120 s): ~1.4 GB at line rate from a device holding the CSK, which can already mint authentic frames. Capping the set would evict entries and make a replay acceptable again, and keying it on a digest is a separate change; both trade the replay guarantee for the memory bound, so neither belongs in this fix. Shape measured, not alleged: entries = distinct authenticated frames per attempt, ≤ 16 KiB each, dropped with the attempt. |
 
@@ -172,8 +176,9 @@ interface cache or the nonce cache.
 
 ### Fixed in this PR
 
-Two defects the audit named are closed, each by a commit that lands **after** this
-record (named by subject, not shown by SHA):
+Four defects are closed, each by a commit that lands **after** this record (named by
+subject, not shown by SHA): the first two the audit named, the last two are the
+branch's own.
 
 * **`fix(net): a malformed datagram must not conclude an authentication attempt`** —
   an attempt now concludes only on a verified response from an authorised server, on
@@ -218,3 +223,37 @@ record (named by subject, not shown by SHA):
   now applies the same post-authentication limiter as UDP, keyed on the authenticated
   client public key, so a hammering client is throttled and one client's key cannot
   throttle another's.
+* **`feat(android): report a pairing only when it was saved and delivered`** — the phone
+  wrote the device record, ignored whether that write and the `PairingConfirmServer` burst
+  actually took, and announced success. The write now goes through `PairedDeviceWrite`,
+  which throws `IOException(UNSAVED_MESSAGE)` when `commit()` answers false and does it
+  before any listener fires, so a rejected write cannot leave a pairing that looks saved;
+  and the confirmation returns `persisted` and `proofDelivered` as two separate facts that
+  are carried to the screen, which renders an undelivered proof as the failure view
+  (`pairing_proof_undelivered`) instead of a success notice. A back press inside the
+  commit window now keeps the screen attached to receive that outcome, and a second back
+  press leaves.
+  **What that bounds, and what it does not** — `proofDelivered` records a write the
+  transport did not reject: `false` when there is no socket or no port, or when every
+  target's `send` threw; `true` otherwise. Until the link reported that per send, it could
+  not: `PairingClient.send` returned nothing and `UdpPairingLink.send` answered `true`
+  unconditionally, so on the default UDP transport the flag was a constant and the
+  undelivered branch was unreachable. It is still **not** evidence that the desktop
+  received the proof: a datagram lost after `send` returned cleanly reads as delivered,
+  and the desktop's own 500 ms retransmissions are the only redundancy on that leg. There
+  is no retry, and none was added, so the flag narrows what the phone *claims*; it does
+  not close the gap between "sent" and "arrived".
+* **`fix(android): read the QR's ip4/ip6 as IP literals`** — `PairingInfo::parse` already
+  refused anything `std::net::Ipv4Addr`/`Ipv6Addr` would not parse, but Kotlin's
+  `PairingUrl.parse` kept `ip4`/`ip6` as opaque text, so a QR naming a hostname, a zone
+  id, a bracketed form or an out-of-range octet was accepted on the phone and refused on
+  the desktop. Kotlin now applies the same accept set (`canonicalIpv4`/`canonicalIpv6`, a
+  hand-written mirror rather than `java.net.InetAddress`, which resolves hostnames) and
+  canonicalises each address to the text Rust's `Display` produces, so one address
+  written in any accepted spelling yields one value on both sides. The shared corpus grew
+  41 → 49 cases, with the count asserted on each side (`shared/src/models.rs:757`,
+  `PairingUrlTest.kt:442`).
+  **What that bounds** — which QRs exist, not what the transport does with them: this is
+  the URL grammar, and a `PairingUrl` built by any other path can still name an endpoint
+  that does not resolve, which is why `open()` reports that instead of being unreachable
+  by construction.
