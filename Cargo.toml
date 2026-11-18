@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
 members = ["shared", "client-pam", "client-config-gui", "tapauthd"]
+# `fuzz/` is a `cargo-fuzz` crate with its own `[workspace]` table: it needs nightly
+# and `-Zsanitizer`, which the shipped workspace must never require. Excluding it here
+# makes it not a workspace member, so `cargo build/test/clippy --workspace` (and their
+# `--all-targets` forms) never compile a fuzz target; its own `fuzz/Cargo.lock` pins its
+# dependencies. (The root lock mentions `libfuzzer-sys` regardless — via `rav1e`.)
+exclude = ["fuzz"]
 
 [workspace.dependencies]
 # Shared library (used by all consuming crates)

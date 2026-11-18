@@ -1,0 +1,51 @@
+[package]
+name = "shared-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace root, and the other half of the repository's `exclude = ["fuzz"]`
+# (`../Cargo.toml`). Excluding it there keeps `cargo build/test/clippy --workspace`
+# from ever compiling a fuzz target; this table is what makes `cargo` run inside this
+# directory stop walking up to the parent manifest. Both halves are needed: without the
+# exclusion the parent tries to own this package, without this table cargo refuses to
+# build it here.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# `shared`'s own protobuf runtime (0.14, `[workspace.dependencies]`), so the decode
+# target calls the same `EncryptedPacket::decode` the daemon calls.
+prost = "0.14"
+hex = "0.4"
+
+# `fuzz-api` adds two `#[doc(hidden)]` one-line delegates to crate-private predicates
+# (`is_forbidden_context_char`, `datagram_within_size_cap`) so these targets assert
+# against the shipped predicates instead of a re-transcription. Nothing else enables it.
+[dependencies.shared]
+path = "../shared"
+features = ["fuzz-api"]
+
+[[bin]]
+name = "pairing_url"
+path = "fuzz_targets/pairing_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "packet_decode"
+path = "fuzz_targets/packet_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "context_sanitizer"
+path = "fuzz_targets/context_sanitizer.rs"
+test = false
+doc = false
+bench = false

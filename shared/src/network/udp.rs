@@ -26,6 +26,25 @@ use crate::protocol::pb::EncryptedPacket;
 
 const MAX_UDP_MESSAGE_SIZE: usize = 16 * 1024; // 16KB, matches TCP pairing path
 
+/// Whether a received datagram is small enough to hand to `EncryptedPacket::decode`.
+///
+/// The one spelling of the cap: the receive loop below gates on it before decoding, so
+/// the largest thing a peer can make this process decode is `MAX_UDP_MESSAGE_SIZE`.
+/// Crate-visible rather than public — the `fuzz/` target reaches it through
+/// `datagram_within_size_cap_for_fuzz` (`fuzz-api`).
+pub(crate) fn datagram_within_size_cap(len: usize) -> bool {
+    len <= MAX_UDP_MESSAGE_SIZE
+}
+
+/// `fuzz-api` only: [`datagram_within_size_cap`], so the packet-decode target's domain
+/// is the set of datagrams this receive path would actually decode. Uncompiled in every
+/// other configuration.
+#[cfg(feature = "fuzz-api")]
+#[doc(hidden)]
+pub fn datagram_within_size_cap_for_fuzz(len: usize) -> bool {
+    datagram_within_size_cap(len)
+}
+
 /// How often the aggregate "dropped a datagram" warning may fire.
 ///
 /// The receive port is reachable by every host on the link, so the rate of
@@ -672,7 +691,7 @@ pub async fn receive_udp_packet(
                 "buffer length mismatch",
             ))
         })?;
-        if packet_bytes.len() > MAX_UDP_MESSAGE_SIZE {
+        if !datagram_within_size_cap(packet_bytes.len()) {
             record_dropped_datagram(
                 "larger than the maximum datagram size",
                 addr,
@@ -799,6 +818,113 @@ mod tests {
             // Every returned interface carries at least one usable address.
             assert!(iface.ipv4.is_some() || iface.ipv6.is_some());
         }
+    }
+
+    /// Both halves of the read-then-write handoff must compare the address, and
+    /// each defect is only visible on the path it lives on.
+    ///
+    /// A refresh whose result is written but then compared against a stale local
+    /// (what a "don't hold the lock across a syscall" refactor produces) answers
+    /// `false` for every non-loopback address on the one call that takes the
+    /// write path: the local it compares was read before the refresh ran, so on a
+    /// cold cache it is empty and nothing is local. That call is therefore the
+    /// first one made here, and the address it asks about is a host interface
+    /// address, whose right answer is `true` — only a stale snapshot says
+    /// otherwise. A `false`-answering address there would be vacuous: a stale
+    /// snapshot answers `false` for that too, and so does a correct cache.
+    ///
+    /// A membership test replaced by a non-emptiness check answers `true` for
+    /// every address. On the fast read path the documentation address catches it
+    /// while the cache is warm; on the write path only an expired cache reaches
+    /// the comparison, so the documentation address is asserted again after the
+    /// cache has been forced stale (by writing `last_refresh` back, not by
+    /// sleeping) — that call re-enumerates a set it has just found non-empty, and
+    /// must still answer `false`.
+    ///
+    /// Both preconditions are asserted rather than assumed: the cold half fails
+    /// loudly if a test earlier in this binary already initialised the cache, and
+    /// the expired half sets `last_refresh` itself so no concurrent refresh can
+    /// turn it into a fast-path call.
+    ///
+    /// The two defects point in opposite directions, which is why the host's own
+    /// address and the documentation address are both asserted on the write path
+    /// instead of one standing in for the other.
+    #[test]
+    fn an_interface_address_is_local_and_a_documentation_address_is_not() {
+        // Loopback returns before the cache is even initialised, so this holds on
+        // any host and warms nothing.
+        assert!(is_local_ip(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(is_local_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+
+        // Enumerated before the cache is touched: the assertions below need the
+        // host's addresses in hand while the cache is still cold.
+        let mut local: Vec<(String, IpAddr)> = Vec::new();
+        for iface in get_multicast_interfaces() {
+            for addr in [iface.ipv4.map(IpAddr::V4), iface.ipv6.map(IpAddr::V6)]
+                .into_iter()
+                .flatten()
+            {
+                local.push((iface.name.clone(), addr));
+            }
+        }
+
+        if local.is_empty() {
+            // No non-loopback interface on this host, so the refresh path has
+            // no address to be right about and only the loopback half applies.
+            return;
+        }
+
+        // The cold half only discriminates on a genuinely uninitialised cache:
+        // `is_local_ip` mutates a process-wide static that every lib test in this
+        // binary shares, so a test that called it first would leave the cache
+        // warm and silently downgrade the assertion below to a warm one.
+        assert!(
+            INTERFACE_ADDR_CACHE.get().is_none(),
+            "INTERFACE_ADDR_CACHE is already initialised, so the cold assertion below would \
+             be answered from a warm cache and prove nothing"
+        );
+
+        // The first cache-touching call answers `true`. On a cold cache it goes
+        // through the write path, whose comparison is the one a stale snapshot
+        // gets wrong.
+        let (name, addr) = &local[0];
+        assert!(
+            is_local_ip(addr),
+            "{addr} is assigned to {name} but the cold cache said it is not local"
+        );
+
+        // Every other host address, now on the warm fast path.
+        for (name, addr) in &local[1..] {
+            assert!(
+                is_local_ip(addr),
+                "{addr} is assigned to {name} but is_local_ip said it is not local"
+            );
+        }
+
+        // TEST-NET-3 (RFC 5737) is reserved for documentation and belongs to no
+        // interface. A host that really used it would fail here, and that is the
+        // only assumption these assertions make.
+        let documentation = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        assert!(
+            !is_local_ip(&documentation),
+            "the warm cache answered true for an address no interface carries"
+        );
+
+        // Force the cache stale deterministically rather than sleeping out the
+        // TTL: a concurrent refresh landing inside such a window would leave the
+        // cache warm and send this call down the fast path, skipping the
+        // write-path comparison without failing.
+        {
+            let cache = INTERFACE_ADDR_CACHE
+                .get()
+                .expect("the assertions above initialised the cache");
+            let mut guard = cache.write().expect("the cache lock is not poisoned");
+            guard.last_refresh = Instant::now() - INTERFACE_CACHE_TTL * 2;
+        }
+        assert!(
+            !is_local_ip(&documentation),
+            "the expired cache answered true for an address no interface carries"
+        );
     }
 
     #[test]
