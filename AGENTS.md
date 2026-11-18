@@ -13,7 +13,7 @@
 
 ## Workspace & Build Commands
 
-### Rust crates (workspace members)
+### Rust crates (workspace members plus the fuzz crate)
 ```
 shared/          # lib (cdylib + rlib), build.rs generates protobuf
 client-pam/      # cdylib -> installed as pam_tapauth.so
@@ -22,7 +22,7 @@ tapauthd/        # bin, the systemd daemon
 fuzz/            # cargo-fuzz crate (nightly) - excluded from the workspace, `exclude = ["fuzz"]`
 ```
 
-That list is the workspace; `fuzz/` is not a member and nothing here builds it (its own
+The first four are the workspace; `fuzz/` is not a member and nothing here builds it (its own
 `fuzz/Cargo.lock` pins its dependencies).
 
 ### Exact CI commands (verified)

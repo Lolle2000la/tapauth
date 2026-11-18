@@ -836,9 +836,15 @@ mod tests {
     /// A membership test replaced by a non-emptiness check answers `true` for
     /// every address. On the fast read path the documentation address catches it
     /// while the cache is warm; on the write path only an expired cache reaches
-    /// the comparison, so the documentation address is asserted again once the
-    /// TTL has run out — that call re-enumerates a set it has just found
-    /// non-empty, and must still answer `false`.
+    /// the comparison, so the documentation address is asserted again after the
+    /// cache has been forced stale (by writing `last_refresh` back, not by
+    /// sleeping) — that call re-enumerates a set it has just found non-empty, and
+    /// must still answer `false`.
+    ///
+    /// Both preconditions are asserted rather than assumed: the cold half fails
+    /// loudly if a test earlier in this binary already initialised the cache, and
+    /// the expired half sets `last_refresh` itself so no concurrent refresh can
+    /// turn it into a fast-path call.
     ///
     /// The two defects point in opposite directions, which is why the host's own
     /// address and the documentation address are both asserted on the write path
@@ -868,6 +874,16 @@ mod tests {
             return;
         }
 
+        // The cold half only discriminates on a genuinely uninitialised cache:
+        // `is_local_ip` mutates a process-wide static that every lib test in this
+        // binary shares, so a test that called it first would leave the cache
+        // warm and silently downgrade the assertion below to a warm one.
+        assert!(
+            INTERFACE_ADDR_CACHE.get().is_none(),
+            "INTERFACE_ADDR_CACHE is already initialised, so the cold assertion below would \
+             be answered from a warm cache and prove nothing"
+        );
+
         // The first cache-touching call answers `true`. On a cold cache it goes
         // through the write path, whose comparison is the one a stale snapshot
         // gets wrong.
@@ -894,10 +910,17 @@ mod tests {
             "the warm cache answered true for an address no interface carries"
         );
 
-        // Let the cache go stale the way it does in production: this call takes
-        // the write path, refreshes a set it has just found non-empty, and must
-        // still answer `false`.
-        std::thread::sleep(INTERFACE_CACHE_TTL + Duration::from_millis(50));
+        // Force the cache stale deterministically rather than sleeping out the
+        // TTL: a concurrent refresh landing inside such a window would leave the
+        // cache warm and send this call down the fast path, skipping the
+        // write-path comparison without failing.
+        {
+            let cache = INTERFACE_ADDR_CACHE
+                .get()
+                .expect("the assertions above initialised the cache");
+            let mut guard = cache.write().expect("the cache lock is not poisoned");
+            guard.last_refresh = Instant::now() - INTERFACE_CACHE_TTL * 2;
+        }
         assert!(
             !is_local_ip(&documentation),
             "the expired cache answered true for an address no interface carries"
