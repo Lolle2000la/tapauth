@@ -112,7 +112,7 @@ Pairing runs over the same two transports as authentication — there is no TCP 
 2. Desktop fires simultaneous discovery on UDP and BLE.
 3. First responding transport wins; `tapauthd` cleans up the competing transport without duplicate grant conflicts. Either winner is a pass by design, so the phase does not assert which one won — only that one was named.
 4. Both transports must have **participated**, asserted separately so a failure names the half that did not: the daemon registered the BLE advertisement for the session (`BLE advertising started`, `tapauthd/src/transport/ble.rs:671`) and sent the request to the IPv4 discovery group (`Sent IPv4 multicast on …`, `shared/src/network/udp.rs:461`). A daemon that serves the race over one transport while the other silently does nothing fails here.
-5. The phone raised **exactly one** prompt for the request, counted from logcat rather than inferred from timing: `AuthRequestManager.submitRequest` logs the caller-context line once per prompt it raises, and the phase's per-request `pam_service` token makes that count specific to this phase. Two prompts would mean the daemon opened a session per transport; the phone itself only collapses *the same challenge* arriving on both transports (`TransportLockManager.tryClaimTransport`).
+5. The phone raised **no more than one prompt per challenge** for the request, grouped from logcat rather than inferred from timing: the phase's per-request `pam_service` token scopes the window to this request (`AuthRequestManager.submitRequest` logs the caller-context line once per submission), and each prompt's `challenge=` prefix is the grouping key — the same key the phone's transport lock claims on (`TransportLockManager.tryClaimTransport`), so a challenge reached over both transports is one prompt. Two prompts for one challenge mean the daemon opened a session per transport. Two prompts for two challenges are a legitimate retry (the phase retries by design) and pass; a window with no prompt at all, or with a prompt line that no longer carries `challenge=`, fails rather than passing vacuously. `TAPAUTH_E2E_SELFTEST=race-prompts` exercises all of those cases on synthetic dumps without a device.
 
 ### Phase 5: Explicit User Denial
 1. Authentication requested while auto-grant helper is paused.
@@ -234,7 +234,9 @@ assert about the transports are logged below the level the daemon otherwise runs
 decode drop. Every other module keeps its level, so no other phase's log volume or assertions change. In
 systemd mode the directive must go on `TAPAUTH_JOURNALD_LOG_LEVEL`, not on `RUST_LOG`: under systemd the
 daemon installs only the journald layer and keys it off that variable
-(`tapauthd/src/logging.rs:40-51`).
+(`tapauthd/src/logging.rs:40-51`). A malformed value cannot abort the daemon: both variables are parsed with
+`EnvFilter::try_new(...)` and fall back to a plain `info` filter, so the worst case is that the trace lines
+go missing and the phases fail on absent evidence (`tapauthd/src/logging.rs:19-20`, `:44-45`).
 
 Other CI steps that back this suite:
 - `./gradlew test` runs the Android JVM unit tests (§3) without an emulator.

@@ -304,6 +304,89 @@ finish_suite() {
     fi
 }
 
+# ── One prompt per challenge (Phase 4) ───────────────────────────────────────
+#
+# Phase 4 exists to prove the daemon does not open one auth session per
+# transport for the same challenge. The phone is the only place that shows
+# this, and it logs one line per prompt it raises:
+#
+#   Posting auth notification (id=…) for … @ user@host, challenge=<16 hex>…
+#   (server-android/.../service/AuthRequestManager.kt:400-409)
+#
+# The `challenge=` prefix is the grouping key, and it is the right one because
+# it is the key the product itself collapses on: the phone answers a challenge
+# it has already claimed on the other transport with "already claimed by …"
+# (TransportLockManager.tryClaimTransport, :39-46, :72), so one prompt per
+# challenge is exactly the property "one session per request" reduces to.
+#
+# The assertion is one prompt PER CHALLENGE, not one prompt in the window.
+# Phase 4 retries by design (authenticate_with_ble_retry, BLE_MAX_ATTEMPTS), and
+# a retry is a new request with a new challenge that may legitimately prompt
+# again; failing on that count would replace a real gap with an intermittent,
+# required CI failure. What must never happen is two prompt lines for the SAME
+# challenge. The residual is deliberate and worth naming: a defect that minted a
+# *fresh* challenge per transport would look like a retry here, because the
+# phone cannot tell the two apart. That shape is what the daemon's one-session
+# design rules out (a session owns its nonce and fans it out over both
+# transports), and it is not what this check claims to catch.
+#
+# Scope is the lines from the first `Auth request caller context:` line carrying
+# this phase's per-phase token onwards (:167-169). The token is what ties the
+# phone's lines to *this* phase — no earlier phase's line carries it — and
+# everything before it belongs to an earlier phase. That cut is load bearing:
+# the BLE disconnect-grace path deliberately re-raises a *released* challenge
+# on the retransmission that finally arrives (AGENTS.md, Transport Details), so
+# a same-challenge duplicate in Phase 3 is correct behaviour and must not be
+# charged to Phase 4. The cost of the cut is that a logcat rotation which drops
+# the caller-context line entirely is reported as "cannot attribute", never as
+# a pass.
+#
+# Defined here, before the self-test below, so `TAPAUTH_E2E_SELFTEST=race-prompts`
+# can exercise it on synthetic dumps; the suite proper calls it from Phase 4.
+race_prompt_check() {
+    local token=$1 dump=$2 start challenges prompts distinct duplicates dup
+    start=$(printf '%s\n' "$dump" | grep -nF "pamService=${token}," | head -n1 | cut -d: -f1 || true)
+    if [ -z "$start" ]; then
+        echo "❌ ERROR: the phone logged no caller-context line for this request ('pamService=${token},'),"
+        echo "   so no prompt can be attributed to this phase."
+        echo "---- caller-context lines in the phone log ----"
+        printf '%s\n' "$dump" | grep -F 'caller context' || true
+        return 1
+    fi
+
+    challenges=$(printf '%s\n' "$dump" | awk -v start="$start" '
+        NR < start { next }
+        /Posting auth notification/ {
+            if (match($0, /challenge=[0-9a-f]+/)) print substr($0, RSTART + 10, RLENGTH - 10)
+        }')
+    if [ -z "$challenges" ]; then
+        echo "❌ ERROR: no 'Posting auth notification … challenge=…' line in the phone log belongs to this"
+        echo "   request, so 'one prompt per challenge' would hold vacuously. The phone either never"
+        echo "   prompted, or its prompt line no longer carries the challenge= field this groups on."
+        echo "---- prompt lines in the phone log ----"
+        printf '%s\n' "$dump" | grep -F 'auth notification' || true
+        return 1
+    fi
+
+    prompts=$(printf '%s\n' "$challenges" | grep -c . || true)
+    distinct=$(printf '%s\n' "$challenges" | sort -u | grep -c . || true)
+    duplicates=$(printf '%s\n' "$challenges" | sort | uniq -d || true)
+    if [ -n "$duplicates" ]; then
+        dup=$(printf '%s\n' "$duplicates" | head -n1)
+        echo "❌ ERROR: the phone raised more than one prompt for the same challenge (${dup})."
+        echo "   That is what a per-transport session looks like from the phone: the daemon opened a"
+        echo "   session per transport and handed the phone two requests for one challenge."
+        echo "---- every prompt line carrying challenge=${dup} ----"
+        printf '%s\n' "$dump" | grep -F 'Posting auth notification' | grep -F "challenge=${dup}" || true
+        echo "---- prompts for this request, per challenge ----"
+        printf '%s\n' "$challenges" | sort | uniq -c | sed 's/^/  /'
+        return 1
+    fi
+
+    echo "✅ One prompt per challenge on the phone for this request (${prompts} prompt(s) across ${distinct} challenge(s); more than one challenge is a legitimate retry)."
+    return 0
+}
+
 # ── Registry self-test (dry run; needs no device, daemon or emulator) ────────
 #
 # Only entered when TAPAUTH_E2E_SELFTEST is set; the normal path ignores it
@@ -319,6 +402,12 @@ finish_suite() {
 #     Run a stub phase body that records a `pass` and then fails. The script must
 #     abort with the failing command's status: recording an outcome must not
 #     swallow a failure through a helper's return value.
+#
+#   TAPAUTH_E2E_SELFTEST=race-prompts
+#     Run race_prompt_check (above) on synthetic phone dumps: one prompt for one
+#     challenge, two prompts for two challenges (a legitimate retry), two prompts
+#     for the SAME challenge, no prompt at all, and an earlier phase's
+#     same-challenge duplicate. The first two must pass, the last three must fail.
 #
 # Placed before cleanup() is trapped and before any environment is touched, so a
 # dry run cannot alter the host.
@@ -430,8 +519,76 @@ case "${TAPAUTH_E2E_SELFTEST:-}" in
         echo "❌ REGISTRY SELF-TEST FAILED: a phase body that failed did not abort the script."
         exit 99
         ;;
+    race-prompts)
+        # Synthetic logcat lines. The shape is the phone's own: one caller-context
+        # line per submitRequest, then one "Posting auth notification" line per
+        # prompt, with the challenge in its first 16 hex characters. Each dump is
+        # built with rp_dump so the lines stay separate lines — `$(...)` strips
+        # only the trailing newline, and a fixture that collapsed into one line
+        # would satisfy every case below for the wrong reason.
+        RP_SCOPE='D AuthRequestManager: Auth request caller context: pamService=e2e-ctx-race, processName=e2e-ctx-proc-race, commandPreview=/tmp/x pam-auth u 30 t'
+        RP_OTHER_SCOPE='D AuthRequestManager: Auth request caller context: pamService=e2e-ctx-ble, processName=e2e-ctx-proc-ble, commandPreview=/tmp/y pam-auth u 30 t'
+        rp_dump() {
+            local line
+            for line in "$@"; do printf '%s\n' "$line"; done
+        }
+        rp_prompt() {
+            printf 'D AuthRequestManager: Posting auth notification (id=1) for dev @ u@h, challenge=%s...' "$1"
+        }
+        rp_check() {
+            local want=$1 label=$2 dump=$3 got=0
+            set +e
+            race_prompt_check "e2e-ctx-race" "$dump" >/dev/null 2>&1
+            got=$?
+            set -e
+            if [ "$want" = "pass" ] && [ "$got" -ne 0 ]; then
+                echo "❌ REGISTRY SELF-TEST FAILED: ${label} was rejected (status ${got})."
+                race_prompt_check "e2e-ctx-race" "$dump" || true
+                exit 1
+            fi
+            if [ "$want" = "fail" ] && [ "$got" -eq 0 ]; then
+                echo "❌ REGISTRY SELF-TEST FAILED: ${label} was accepted; the assertion cannot fail."
+                exit 1
+            fi
+            echo "✅ race_prompt_check: ${label} → ${want} (status ${got})"
+        }
+
+        # 1. One prompt for one challenge: the healthy race.
+        rp_check pass "one prompt for one challenge" \
+            "$(rp_dump "$RP_SCOPE" "$(rp_prompt aaaaaaaaaaaaaaaa)")"
+        # 2. Two prompts for two different challenges: a legitimate retry, which
+        #    the old "exactly one prompt in the window" assertion failed on.
+        rp_check pass "two prompts for two challenges (retry)" \
+            "$(rp_dump "$RP_SCOPE" "$(rp_prompt aaaaaaaaaaaaaaaa)" \
+                "$RP_SCOPE" "$(rp_prompt bbbbbbbbbbbbbbbb)")"
+        # 3. Two prompts for the SAME challenge: a per-transport session.
+        rp_check fail "two prompts for the same challenge" \
+            "$(rp_dump "$RP_SCOPE" "$(rp_prompt aaaaaaaaaaaaaaaa)" "$(rp_prompt aaaaaaaaaaaaaaaa)")"
+        # 4. No prompt at all in this phase's window.
+        rp_check fail "no prompt in this phase's window" "$(rp_dump "$RP_SCOPE")"
+        # 5. An earlier phase's same-challenge duplicate (the BLE grace
+        #    re-prompt) is outside this phase's window and must not be charged
+        #    to it; this phase's own single prompt still passes.
+        rp_check pass "earlier phase's same-challenge duplicate stays out of scope" \
+            "$(rp_dump "$RP_OTHER_SCOPE" "$(rp_prompt cccccccccccccccc)" \
+                "$(rp_prompt cccccccccccccccc)" "$RP_SCOPE" "$(rp_prompt dddddddddddddddd)")"
+        # 6. ...and a prompt with no challenge= field anywhere in scope proves
+        #    nothing, so it fails rather than passing vacuously.
+        rp_check fail "prompt line without a challenge= field" \
+            "$(rp_dump "$RP_SCOPE" 'D AuthRequestManager: Posting auth notification (id=1) for dev @ u@h')"
+
+        # The failure has to NAME the offending challenge, or a real regression
+        # and a test artefact look the same in the CI log.
+        RP_DUP_OUT=$( { race_prompt_check "e2e-ctx-race" \
+            "$(rp_dump "$RP_SCOPE" "$(rp_prompt aaaaaaaaaaaaaaaa)" "$(rp_prompt aaaaaaaaaaaaaaaa)")"; } 2>&1 || true)
+        printf '%s\n' "$RP_DUP_OUT" | grep -qF "same challenge (aaaaaaaaaaaaaaaa)" \
+            || { echo "❌ REGISTRY SELF-TEST FAILED: the duplicate-challenge failure does not name the challenge."; exit 1; }
+        echo "✅ race_prompt_check: the duplicate-challenge failure names the offending challenge."
+        echo "✅ PROMPT-GROUPING SELF-TEST PASSED: 3 accepted (single, retry, earlier-phase duplicate), 3 rejected (same-challenge duplicate, no prompt, no challenge= field)."
+        exit 0
+        ;;
     *)
-        echo "❌ ERROR: unknown TAPAUTH_E2E_SELFTEST value '$TAPAUTH_E2E_SELFTEST' (expected summary|fail-after-record)" >&2
+        echo "❌ ERROR: unknown TAPAUTH_E2E_SELFTEST value '$TAPAUTH_E2E_SELFTEST' (expected summary|fail-after-record|race-prompts)" >&2
         exit 2
         ;;
 esac
@@ -2984,31 +3141,20 @@ if authenticate_with_ble_retry "Parallel Discovery Race Authentication" "$CTX_CL
     assert_log_since "$LOG_BASE" "Sent IPv4 multicast on" \
         "Daemon sent the request to the IPv4 discovery group over UDP (UDP participated in the race)"
 
-    # ...and the phone must have been asked exactly once for this request: the
-    # daemon opening one session per transport (two challenges) would ring it
-    # twice, and the phone only collapses *the same challenge* seen on both
-    # transports (TransportLockManager.tryClaimTransport,
-    # server-android/.../service/TransportLockManager.kt:38-79). The dump is
-    # grepped whole rather than through a line-offset window, for the reason the
-    # Phase 2 caller-context helpers give: the logcat ring buffer can rotate
-    # between taking a mark and checking it.
+    # ...and the phone must have been asked once per *challenge* for this
+    # request: the daemon opening one session per transport would hand the phone
+    # two requests for one challenge, which is what race_prompt_check groups on
+    # (see its comment above). A retry is a new request with a new challenge, and
+    # is deliberately not a failure. The dump is grepped whole rather than
+    # through a line-offset window, for the reason the Phase 2 caller-context
+    # helpers give: the logcat ring buffer can rotate between taking a mark and
+    # checking it.
     RACE_DUMP=$(adb logcat -d 2>/dev/null || true)
-    RACE_PROMPTS=$(grep -cF "pamService=${CTX_SERVICE}," <<< "$RACE_DUMP" || true)
-    RACE_PROMPTS=${RACE_PROMPTS:-0}
-    if [ "$RACE_PROMPTS" -ne 1 ]; then
-        echo "❌ ERROR: expected exactly one prompt on the phone for this request, saw ${RACE_PROMPTS}."
-        echo "   Two prompts for one request mean the daemon opened a session per transport. A second"
-        echo "   prompt carrying the SAME challenge instead means a released-challenge re-prompt"
-        echo "   after a BLE disconnect (the BleDisconnectGrace path), not a duplicate request."
-        echo "---- prompts carrying this phase's caller-context token ----"
-        grep -F "pamService=${CTX_SERVICE}," <<< "$RACE_DUMP" || true
-        echo "---- every prompt the phone logged (compare the challenge= prefixes) ----"
-        grep -F 'Posting auth notification' <<< "$RACE_DUMP" || true
+    if ! race_prompt_check "$CTX_SERVICE" "$RACE_DUMP"; then
         exit 1
     fi
-    echo "✅ Exactly one prompt was raised on the phone for this request."
     echo "✅ Parallel Discovery Race Authentication PASSED!"
-    phase_pass "4" "with both transports live pam-auth returned OUTCOME=SUCCESS, the daemon registered the BLE advertisement and sent the request to the IPv4 multicast group (both transports participated, winner ${GRANT_TRANSPORT}), and the phone raised exactly one prompt for the request"
+    phase_pass "4" "with both transports live pam-auth returned OUTCOME=SUCCESS, the daemon registered the BLE advertisement and sent the request to the IPv4 multicast group (both transports participated, winner ${GRANT_TRANSPORT}), and the phone raised no more than one prompt per challenge for the request"
 else
     echo "❌ Parallel Discovery Race Authentication FAILED after ${BLE_MAX_ATTEMPTS} attempts."
     if [ -f "$DAEMON_LOG" ]; then
