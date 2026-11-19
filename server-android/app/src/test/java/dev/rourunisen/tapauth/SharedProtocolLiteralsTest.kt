@@ -1,5 +1,6 @@
 package dev.rourunisen.tapauth
 
+import dev.rourunisen.tapauth.ble.BleAuthRequestGate
 import dev.rourunisen.tapauth.ble.BleGattService
 import dev.rourunisen.tapauth.data.AppConfiguration
 import dev.rourunisen.tapauth.network.BlePairingClient
@@ -197,6 +198,31 @@ class SharedProtocolLiteralsTest {
         assertEquals("the ATT MTU both sides negotiate", 517, BleGattService.GATT_REQUESTED_MTU)
     }
 
+    /**
+     * The phone prunes an in-flight authentication claim once it is older than
+     * [BleAuthRequestGate.IN_FLIGHT_MAX_AGE_MS], and a challenge whose claim is gone falls through
+     * to the replay cache, which answers `Replay` and tears the GATT link down. The prune is
+     * therefore a hard ceiling on how long a legitimate attempt may last, and the longest PAM
+     * deadline a deployment may configure (`MAX_PAM_TIMEOUT_SECS`, the bound both the daemon's and
+     * the PAM module's config parsers refuse past) has to fit inside it.
+     *
+     * The defect this catches: either side moving alone. A config maximum raised past the prune
+     * admits a `pam_operation_timeout_secs` whose attempt is disconnected mid-prompt — the failure
+     * the disconnect grace exists to remove; a prune shortened below the maximum does the same to
+     * the longest legal configuration.
+     */
+    @Test
+    fun theInFlightPruneCoversTheLongestConfigurablePamDeadline() {
+        val maxPamTimeoutSecs = capture(MAX_PAM_TIMEOUT_SECS, TOML_CONFIG_RS)
+
+        assertTrue(
+            "BleAuthRequestGate prunes a claim after ${BleAuthRequestGate.IN_FLIGHT_MAX_AGE_MS} " +
+                "ms, but a deployment may configure a $maxPamTimeoutSecs s PAM deadline: a live " +
+                "challenge would be pruned and its next retransmission refused as a replay",
+            maxPamTimeoutSecs * 1_000L <= BleAuthRequestGate.IN_FLIGHT_MAX_AGE_MS,
+        )
+    }
+
     /** The first capture group of [pattern] in a repository file, as an `Int`. */
     private fun capture(pattern: Regex, path: String): Int =
         pattern.find(repositoryFile(path))?.groupValues?.get(1)?.toInt()
@@ -230,6 +256,11 @@ class SharedProtocolLiteralsTest {
         const val MODELS_RS = "shared/src/models.rs"
 
         const val PAIRING_WIRE_RS = "shared/src/protocol/pairing/wire.rs"
+
+        const val TOML_CONFIG_RS = "shared/src/config/toml_config.rs"
+
+        /** `pub const MAX_PAM_TIMEOUT_SECS: u64 = 600;` */
+        val MAX_PAM_TIMEOUT_SECS = Regex("""MAX_PAM_TIMEOUT_SECS\s*:\s*u64\s*=\s*(\d+)""")
 
         /** `pub const MAX_GATT_PAYLOAD_BYTES: usize = 512;` */
         val MAX_GATT_PAYLOAD = Regex("""MAX_GATT_PAYLOAD_BYTES\s*:\s*usize\s*=\s*(\d+)""")

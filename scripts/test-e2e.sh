@@ -304,6 +304,289 @@ finish_suite() {
     fi
 }
 
+# ── One prompt per challenge (Phase 4) ───────────────────────────────────────
+#
+# Phase 4 exists to prove the daemon does not open one auth session per
+# transport for the same challenge. The phone is the only place that shows
+# this, and it logs one line per prompt it raises:
+#
+#   Posting auth notification (id=…) for … @ user@host, challenge=<16 hex>…
+#   (server-android/.../service/AuthRequestManager.kt:400-409)
+#
+# The `challenge=` prefix is the grouping key, and it is the right one because
+# it is the key the product itself collapses on: the phone answers a challenge
+# it has already claimed on the other transport with "already claimed by …"
+# (TransportLockManager.tryClaimTransport, :39-46, :72), so one prompt per
+# challenge is exactly the property "one session per request" reduces to.
+#
+# The assertion is one prompt PER CHALLENGE, not one prompt in the window.
+# Phase 4 retries by design (authenticate_with_ble_retry, BLE_MAX_ATTEMPTS), and
+# a retry is a new request with a new challenge that may legitimately prompt
+# again; failing on that count would replace a real gap with an intermittent,
+# required CI failure. What must never happen is two prompt lines for the SAME
+# challenge. The residual is deliberate and worth naming: a defect that minted a
+# *fresh* challenge per transport would look like a retry here, because the
+# phone cannot tell the two apart. That shape is what the daemon's one-session
+# design rules out (a session owns its nonce and fans it out over both
+# transports), and it is not what this check claims to catch.
+#
+# Scope is the lines from the first `Auth request caller context:` line carrying
+# this phase's per-phase token onwards (:167-169). The token is what ties the
+# phone's lines to *this* phase — no earlier phase's line carries it — and
+# everything before it belongs to an earlier phase. That cut is load bearing:
+# the BLE disconnect-grace path deliberately re-raises a *released* challenge
+# on the retransmission that finally arrives (AGENTS.md, Transport Details), so
+# a same-challenge duplicate in Phase 3 is correct behaviour and must not be
+# charged to Phase 4. The cost of the cut is that a logcat rotation which drops
+# the caller-context line entirely is reported as "cannot attribute", never as
+# a pass.
+#
+# Defined here, before the self-test below, so `TAPAUTH_E2E_SELFTEST=race-prompts`
+# can exercise it on synthetic dumps; the suite proper calls it from Phase 4.
+race_prompt_check() {
+    local token=$1 dump=$2 start challenges prompts distinct duplicates dup
+    start=$(printf '%s\n' "$dump" | grep -nF "pamService=${token}," | head -n1 | cut -d: -f1 || true)
+    if [ -z "$start" ]; then
+        echo "❌ ERROR: the phone logged no caller-context line for this request ('pamService=${token},'),"
+        echo "   so no prompt can be attributed to this phase."
+        echo "---- caller-context lines in the phone log ----"
+        printf '%s\n' "$dump" | grep -F 'caller context' || true
+        return 1
+    fi
+
+    challenges=$(printf '%s\n' "$dump" | awk -v start="$start" '
+        NR < start { next }
+        /Posting auth notification/ {
+            if (match($0, /challenge=[0-9a-f]+/)) print substr($0, RSTART + 10, RLENGTH - 10)
+        }')
+    if [ -z "$challenges" ]; then
+        echo "❌ ERROR: no 'Posting auth notification … challenge=…' line in the phone log belongs to this"
+        echo "   request, so 'one prompt per challenge' would hold vacuously. The phone either never"
+        echo "   prompted, or its prompt line no longer carries the challenge= field this groups on."
+        echo "---- prompt lines in the phone log ----"
+        printf '%s\n' "$dump" | grep -F 'auth notification' || true
+        return 1
+    fi
+
+    prompts=$(printf '%s\n' "$challenges" | grep -c . || true)
+    distinct=$(printf '%s\n' "$challenges" | sort -u | grep -c . || true)
+    duplicates=$(printf '%s\n' "$challenges" | sort | uniq -d || true)
+    if [ -n "$duplicates" ]; then
+        dup=$(printf '%s\n' "$duplicates" | head -n1)
+        echo "❌ ERROR: the phone raised more than one prompt for the same challenge (${dup})."
+        echo "   That is what a per-transport session looks like from the phone: the daemon opened a"
+        echo "   session per transport and handed the phone two requests for one challenge."
+        echo "---- every prompt line carrying challenge=${dup} ----"
+        printf '%s\n' "$dump" | grep -F 'Posting auth notification' | grep -F "challenge=${dup}" || true
+        echo "---- prompts for this request, per challenge ----"
+        printf '%s\n' "$challenges" | sort | uniq -c | sed 's/^/  /'
+        return 1
+    fi
+
+    echo "✅ One prompt per challenge on the phone for this request (${prompts} prompt(s) across ${distinct} challenge(s); more than one challenge is a legitimate retry)."
+    return 0
+}
+
+# ── Daemon-log window helpers ─────────────────────────────────────────────────
+#
+# Both of these read the daemon log from a line offset taken before the request,
+# so a match left behind by an earlier phase cannot satisfy a later assertion.
+# They are defined here, before their first consumer (Phase 2), and not beside
+# Phase 2c where they used to live: this file is top-level sequential code, so a
+# function is only a command once the interpreter has reached its definition
+# line. A call above the definition is not a failed assertion — it is
+# `bash: grant_transport_since: command not found` and, under `set -e`, exit
+# 127, which reports a harness defect as though it were a test verdict.
+# `TAPAUTH_E2E_SELFTEST=helper-order` (below) keeps that from recurring.
+
+# Helper: assert a pattern is present in the daemon log AFTER a given line
+# offset (window-scoped, so stale matches from earlier phases don't count).
+assert_log_since() {
+    local base=$1 pattern=$2 label=$3
+    if tail -n +"$((base + 1))" "$DAEMON_LOG" 2>/dev/null | grep -q "$pattern"; then
+        echo "✅ ${label}"
+    else
+        echo "❌ ERROR (${label}): pattern '$pattern' not found in the daemon log for this phase."
+        exit 1
+    fi
+}
+
+# Print the transport named by the newest "Authentication granted over …" line
+# after a given line offset, or nothing when that window holds none.
+grant_transport_since() {
+    local base=$1
+    tail -n +"$((base + 1))" "$DAEMON_LOG" 2>/dev/null \
+        | grep -o "Authentication granted over [A-Za-z]*" \
+        | tail -n 1 \
+        | awk '{print $NF}'
+}
+
+# ── Helper definition order ──────────────────────────────────────────────────
+#
+# This suite is top-level sequential code with `set -e`: a shell function is a
+# command only from the line its definition was read onwards. Calling one above
+# its definition is neither a compile error nor a failed assertion — bash prints
+# `command not found` and, because the call sits in an assignment or a bare
+# command, `set -e` aborts the run with status 127. `bash -n` accepts it (the
+# name is a perfectly good word) and no assertion ever renders a verdict, so the
+# CI job reports a harness defect in the shape of a test failure. That is what
+# happened to the Phase 2 transport assertion when it was added beside the
+# phase instead of above it.
+#
+# helper_order_violations <file> prints one line per call site that can run
+# before the callee is defined, and returns 1 when it printed any. Execution
+# order is computed, not guessed:
+#
+#   * a call at top level runs at its own line, because the file is sequential;
+#   * a call inside a function body runs whenever that function is first
+#     reached, so it is charged to the enclosing function's earliest execution
+#     line — which is why a helper called from a function that only runs later
+#     is correctly *not* a violation, and why the same body is a violation as
+#     soon as its caller is reached too early;
+#   * a function that is never reached from top level cannot run at all, so
+#     nothing inside it is a violation.
+#
+# A function is recognised by a `name() {` definition line, and the call sites
+# are the command words of the line: the first word of each fragment split on
+# `| & ; ( ) { }`, after dropping leading keywords (`if`, `then`, `!`, …) and
+# leading `VAR=` assignments — the last of which is the `X=$(helper)` shape that
+# actually broke CI. The scan is deliberately structural rather than a git diff:
+# it reads the file as bash would encounter it.
+helper_order_violations() {
+    local target=${1:?helper_order_violations needs a file}
+    awk '
+    BEGIN {
+        INF = 1000000000
+        KW = "if|then|else|elif|while|until|do|!|time|command|builtin|exec"
+        KWRE = "^(" KW ")[ \t]+"
+        SQ = sprintf("%c", 39)
+        DQ = sprintf("%c", 34)
+        # Built rather than written out so this program cannot match itself: a
+        # literal home-of-a-heredoc pattern in here would be found by the very
+        # scan that reads this file.
+        HRE = "<<-?[ \t]*[" SQ DQ "]?[A-Za-z_][A-Za-z0-9_]*"
+    }
+    { src[NR] = $0 }
+    END {
+        n = NR
+
+        # Pass 0: mark heredoc bodies. They are data written somewhere, not
+        # shell this file runs, so a line inside one is neither a definition
+        # nor a call — that is also why this self-test can build its fixtures
+        # with heredocs without the scan treating them as part of the suite.
+        # An unterminated heredoc would make the scan skip the rest of the
+        # file, but `bash -n` already rejects that shape, so it cannot arrive
+        # here as a silent pass.
+        for (i = 1; i <= n; i++) {
+            if (skip[i]) continue
+            line = src[i]
+            if (line ~ /^[ \t]*#/) continue
+            if (!match(line, HRE)) continue
+            d = substr(line, RSTART, RLENGTH)
+            sub(/^<<-?[ \t]*/, "", d)
+            gsub(SQ, "", d)
+            gsub(DQ, "", d)
+            for (j = i + 1; j <= n; j++) {
+                skip[j] = 1
+                if (src[j] == d) break
+            }
+            i = j
+        }
+
+        # Pass 1: definitions and the line range of each body. A body ends at
+        # the first line that is nothing but a closing brace at the definition
+        # line indentation or less; the definition lines themselves are skipped
+        # so a brace inside a body cannot be mistaken for another definition.
+        for (i = 1; i <= n; i++) {
+            if (skip[i]) continue
+            line = src[i]
+            if (line ~ /^[ \t]*#/) continue
+            if (line !~ /^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)[ \t]*\{/) continue
+            nm = line
+            sub(/^[ \t]*/, "", nm)
+            sub(/[ \t]*\(\)[ \t]*\{.*/, "", nm)
+            if (nm in defline) continue
+            lead = line
+            sub(/[^ \t].*$/, "", lead)
+            ind = length(lead)
+            defline[nm] = i
+            deforder[++ndefs] = nm
+            after = line
+            sub(/^[^{]*\{/, "", after)
+            if (after ~ /\}/) { endline[nm] = i; continue }
+            endline[nm] = n
+            for (j = i + 1; j <= n; j++) {
+                if (src[j] !~ /^[ \t]*\}[ \t]*$/) continue
+                lead2 = src[j]
+                sub(/[^ \t].*$/, "", lead2)
+                if (length(lead2) <= ind) { endline[nm] = j; break }
+            }
+            i = endline[nm]
+        }
+
+        # Pass 2: call sites, each tagged with the function body it sits in.
+        for (i = 1; i <= n; i++) {
+            if (skip[i]) continue
+            line = src[i]
+            if (line ~ /^[ \t]*#/) continue
+            nseg = split(line, segs, /[|&;(){}]/)
+            for (s = 1; s <= nseg; s++) {
+                seg = segs[s]
+                sub(/^[ \t]+/, "", seg)
+                while (1) {
+                    if (seg ~ KWRE) { sub(KWRE, "", seg); continue }
+                    if (seg ~ /^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*/) {
+                        sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*/, "", seg)
+                        continue
+                    }
+                    break
+                }
+                w = seg
+                sub(/[ \t].*$/, "", w)
+                if (w == "") continue
+                if (!(w in defline)) continue
+                if (i == defline[w]) continue
+                ncalls++
+                callline[ncalls] = i
+                callname[ncalls] = w
+                enc = ""
+                for (d = 1; d <= ndefs; d++) {
+                    dn = deforder[d]
+                    if (i > defline[dn] && i <= endline[dn]) { enc = dn; break }
+                }
+                callenc[ncalls] = enc
+            }
+        }
+
+        # Pass 3: earliest line at which each function can be reached, to a
+        # fixpoint so a chain of calls propagates.
+        for (d = 1; d <= ndefs; d++) earliest[deforder[d]] = INF
+        for (it = 0; it <= ndefs + 1; it++) {
+            changed = 0
+            for (c = 1; c <= ncalls; c++) {
+                g = callenc[c]
+                t = (g == "") ? callline[c] : earliest[g]
+                if (t < earliest[callname[c]]) { earliest[callname[c]] = t; changed = 1 }
+            }
+            if (!changed) break
+        }
+
+        # Pass 4: report.
+        for (c = 1; c <= ncalls; c++) {
+            f = callname[c]
+            g = callenc[c]
+            t = (g == "") ? callline[c] : earliest[g]
+            if (t >= defline[f]) continue
+            where = (g == "") ? "top level" : ("inside " g)
+            printf "line %d: %s is called at line %d (%s) but is only defined at line %d\n",
+                t, f, callline[c], where, defline[f]
+            nviol++
+        }
+        exit (nviol > 0)
+    }
+    ' "$target"
+}
+
 # ── Registry self-test (dry run; needs no device, daemon or emulator) ────────
 #
 # Only entered when TAPAUTH_E2E_SELFTEST is set; the normal path ignores it
@@ -319,6 +602,22 @@ finish_suite() {
 #     Run a stub phase body that records a `pass` and then fails. The script must
 #     abort with the failing command's status: recording an outcome must not
 #     swallow a failure through a helper's return value.
+#
+#   TAPAUTH_E2E_SELFTEST=race-prompts
+#     Run race_prompt_check (above) on synthetic phone dumps: one prompt for one
+#     challenge, two prompts for two challenges (a legitimate retry), two prompts
+#     for the SAME challenge, no prompt at all, and an earlier phase's
+#     same-challenge duplicate. The first two must pass, the last three must fail.
+#
+#   TAPAUTH_E2E_SELFTEST=helper-order
+#     Assert that no line this suite can reach calls a shell function defined
+#     further down (helper_order_violations, above) — the shape that makes a
+#     phase abort with `command not found` / exit 127 instead of rendering a
+#     verdict — then exercise that check on synthetic files: three that must be
+#     accepted (a call after the definition; a call inside a function that runs
+#     later; a call in a function nothing calls) and three that must be rejected
+#     (a bare call before the definition; the `X=$(helper)` assignment shape
+#     that broke CI; a call inside a function that is itself reached too early).
 #
 # Placed before cleanup() is trapped and before any environment is touched, so a
 # dry run cannot alter the host.
@@ -430,8 +729,177 @@ case "${TAPAUTH_E2E_SELFTEST:-}" in
         echo "❌ REGISTRY SELF-TEST FAILED: a phase body that failed did not abort the script."
         exit 99
         ;;
+    race-prompts)
+        # Synthetic logcat lines. The shape is the phone's own: one caller-context
+        # line per submitRequest, then one "Posting auth notification" line per
+        # prompt, with the challenge in its first 16 hex characters. Each dump is
+        # built with rp_dump so the lines stay separate lines — `$(...)` strips
+        # only the trailing newline, and a fixture that collapsed into one line
+        # would satisfy every case below for the wrong reason.
+        RP_SCOPE='D AuthRequestManager: Auth request caller context: pamService=e2e-ctx-race, processName=e2e-ctx-proc-race, commandPreview=/tmp/x pam-auth u 30 t'
+        RP_OTHER_SCOPE='D AuthRequestManager: Auth request caller context: pamService=e2e-ctx-ble, processName=e2e-ctx-proc-ble, commandPreview=/tmp/y pam-auth u 30 t'
+        rp_dump() {
+            local line
+            for line in "$@"; do printf '%s\n' "$line"; done
+        }
+        rp_prompt() {
+            printf 'D AuthRequestManager: Posting auth notification (id=1) for dev @ u@h, challenge=%s...' "$1"
+        }
+        rp_check() {
+            local want=$1 label=$2 dump=$3 got=0
+            set +e
+            race_prompt_check "e2e-ctx-race" "$dump" >/dev/null 2>&1
+            got=$?
+            set -e
+            if [ "$want" = "pass" ] && [ "$got" -ne 0 ]; then
+                echo "❌ REGISTRY SELF-TEST FAILED: ${label} was rejected (status ${got})."
+                race_prompt_check "e2e-ctx-race" "$dump" || true
+                exit 1
+            fi
+            if [ "$want" = "fail" ] && [ "$got" -eq 0 ]; then
+                echo "❌ REGISTRY SELF-TEST FAILED: ${label} was accepted; the assertion cannot fail."
+                exit 1
+            fi
+            echo "✅ race_prompt_check: ${label} → ${want} (status ${got})"
+        }
+
+        # 1. One prompt for one challenge: the healthy race.
+        rp_check pass "one prompt for one challenge" \
+            "$(rp_dump "$RP_SCOPE" "$(rp_prompt aaaaaaaaaaaaaaaa)")"
+        # 2. Two prompts for two different challenges: a legitimate retry, which
+        #    the old "exactly one prompt in the window" assertion failed on.
+        rp_check pass "two prompts for two challenges (retry)" \
+            "$(rp_dump "$RP_SCOPE" "$(rp_prompt aaaaaaaaaaaaaaaa)" \
+                "$RP_SCOPE" "$(rp_prompt bbbbbbbbbbbbbbbb)")"
+        # 3. Two prompts for the SAME challenge: a per-transport session.
+        rp_check fail "two prompts for the same challenge" \
+            "$(rp_dump "$RP_SCOPE" "$(rp_prompt aaaaaaaaaaaaaaaa)" "$(rp_prompt aaaaaaaaaaaaaaaa)")"
+        # 4. No prompt at all in this phase's window.
+        rp_check fail "no prompt in this phase's window" "$(rp_dump "$RP_SCOPE")"
+        # 5. An earlier phase's same-challenge duplicate (the BLE grace
+        #    re-prompt) is outside this phase's window and must not be charged
+        #    to it; this phase's own single prompt still passes.
+        rp_check pass "earlier phase's same-challenge duplicate stays out of scope" \
+            "$(rp_dump "$RP_OTHER_SCOPE" "$(rp_prompt cccccccccccccccc)" \
+                "$(rp_prompt cccccccccccccccc)" "$RP_SCOPE" "$(rp_prompt dddddddddddddddd)")"
+        # 6. ...and a prompt with no challenge= field anywhere in scope proves
+        #    nothing, so it fails rather than passing vacuously.
+        rp_check fail "prompt line without a challenge= field" \
+            "$(rp_dump "$RP_SCOPE" 'D AuthRequestManager: Posting auth notification (id=1) for dev @ u@h')"
+
+        # The failure has to NAME the offending challenge, or a real regression
+        # and a test artefact look the same in the CI log.
+        RP_DUP_OUT=$( { race_prompt_check "e2e-ctx-race" \
+            "$(rp_dump "$RP_SCOPE" "$(rp_prompt aaaaaaaaaaaaaaaa)" "$(rp_prompt aaaaaaaaaaaaaaaa)")"; } 2>&1 || true)
+        printf '%s\n' "$RP_DUP_OUT" | grep -qF "same challenge (aaaaaaaaaaaaaaaa)" \
+            || { echo "❌ REGISTRY SELF-TEST FAILED: the duplicate-challenge failure does not name the challenge."; exit 1; }
+        echo "✅ race_prompt_check: the duplicate-challenge failure names the offending challenge."
+        echo "✅ PROMPT-GROUPING SELF-TEST PASSED: 3 accepted (single, retry, earlier-phase duplicate), 3 rejected (same-challenge duplicate, no prompt, no challenge= field)."
+        exit 0
+        ;;
+    helper-order)
+        # helper_order_violations (above) is exercised on synthetic files here,
+        # not just on this suite: a check that has only ever been run against a
+        # clean input is indistinguishable from one that always passes.
+        ho_fail() {
+            echo "❌ HELPER-ORDER SELF-TEST FAILED: $1"
+            exit 1
+        }
+        HO_DIR=$(mktemp -d -t tapauth-e2e-helper-order.XXXXXX)
+        trap 'rm -rf "$HO_DIR"' EXIT
+        ho_case() {
+            local want=$1 label=$2 file=$3 out="" rc=0
+            set +e
+            out=$(helper_order_violations "$file")
+            rc=$?
+            set -e
+            if [ "$want" = "pass" ] && [ "$rc" -ne 0 ]; then
+                ho_fail "${label} was reported out of order (status ${rc}): ${out}"
+            fi
+            if [ "$want" = "fail" ] && [ "$rc" -eq 0 ]; then
+                ho_fail "${label} was accepted; the check cannot fail"
+            fi
+            echo "✅ helper_order_violations: ${label} → ${want} (status ${rc})"
+        }
+
+        # 1. The suite itself. This is the assertion that would have stopped the
+        #    defect instead of letting CI report exit 127 with no verdict: the
+        #    Phase 2 transport assertion calls grant_transport_since, which used
+        #    to be defined only beside Phase 2c, ~170 lines further down.
+        HO_REAL=$(helper_order_violations "$SCRIPT_DIR/test-e2e.sh") || true
+        if [ -n "$HO_REAL" ]; then
+            echo "❌ HELPER-ORDER SELF-TEST FAILED: this suite reaches a helper before defining it:"
+            printf '%s\n' "$HO_REAL"
+            exit 1
+        fi
+        echo "✅ helper_order_violations: test-e2e.sh defines every helper before any line that can reach it."
+
+        # 2. Definition then call, at top level: the healthy shape.
+        cat > "$HO_DIR/defined-first.sh" <<'EOF'
+helper_a() { echo a; }
+helper_a
+EOF
+        ho_case pass "a helper called after its definition" "$HO_DIR/defined-first.sh"
+
+        # 3. Call then definition, at top level: the defect.
+        cat > "$HO_DIR/called-first.sh" <<'EOF'
+helper_b
+helper_b() { echo b; }
+EOF
+        ho_case fail "a helper called before its definition" "$HO_DIR/called-first.sh"
+
+        # 4. The exact shape that broke CI: the call is the command substitution
+        #    of an assignment, so no assertion renders a verdict and `set -e`
+        #    aborts the run with 127 instead.
+        cat > "$HO_DIR/assignment-call.sh" <<'EOF'
+TRANSPORT=$(helper_c "$1")
+helper_c() { echo c; }
+EOF
+        ho_case fail "a helper called from an assignment before its definition" \
+            "$HO_DIR/assignment-call.sh"
+
+        # 5. A call inside a function body is charged to the caller, not to the
+        #    body's own line: here the caller runs after the definition, so this
+        #    must be accepted rather than flagged.
+        cat > "$HO_DIR/late-caller.sh" <<'EOF'
+run_phase_d() {
+    helper_d
+}
+helper_d() { echo d; }
+run_phase_d
+EOF
+        ho_case pass "a helper reached from a function that runs after its definition" \
+            "$HO_DIR/late-caller.sh"
+
+        # 6. ...and the same body is a defect once that caller is reached too
+        #    early. Without this the enclosing-function rule would excuse every
+        #    call that sits inside any function.
+        cat > "$HO_DIR/early-caller.sh" <<'EOF'
+run_phase_e() {
+    helper_e
+}
+run_phase_e
+helper_e() { echo e; }
+EOF
+        ho_case fail "a helper reached from a function that runs before its definition" \
+            "$HO_DIR/early-caller.sh"
+
+        # 7. A function nothing reaches cannot run, so what it calls is not a
+        #    violation: reporting it would make the check cry wolf on dead code.
+        cat > "$HO_DIR/unreached-caller.sh" <<'EOF'
+never_called() {
+    helper_f
+}
+helper_f() { echo f; }
+EOF
+        ho_case pass "a helper reached only from a function nothing calls" \
+            "$HO_DIR/unreached-caller.sh"
+
+        echo "✅ HELPER-ORDER SELF-TEST PASSED: 3 accepted (defined-first, late caller, unreached caller), 3 rejected (bare call before definition, assignment call before definition, early caller)."
+        exit 0
+        ;;
     *)
-        echo "❌ ERROR: unknown TAPAUTH_E2E_SELFTEST value '$TAPAUTH_E2E_SELFTEST' (expected summary|fail-after-record)" >&2
+        echo "❌ ERROR: unknown TAPAUTH_E2E_SELFTEST value '$TAPAUTH_E2E_SELFTEST' (expected summary|fail-after-record|race-prompts|helper-order)" >&2
         exit 2
         ;;
 esac
@@ -497,6 +965,28 @@ fi
 # Sandbox directory for logs, captures and (dev mode) state redirection
 TEST_DIR=$(mktemp -d -t tapauth-e2e.XXXXXX)
 DAEMON_LOG="${TEST_DIR}/tapauthd.log"
+
+# Per-target trace directives added to the daemon's log filter for the E2E run.
+#
+# Three facts the suite asserts are logged below the level the daemon runs at
+# (INFO in journald, `debug` on stdout), and each is the *only* daemon-side
+# evidence of the thing asserted — none of them may be inferred from timing:
+#   * `BLE advertising started (attempt N)` (tapauthd/src/transport/ble.rs:671)
+#     — the advertisement for the session was registered with BlueZ. Phase 4
+#     asserts it while UDP is also live, so a daemon that quietly serves the
+#     race over UDP alone cannot pass.
+#   * `Sent IPv4 multicast on <N> interface(s)` (shared/src/network/udp.rs:461)
+#     — the UDP egress for the request. Phase 4 asserts it so "both transports
+#     participated" does not rest on the winner's name, and Phase 2d's sibling
+#     assertions need no addition (its transport attribution is an INFO line).
+#   * `Dropped a datagram from <addr> (<N> bytes): <reason>; still waiting for a
+#     response` (shared/src/network/udp.rs:78) — the per-frame decode drop.
+#     Phase 2d asserts it for its non-protobuf injection: the aggregate `warn`
+#     beside it is rate limited to one per 60 s, so only the per-frame line is
+#     deterministic.
+# The directives are per target, so every other module keeps the level it had
+# and no other phase's log volume or assertions change.
+E2E_TRACE_TARGETS="tapauthd::transport::ble=trace,shared::network::udp=trace"
 
 PAM_SERVICE_NAME="tapauth-test-e2e"
 PAM_MIXED_SERVICE_NAME="tapauth-mixed-stack"
@@ -1017,14 +1507,22 @@ EOF
     #    State/config paths and socket activation stay production; the binary is
     #    built WITHOUT dev-state-override, so TAPAUTH_STATE_DIR cannot redirect
     #    anything even if it were set in the environment.
+    #
+    #    Note that under systemd the journal filter comes from
+    #    TAPAUTH_JOURNALD_LOG_LEVEL, NOT from TAPAUTH_LOG_LEVEL/RUST_LOG
+    #    (tapauthd/src/logging.rs:40-51 keys the stdout layer off the latter but
+    #    skips it when JOURNAL_STREAM is set). Assertions therefore read
+    #    TAPAUTH_JOURNALD_LOG_LEVEL, which is why the per-target trace directives
+    #    are added there as well as to the dev-mode run below.
     mkdir -p /etc/systemd/system/tapauthd.service.d
     cat > /etc/systemd/system/tapauthd.service.d/e2e.conf <<EOF
 # E2E-only override (not shipped in production packages)
 [Service]
 Environment=TAPAUTH_DEV_MODE=1
 Environment=TAPAUTH_DEV_UDP_TARGET=127.0.0.1:${DEV_HOST_PORT}
-Environment=TAPAUTH_LOG_LEVEL=debug
-Environment=RUST_LOG=debug
+Environment=TAPAUTH_LOG_LEVEL=debug,${E2E_TRACE_TARGETS}
+Environment=RUST_LOG=debug,${E2E_TRACE_TARGETS}
+Environment=TAPAUTH_JOURNALD_LOG_LEVEL=info,${E2E_TRACE_TARGETS}
 EOF
 
     # 5. Enable the real socket unit; the service is activated on first IPC
@@ -1109,7 +1607,7 @@ echo "==> Step 3: Setting up Transport Bridges (BLE + UDP)..."
 # Step 4: Launch tapauthd daemon
 echo "==> Step 4: Launching tapauthd daemon..."
 if [ "$E2E_DAEMON_MODE" = "dev" ]; then
-    env TAPAUTH_DEV_MODE="1" TAPAUTH_DEV_UDP_TARGET="127.0.0.1:${DEV_HOST_PORT}" TAPAUTH_LOG_LEVEL="debug" RUST_LOG="debug" TAPAUTHD_SOCK="$TAPAUTHD_SOCK" ${TAPAUTH_STATE_DIR:+TAPAUTH_STATE_DIR="$TAPAUTH_STATE_DIR"} "$TAPAUTHD_BIN" > "$DAEMON_LOG" 2>&1 &
+    env TAPAUTH_DEV_MODE="1" TAPAUTH_DEV_UDP_TARGET="127.0.0.1:${DEV_HOST_PORT}" TAPAUTH_LOG_LEVEL="debug,${E2E_TRACE_TARGETS}" RUST_LOG="debug" TAPAUTHD_SOCK="$TAPAUTHD_SOCK" ${TAPAUTH_STATE_DIR:+TAPAUTH_STATE_DIR="$TAPAUTH_STATE_DIR"} "$TAPAUTHD_BIN" > "$DAEMON_LOG" 2>&1 &
     DAEMON_PID=$!
 
     echo -n "    Waiting for daemon socket"
@@ -2367,6 +2865,9 @@ echo "==> Requesting authentication for user '$TEST_USER'..."
 # below have something to check (see the caller-context helpers above). The
 # request id is passed explicitly because it also appears in the expected
 # command preview.
+# The log offset is taken before the request so the transport attribution below
+# is scoped to this phase's session (the same window idiom Phase 2d uses).
+LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
 caller_context_tokens "udp"
 UDP_AUTH_OUTPUT=$("$CTX_CLI" pam-auth "$TEST_USER" 20 "$CTX_REQUEST_ID" \
     --pam-service "$CTX_SERVICE" --process-name "$CTX_PROCESS" || true)
@@ -2390,7 +2891,23 @@ fi
 assert_caller_context_delivered "Phase 2 (UDP)" \
     "$CTX_SERVICE" "$CTX_PROCESS" \
     "${CTX_CLI} pam-auth ${TEST_USER} 20 ${CTX_REQUEST_ID}"
-phase_pass "2" "pam-auth returned OUTCOME=SUCCESS and the phone logged the v2 caller context for this request (pam_service='${CTX_SERVICE}', process_name='${CTX_PROCESS}', and command_preview when the e2e build variant is installed)"
+
+# ...and assert the grant came over the transport this phase left enabled.
+# `enable_ble = false` above is only a line in config.toml until a grant arrives
+# on the transport the daemon actually used: a daemon that ignores the toggle and
+# rings the phone over BLE passes every assertion above, because OUTCOME=SUCCESS
+# says nothing about which transport delivered it. This is the same assertion
+# Phase 2d makes (grant_transport_since + a required transport name), with the
+# expected winner kept as Udp.
+sleep 1
+PHASE2_TRANSPORT=$(grant_transport_since "$LOG_BASE")
+if [ "$PHASE2_TRANSPORT" != "Udp" ]; then
+    echo "❌ ERROR: expected the grant to be attributed to Udp, got '${PHASE2_TRANSPORT}'."
+    tail -n +"$((LOG_BASE + 1))" "$DAEMON_LOG" 2>/dev/null | tail -n 20
+    exit 1
+fi
+echo "✅ Phase 2 grant attributed to Udp (BLE is disabled for this phase)."
+phase_pass "2" "pam-auth returned OUTCOME=SUCCESS, the daemon attributed the grant to Udp (so the enable_ble=false toggle is verified behaviourally), and the phone logged the v2 caller context for this request (pam_service='${CTX_SERVICE}', process_name='${CTX_PROCESS}', and command_preview when the e2e build variant is installed)"
 
 # Stop capture and take the first captured server grant packet
 CAPTURE_OK=0
@@ -2539,27 +3056,10 @@ else
     phase_skip "2e" "pamtester missing, pam_tapauth.so absent, or /etc/pam.d not writable"
 fi
 
-# Helper: assert a pattern is present in the daemon log AFTER a given line
-# offset (window-scoped, so stale matches from earlier phases don't count).
-assert_log_since() {
-    local base=$1 pattern=$2 label=$3
-    if tail -n +"$((base + 1))" "$DAEMON_LOG" 2>/dev/null | grep -q "$pattern"; then
-        echo "✅ ${label}"
-    else
-        echo "❌ ERROR (${label}): pattern '$pattern' not found in the daemon log for this phase."
-        exit 1
-    fi
-}
-
-# Print the transport named by the newest "Authentication granted over …" line
-# after a given line offset, or nothing when that window holds none.
-grant_transport_since() {
-    local base=$1
-    tail -n +"$((base + 1))" "$DAEMON_LOG" 2>/dev/null \
-        | grep -o "Authentication granted over [A-Za-z]*" \
-        | tail -n 1 \
-        | awk '{print $NF}'
-}
+# The daemon-log window helpers (assert_log_since, grant_transport_since) are
+# defined near the top of the file, before their first consumer — see the
+# "Daemon-log window helpers" section above. They used to live here, beside
+# Phase 2c, which put the first of their consumers above their definitions.
 
 # ── BLE scan resiliency helpers ───────────────────────────────────────────────
 #
@@ -2738,6 +3238,22 @@ if [ "$CAPTURE_OK" = "1" ]; then
     echo "==> Injecting grant with a flipped AES-GCM tag byte..."
     "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" send "$GRANT_HEX" --port "$UDP_PORT" --corrupt
 
+    # The injection above is the expensive half of this attack: it needs a
+    # captured grant and the CSK to look authentic enough to reach decryption.
+    # The cheaper one needs neither — a datagram that is not a protobuf at all.
+    # It is dropped a layer lower (shared/src/network/udp.rs:706-717, before any
+    # crypto runs) and counted by a different counter from the AEAD drop above,
+    # so it gets its own assertion below. Sent in the same pre-grant window, so
+    # the session is still pending when it lands.
+    echo "==> Injecting a non-protobuf datagram (no key, no captured packet)..."
+    GARBAGE_OUT=$("$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" send --garbage --port "$UDP_PORT")
+    echo "$GARBAGE_OUT"
+    GARBAGE_LEN=$(printf '%s\n' "$GARBAGE_OUT" | sed -n 's/^GARBAGE_LEN=\([0-9][0-9]*\)$/\1/p' | head -n1)
+    if [ -z "$GARBAGE_LEN" ]; then
+        echo "❌ ERROR: udp_attack.py send --garbage did not print GARBAGE_LEN, so the drop cannot be attributed."
+        exit 1
+    fi
+
     set +e
     wait_pid_with_timeout "$TAMPER_CLI_PID" 15
     TAMPER_EXIT=$?
@@ -2755,6 +3271,19 @@ if [ "$CAPTURE_OK" = "1" ]; then
     # occurrence is this one.
     assert_log_since "$LOG_BASE" "Failed to decrypt response packet" \
         "Daemon dropped the tampered datagram instead of treating it as a response (audit trail present)"
+
+    # The non-protobuf frame never reaches AEAD: `receive_udp_packet` fails the
+    # decode and calls `record_dropped_datagram` (shared/src/network/udp.rs:77-82),
+    # whose per-frame line names the byte length it was handed. That length is
+    # this harness's own GARBAGE_PAYLOAD size, printed by the helper above, so the
+    # line can only be this injection. The per-frame line is asserted rather than
+    # the aggregate warn beside it, which is rate limited to one per 60 s and
+    # therefore not deterministic. Note that "unusable UDP datagram" (this
+    # counter) and "unauthenticated frame(s)" (the AEAD counter above) are
+    # deliberately different strings: one drop must not satisfy both assertions.
+    assert_log_since "$LOG_BASE" \
+        "Dropped a datagram from .* (${GARBAGE_LEN} bytes)" \
+        "Daemon dropped the non-protobuf datagram before any crypto ran (${GARBAGE_LEN}-byte frame)"
 
     # The dropped frame must not conclude anything: the session is still waiting,
     # so the auto-granted grant that follows still authenticates it.
@@ -2781,7 +3310,7 @@ if [ "$CAPTURE_OK" = "1" ]; then
         exit 1
     fi
 
-    phase_pass "2d" "the corrupted grant was dropped rather than answered (the daemon logged the decryption failure and kept waiting), and the phone's real grant then authenticated the session over Udp (OUTCOME=SUCCESS, exit code ${TAMPER_EXIT})"
+    phase_pass "2d" "the corrupted grant was dropped rather than answered (the daemon logged the decryption failure and kept waiting), a non-protobuf datagram was dropped one layer lower without needing any key, and the phone's real grant then authenticated the session over Udp (OUTCOME=SUCCESS, exit code ${TAMPER_EXIT})"
 else
     echo "ℹ️  SKIPPED (no captured grant packet available)."
     phase_skip "2d" "no captured server grant packet available (packet capture needs root)"
@@ -2865,7 +3394,15 @@ echo "==> Setting transport config: Both BLE and UDP enabled..."
 "$CLI_BIN" set-transports --ble true --network true
 
 LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
-if authenticate_with_ble_retry "Parallel Discovery Race Authentication"; then
+# The phase-3 style caller context is used here for one extra reason: its
+# per-phase token is what the prompt count below counts. Both transports funnel
+# through AuthRequestManager.submitRequest, which logs that line once per prompt
+# it raises (server-android/.../service/AuthRequestManager.kt:168-175), so the
+# token counts prompts for this phase's request and no earlier phase's line can
+# satisfy it.
+caller_context_tokens "race"
+if authenticate_with_ble_retry "Parallel Discovery Race Authentication" "$CTX_CLI" \
+    "$CTX_REQUEST_ID" --pam-service "$CTX_SERVICE" --process-name "$CTX_PROCESS"; then
     # The race is decided by whichever transport answers first, so requiring a
     # particular winner would encode a scheduling accident. What must hold is that
     # the daemon named one: with both transports live, "passed" is only meaningful
@@ -2878,8 +3415,40 @@ if authenticate_with_ble_retry "Parallel Discovery Race Authentication"; then
         exit 1
     fi
     echo "ℹ️  Parallel race: the grant arrived over ${GRANT_TRANSPORT} (either winner is a pass by design)."
+
+    # A named winner says nothing about the loser having been *tried*: a daemon
+    # that serves this phase over UDP alone, or over BLE alone, names a transport
+    # too. Both transports must have participated, and each half is asserted
+    # separately so a failure names the one that did not:
+    #   * the BLE advertisement for the session was registered with BlueZ
+    #     (tracing::trace! in start_advertising, tapauthd/src/transport/ble.rs:671);
+    #   * the request went out to the IPv4 discovery group
+    #     (tracing::trace!, shared/src/network/udp.rs:461).
+    # Both are LOGGED facts, not timing ones, and neither depends on which
+    # transport won. The two lines are at TRACE, which the daemon's E2E log filter
+    # raises for these two targets only (see E2E_TRACE_TARGETS above).
+    assert_log_since "$LOG_BASE" "BLE advertising started" \
+        "Daemon registered the BLE advertisement for this session (BLE participated in the race)"
+    # The only other IPv4 send this window can hold is the AuthenticationCancel a
+    # BLE winner multicasts through the same helper, so this line cannot be
+    # produced by a session in which neither transport ran.
+    assert_log_since "$LOG_BASE" "Sent IPv4 multicast on" \
+        "Daemon sent the request to the IPv4 discovery group over UDP (UDP participated in the race)"
+
+    # ...and the phone must have been asked once per *challenge* for this
+    # request: the daemon opening one session per transport would hand the phone
+    # two requests for one challenge, which is what race_prompt_check groups on
+    # (see its comment above). A retry is a new request with a new challenge, and
+    # is deliberately not a failure. The dump is grepped whole rather than
+    # through a line-offset window, for the reason the Phase 2 caller-context
+    # helpers give: the logcat ring buffer can rotate between taking a mark and
+    # checking it.
+    RACE_DUMP=$(adb logcat -d 2>/dev/null || true)
+    if ! race_prompt_check "$CTX_SERVICE" "$RACE_DUMP"; then
+        exit 1
+    fi
     echo "✅ Parallel Discovery Race Authentication PASSED!"
-    phase_pass "4" "with both transports live pam-auth returned OUTCOME=SUCCESS, and the daemon attributed the grant to ${GRANT_TRANSPORT}"
+    phase_pass "4" "with both transports live pam-auth returned OUTCOME=SUCCESS, the daemon registered the BLE advertisement and sent the request to the IPv4 multicast group (both transports participated, winner ${GRANT_TRANSPORT}), and the phone raised no more than one prompt per challenge for the request"
 else
     echo "❌ Parallel Discovery Race Authentication FAILED after ${BLE_MAX_ATTEMPTS} attempts."
     if [ -f "$DAEMON_LOG" ]; then
