@@ -1,8 +1,9 @@
 //! Admin & PAM IPC CLI tool for testing and administration.
 //! Connects to tapauthd via Unix socket (supports TAPAUTHD_SOCK override).
 
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 use prost::Message;
+use shared::ipc::framing;
 use shared::ipc::pb as ipc;
 use std::env;
 use std::path::Path;
@@ -12,6 +13,16 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 
 const DEFAULT_SOCKET: &str = "/run/tapauthd/tapauthd.sock";
+
+/// Read timeout for the commands that wait on a pairing worker
+/// (`wait-for-pairing`, `complete-pairing`).
+///
+/// The daemon answers a pending pairing at most `SESSION_REPLY_TIMEOUT` (135 s:
+/// `SESSION_DEADLINE`, 120 s, plus 5 s of slack — `tapauthd/src/pairing.rs`)
+/// after `start-pairing`, so a shorter read timeout reports a
+/// slow-but-legitimate pairing here as a transport failure while the daemon is
+/// still working. Recheck that value when changing this one.
+const PAIRING_REPLY_READ_TIMEOUT: Duration = Duration::from_secs(150);
 
 /// Production builds always talk to the systemd-activated socket. Only dev
 /// builds (feature `dev-socket-override`, pulled in by `fallback-socket`) may
@@ -36,9 +47,9 @@ async fn write_framed(
     stream: &mut UnixStream,
     msg: &[u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let len = msg.len() as u32;
+    let prefix = framing::encode_len(msg.len())?;
     let mut buf = BytesMut::with_capacity(4 + msg.len());
-    buf.put_u32(len);
+    buf.extend_from_slice(&prefix);
     buf.extend_from_slice(msg);
     stream.write_all(&buf).await?;
     Ok(())
@@ -47,10 +58,7 @@ async fn write_framed(
 async fn read_framed(stream: &mut UnixStream) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 10 * 1024 * 1024 {
-        return Err("Frame too large".into());
-    }
+    let len = framing::decode_len(len_buf)?;
     let mut data = vec![0u8; len];
     stream.read_exact(&mut data).await?;
     Ok(data)
@@ -90,6 +98,8 @@ async fn send_pam_auth(
     username: String,
     timeout_secs: u32,
     request_id: String,
+    pam_service: String,
+    process_name: String,
 ) -> Result<ipc::PamAuthenticateResponse, Box<dyn std::error::Error>> {
     let envelope = ipc::IpcEnvelope {
         msg: Some(ipc::ipc_envelope::Msg::PamAuthenticate(
@@ -98,6 +108,8 @@ async fn send_pam_auth(
                 tty_present: false,
                 timeout_seconds: timeout_secs,
                 request_id,
+                pam_service,
+                process_name,
             },
         )),
     };
@@ -126,6 +138,24 @@ async fn send_pam_cancel(
     }
 }
 
+/// Decode a pairing session id written as 32 hex characters (16 raw bytes),
+/// with or without a leading `0x`. The daemon compares it byte for byte against
+/// the running session, so a mistyped id must fail here rather than silently
+/// cancel nothing.
+fn parse_session_id(value: &str) -> Result<Vec<u8>, String> {
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    if digits.len() != 32 {
+        return Err(format!(
+            "session id must be 32 hex characters (16 bytes), got {}",
+            digits.len()
+        ));
+    }
+    hex::decode(digits).map_err(|e| format!("session id is not valid hex: {}", e))
+}
+
 fn outcome_name(outcome: i32) -> &'static str {
     match ipc::PamOutcome::try_from(outcome) {
         Ok(ipc::PamOutcome::Success) => "SUCCESS",
@@ -137,251 +167,416 @@ fn outcome_name(outcome: i32) -> &'static str {
     }
 }
 
+fn usage() {
+    eprintln!("Usage: tapauth-ipc-cli <command> [args...]");
+    eprintln!("Commands:");
+    eprintln!("  start-pairing");
+    eprintln!("  wait-for-pairing [port]");
+    eprintln!("  complete-pairing [port]");
+    eprintln!("  cancel-pairing --port <port> --session-id <hex>");
+    eprintln!("  get-servers");
+    eprintln!("  remove-device <public_key_hex>");
+    eprintln!("  set-transports --ble <true|false> --network <true|false>");
+    eprintln!("  get-config");
+    eprintln!("  pam-auth <username> [timeout_secs] [request_id]");
+    eprintln!("  pam-cancel <request_id> [reason]");
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: tapauth-ipc-cli <command> [args...]");
-        eprintln!("Commands:");
-        eprintln!("  start-pairing");
-        eprintln!("  wait-for-pairing <port>");
-        eprintln!("  complete-pairing <port>");
-        eprintln!("  get-servers");
-        eprintln!("  remove-device <public_key_hex>");
-        eprintln!("  set-transports --ble <true|false> --network <true|false>");
-        eprintln!("  get-config");
-        eprintln!("  pam-auth <username> [timeout_secs] [request_id]");
-        eprintln!("  pam-cancel <request_id> [reason]");
+        usage();
         std::process::exit(1);
     }
 
     match args[1].as_str() {
-        "start-pairing" => {
-            let req = ipc::AdminRequest {
-                payload: Some(ipc::admin_request::Payload::StartPairing(
-                    ipc::StartPairingRequest {},
-                )),
-            };
-            let resp = send_admin(req, Duration::from_secs(10)).await?;
-            if resp.status != ipc::AdminStatus::AdminSuccess as i32 {
-                eprintln!("ERROR: {}", resp.error_message);
-                std::process::exit(1);
-            }
-            if let Some(ipc::admin_response::Payload::StartPairing(p)) = resp.payload {
-                println!("PORT={}", p.port);
-                println!("URL={}", p.url);
-            }
-        }
-        "wait-for-pairing" => {
-            if args.len() < 3 {
-                eprintln!("Usage: tapauth-ipc-cli wait-for-pairing <port>");
-                std::process::exit(1);
-            }
-            let port: u32 = args[2].parse()?;
-            let req = ipc::AdminRequest {
-                payload: Some(ipc::admin_request::Payload::WaitForPairing(
-                    ipc::WaitForPairingRequest { port },
-                )),
-            };
-            let resp = send_admin(req, Duration::from_secs(60)).await?;
-            if resp.status != ipc::AdminStatus::AdminSuccess as i32 {
-                eprintln!("ERROR: {}", resp.error_message);
-                std::process::exit(1);
-            }
-            if let Some(ipc::admin_response::Payload::WaitForPairing(p)) = resp.payload {
-                println!("SAS={}", p.sas_code);
-                println!("PORT={}", p.port);
-            }
-        }
-        "complete-pairing" => {
-            if args.len() < 3 {
-                eprintln!("Usage: tapauth-ipc-cli complete-pairing <port>");
-                std::process::exit(1);
-            }
-            let port: u32 = args[2].parse()?;
-            let req = ipc::AdminRequest {
-                payload: Some(ipc::admin_request::Payload::CompletePairing(
-                    ipc::CompletePairingRequest { port },
-                )),
-            };
-            let resp = send_admin(req, Duration::from_secs(30)).await?;
-            if resp.status != ipc::AdminStatus::AdminSuccess as i32 {
-                eprintln!("ERROR: {}", resp.error_message);
-                std::process::exit(1);
-            }
-            if let Some(ipc::admin_response::Payload::CompletePairing(p)) = resp.payload {
-                println!("SERVER_HEX={}", p.server_hex);
-            }
-        }
-        "get-servers" => {
-            let req = ipc::AdminRequest {
-                payload: Some(ipc::admin_request::Payload::GetServers(
-                    ipc::GetServersRequest {},
-                )),
-            };
-            let resp = send_admin(req, Duration::from_secs(10)).await?;
-            if resp.status != ipc::AdminStatus::AdminSuccess as i32 {
-                eprintln!("ERROR: {}", resp.error_message);
-                std::process::exit(1);
-            }
-            if let Some(ipc::admin_response::Payload::GetServers(p)) = resp.payload {
-                println!("COUNT={}", p.servers.len());
-                for s in p.servers {
-                    println!(
-                        "SERVER: name={}, key={}, users={:?}",
-                        s.name, s.public_key, s.allowed_users
-                    );
-                }
-            }
-        }
-        "remove-device" => {
-            if args.len() < 3 {
-                eprintln!("Usage: tapauth-ipc-cli remove-device <public_key_hex>");
-                std::process::exit(1);
-            }
-            let public_key = args[2].clone();
-            let req = ipc::AdminRequest {
-                payload: Some(ipc::admin_request::Payload::RemoveDevice(
-                    ipc::RemoveDeviceRequest { public_key },
-                )),
-            };
-            let resp = send_admin(req, Duration::from_secs(10)).await?;
-            if resp.status != ipc::AdminStatus::AdminSuccess as i32 {
-                eprintln!("ERROR: {}", resp.error_message);
-                std::process::exit(1);
-            }
-            println!("REMOVED=true");
-        }
-        "set-transports" => {
-            let mut ble = None;
-            let mut network = None;
-            let mut i = 2;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--ble" => {
-                        if i + 1 >= args.len() {
-                            eprintln!("Missing value for --ble");
-                            std::process::exit(1);
-                        }
-                        ble = Some(args[i + 1].parse::<bool>()?);
-                        i += 2;
-                    }
-                    "--network" => {
-                        if i + 1 >= args.len() {
-                            eprintln!("Missing value for --network");
-                            std::process::exit(1);
-                        }
-                        network = Some(args[i + 1].parse::<bool>()?);
-                        i += 2;
-                    }
-                    _ => i += 1,
-                }
-            }
-
-            let cfg_req = ipc::AdminRequest {
-                payload: Some(ipc::admin_request::Payload::GetConfig(
-                    ipc::GetConfigRequest {},
-                )),
-            };
-            let cfg_resp = send_admin(cfg_req, Duration::from_secs(10)).await?;
-            if cfg_resp.status != ipc::AdminStatus::AdminSuccess as i32 {
-                // Refusing to fall back to defaults here: SaveConfig persists the
-                // whole config, so guessing hostname/udp_port could clobber the
-                // daemon's real values.
-                eprintln!(
-                    "ERROR: could not read current config: {}",
-                    cfg_resp.error_message
-                );
-                std::process::exit(1);
-            }
-            let (hostname, udp_port) = match cfg_resp.payload {
-                Some(ipc::admin_response::Payload::GetConfig(c)) => (c.hostname, c.udp_port),
-                _ => {
-                    eprintln!("ERROR: unexpected response payload from get-config");
-                    std::process::exit(1);
-                }
-            };
-
-            let req = ipc::AdminRequest {
-                payload: Some(ipc::admin_request::Payload::SaveConfig(
-                    ipc::SaveConfigRequest {
-                        hostname,
-                        udp_port,
-                        enable_ble: ble,
-                        enable_network: network,
-                    },
-                )),
-            };
-            let resp = send_admin(req, Duration::from_secs(10)).await?;
-            if resp.status != ipc::AdminStatus::AdminSuccess as i32 {
-                eprintln!("ERROR: {}", resp.error_message);
-                std::process::exit(1);
-            }
-            println!("CONFIG_SAVED=true");
-        }
-        "get-config" => {
-            let req = ipc::AdminRequest {
-                payload: Some(ipc::admin_request::Payload::GetConfig(
-                    ipc::GetConfigRequest {},
-                )),
-            };
-            let resp = send_admin(req, Duration::from_secs(10)).await?;
-            if resp.status != ipc::AdminStatus::AdminSuccess as i32 {
-                eprintln!("ERROR: {}", resp.error_message);
-                std::process::exit(1);
-            }
-            if let Some(ipc::admin_response::Payload::GetConfig(c)) = resp.payload {
-                println!("HOSTNAME={}", c.hostname);
-                println!("UDP_PORT={}", c.udp_port);
-                println!("ENABLE_BLE={}", c.enable_ble);
-                println!("ENABLE_NETWORK={}", c.enable_network);
-            }
-        }
-        "pam-auth" => {
-            if args.len() < 3 {
-                eprintln!("Usage: tapauth-ipc-cli pam-auth <username> [timeout_secs] [request_id]");
-                std::process::exit(1);
-            }
-            let user = args[2].clone();
-            let timeout_secs = if args.len() >= 4 {
-                args[3].parse::<u32>()?
-            } else {
-                30
-            };
-            let request_id = if args.len() >= 5 {
-                args[4].clone()
-            } else {
-                format!("test-{}", std::process::id())
-            };
-            // Print the request id before blocking so orchestrators can cancel it.
-            println!("REQUEST_ID={}", request_id);
-            let resp = send_pam_auth(user, timeout_secs, request_id).await?;
-            println!("OUTCOME={}", outcome_name(resp.outcome));
-            println!("DETAIL={}", resp.detail);
-            if resp.outcome != 0 {
-                std::process::exit(resp.outcome);
-            }
-        }
-        "pam-cancel" => {
-            if args.len() < 3 {
-                eprintln!("Usage: tapauth-ipc-cli pam-cancel <request_id> [reason]");
-                std::process::exit(1);
-            }
-            let request_id = args[2].clone();
-            let reason = if args.len() >= 4 {
-                args[3].clone()
-            } else {
-                "cli-cancel".to_string()
-            };
-            let resp = send_pam_cancel(request_id, reason).await?;
-            println!("OUTCOME={}", outcome_name(resp.outcome));
-            println!("DETAIL={}", resp.detail);
-        }
+        "start-pairing" => cmd_start_pairing().await?,
+        "wait-for-pairing" => cmd_wait_for_pairing(&args[2..]).await?,
+        "complete-pairing" => cmd_complete_pairing(&args[2..]).await?,
+        "cancel-pairing" => cmd_cancel_pairing(&args[2..]).await?,
+        "get-servers" => cmd_get_servers().await?,
+        "remove-device" => cmd_remove_device(&args[2..]).await?,
+        "set-transports" => cmd_set_transports(&args[2..]).await?,
+        "get-config" => cmd_get_config().await?,
+        "pam-auth" => cmd_pam_auth(&args[2..]).await?,
+        "pam-cancel" => cmd_pam_cancel(&args[2..]).await?,
         other => {
             eprintln!("Unknown command: {}", other);
             std::process::exit(1);
         }
     }
 
+    Ok(())
+}
+
+async fn cmd_start_pairing() -> Result<(), Box<dyn std::error::Error>> {
+    let req = ipc::AdminRequest {
+        payload: Some(ipc::admin_request::Payload::StartPairing(
+            ipc::StartPairingRequest {},
+        )),
+    };
+    let resp = send_admin(req, Duration::from_secs(10)).await?;
+    if resp.status != ipc::AdminStatus::AdminSuccess as i32 {
+        eprintln!("ERROR: {}", resp.error_message);
+        std::process::exit(1);
+    }
+    if let Some(ipc::admin_response::Payload::StartPairing(p)) = resp.payload {
+        // A BLE-only session has no port: absence is reported by printing no
+        // `PORT=` line at all, never by inventing `0` for one.
+        if let Some(port) = p.port {
+            println!("PORT={}", port);
+        }
+        println!("URL={}", p.url);
+        // Printed for harnesses that later need to address this exact
+        // session to `cancel-pairing`.
+        println!("SESSION_ID={}", hex::encode(&p.session_id));
+    }
+    Ok(())
+}
+
+/// The optional positional port of `wait-for-pairing` / `complete-pairing`.
+///
+/// Absent is a BLE-only session (no port to name); a value must be a real UDP port,
+/// so `0` and anything past `65535` are refused instead of being read as absence.
+fn parse_optional_port(arg: Option<&String>) -> Option<u32> {
+    let arg = arg?;
+    match arg.parse::<u16>() {
+        Ok(port) if port != 0 => Some(u32::from(port)),
+        _ => {
+            eprintln!("Invalid pairing port '{arg}': expected 1..=65535");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn cmd_wait_for_pairing(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let port = parse_optional_port(args.first());
+    let req = ipc::AdminRequest {
+        payload: Some(ipc::admin_request::Payload::WaitForPairing(
+            ipc::WaitForPairingRequest { port },
+        )),
+    };
+    let resp = send_admin(req, PAIRING_REPLY_READ_TIMEOUT).await?;
+    if resp.status != ipc::AdminStatus::AdminSuccess as i32 {
+        eprintln!("ERROR: {}", resp.error_message);
+        std::process::exit(1);
+    }
+    if let Some(ipc::admin_response::Payload::WaitForPairing(p)) = resp.payload {
+        println!("SAS={}", p.sas_code);
+        if let Some(port) = p.port {
+            println!("PORT={}", port);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_complete_pairing(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let port = parse_optional_port(args.first());
+    let req = ipc::AdminRequest {
+        payload: Some(ipc::admin_request::Payload::CompletePairing(
+            ipc::CompletePairingRequest { port },
+        )),
+    };
+    // Must outlive the daemon's `SESSION_REPLY_TIMEOUT` (135 s, see
+    // `PAIRING_REPLY_READ_TIMEOUT`).
+    let resp = send_admin(req, PAIRING_REPLY_READ_TIMEOUT).await?;
+    if resp.status != ipc::AdminStatus::AdminSuccess as i32 {
+        eprintln!("ERROR: {}", resp.error_message);
+        std::process::exit(1);
+    }
+    if let Some(ipc::admin_response::Payload::CompletePairing(p)) = resp.payload {
+        println!("SERVER_HEX={}", p.server_hex);
+    }
+    Ok(())
+}
+
+async fn cmd_cancel_pairing(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (port, session_id) = parse_cancel_flags(args);
+
+    let req = ipc::AdminRequest {
+        payload: Some(ipc::admin_request::Payload::CancelPairing(
+            ipc::CancelPairingRequest { port, session_id },
+        )),
+    };
+    let resp = send_admin(req, Duration::from_secs(30)).await?;
+    if resp.status != ipc::AdminStatus::AdminSuccess as i32 {
+        eprintln!("ERROR: {}", resp.error_message);
+        std::process::exit(1);
+    }
+    println!("CANCELLED=true");
+    Ok(())
+}
+
+/// Parse `cancel-pairing`'s flags.
+///
+/// Both flags are optional on the wire: an absent port and an empty session id mean
+/// "don't check that field", which is what the daemon does for a GUI that tears its
+/// screen down. The port used to be spelled `0` for that; it is now absent, and a
+/// `0` on the command line is refused rather than read as the wildcard.
+fn parse_cancel_flags(args: &[String]) -> (Option<u32>, Vec<u8>) {
+    let mut port: Option<u32> = None;
+    let mut session_id: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--port" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Missing value for --port");
+                    std::process::exit(1);
+                }
+                match args[i + 1].parse::<u16>() {
+                    Ok(value) if value != 0 => port = Some(u32::from(value)),
+                    Ok(_) => {
+                        eprintln!("Invalid --port '0': expected 1..=65535");
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Invalid --port '{}': {}", args[i + 1], e);
+                        std::process::exit(1);
+                    }
+                }
+                i += 2;
+            }
+            "--session-id" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Missing value for --session-id");
+                    std::process::exit(1);
+                }
+                match parse_session_id(&args[i + 1]) {
+                    Ok(value) => session_id = value,
+                    Err(e) => {
+                        eprintln!("Invalid --session-id: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                i += 2;
+            }
+            other => {
+                eprintln!(
+                    "Unknown argument '{}'. Usage: tapauth-ipc-cli cancel-pairing \
+                     [--port <port>] [--session-id <hex>]",
+                    other
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+    (port, session_id)
+}
+
+async fn cmd_get_servers() -> Result<(), Box<dyn std::error::Error>> {
+    let req = ipc::AdminRequest {
+        payload: Some(ipc::admin_request::Payload::GetServers(
+            ipc::GetServersRequest {},
+        )),
+    };
+    let resp = send_admin(req, Duration::from_secs(10)).await?;
+    if resp.status != ipc::AdminStatus::AdminSuccess as i32 {
+        eprintln!("ERROR: {}", resp.error_message);
+        std::process::exit(1);
+    }
+    if let Some(ipc::admin_response::Payload::GetServers(p)) = resp.payload {
+        println!("COUNT={}", p.servers.len());
+        for s in p.servers {
+            println!(
+                "SERVER: name={}, key={}, users={:?}",
+                s.name, s.public_key, s.allowed_users
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_remove_device(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.is_empty() {
+        eprintln!("Usage: tapauth-ipc-cli remove-device <public_key_hex>");
+        std::process::exit(1);
+    }
+    let public_key = args[0].clone();
+    let req = ipc::AdminRequest {
+        payload: Some(ipc::admin_request::Payload::RemoveDevice(
+            ipc::RemoveDeviceRequest { public_key },
+        )),
+    };
+    let resp = send_admin(req, Duration::from_secs(10)).await?;
+    if resp.status != ipc::AdminStatus::AdminSuccess as i32 {
+        eprintln!("ERROR: {}", resp.error_message);
+        std::process::exit(1);
+    }
+    println!("REMOVED=true");
+    Ok(())
+}
+
+async fn cmd_set_transports(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (ble, network) = parse_transport_flags(args)?;
+
+    let cfg_req = ipc::AdminRequest {
+        payload: Some(ipc::admin_request::Payload::GetConfig(
+            ipc::GetConfigRequest {},
+        )),
+    };
+    let cfg_resp = send_admin(cfg_req, Duration::from_secs(10)).await?;
+    if cfg_resp.status != ipc::AdminStatus::AdminSuccess as i32 {
+        // Refusing to fall back to defaults here: SaveConfig persists the
+        // whole config, so guessing hostname/udp_port could clobber the
+        // daemon's real values.
+        eprintln!(
+            "ERROR: could not read current config: {}",
+            cfg_resp.error_message
+        );
+        std::process::exit(1);
+    }
+    let (hostname, udp_port) = match cfg_resp.payload {
+        Some(ipc::admin_response::Payload::GetConfig(c)) => (c.hostname, c.udp_port),
+        _ => {
+            eprintln!("ERROR: unexpected response payload from get-config");
+            std::process::exit(1);
+        }
+    };
+
+    let req = ipc::AdminRequest {
+        payload: Some(ipc::admin_request::Payload::SaveConfig(
+            ipc::SaveConfigRequest {
+                hostname,
+                udp_port,
+                enable_ble: ble,
+                enable_network: network,
+            },
+        )),
+    };
+    let resp = send_admin(req, Duration::from_secs(10)).await?;
+    if resp.status != ipc::AdminStatus::AdminSuccess as i32 {
+        eprintln!("ERROR: {}", resp.error_message);
+        std::process::exit(1);
+    }
+    println!("CONFIG_SAVED=true");
+    Ok(())
+}
+
+/// Parse `set-transports`' flags. A flag that is absent stays `None`, which the
+/// daemon reads as "leave this transport as it is".
+fn parse_transport_flags(
+    args: &[String],
+) -> Result<(Option<bool>, Option<bool>), Box<dyn std::error::Error>> {
+    let mut ble = None;
+    let mut network = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ble" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Missing value for --ble");
+                    std::process::exit(1);
+                }
+                ble = Some(args[i + 1].parse::<bool>()?);
+                i += 2;
+            }
+            "--network" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Missing value for --network");
+                    std::process::exit(1);
+                }
+                network = Some(args[i + 1].parse::<bool>()?);
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    Ok((ble, network))
+}
+
+async fn cmd_get_config() -> Result<(), Box<dyn std::error::Error>> {
+    let req = ipc::AdminRequest {
+        payload: Some(ipc::admin_request::Payload::GetConfig(
+            ipc::GetConfigRequest {},
+        )),
+    };
+    let resp = send_admin(req, Duration::from_secs(10)).await?;
+    if resp.status != ipc::AdminStatus::AdminSuccess as i32 {
+        eprintln!("ERROR: {}", resp.error_message);
+        std::process::exit(1);
+    }
+    if let Some(ipc::admin_response::Payload::GetConfig(c)) = resp.payload {
+        println!("HOSTNAME={}", c.hostname);
+        println!("UDP_PORT={}", c.udp_port);
+        println!("ENABLE_BLE={}", c.enable_ble);
+        println!("ENABLE_NETWORK={}", c.enable_network);
+    }
+    Ok(())
+}
+
+async fn cmd_pam_auth(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.is_empty() {
+        eprintln!(
+            "Usage: tapauth-ipc-cli pam-auth <username> [timeout_secs] [request_id] \
+             [--pam-service <name>] [--process-name <name>]"
+        );
+        std::process::exit(1);
+    }
+    let user = args[0].clone();
+    let (positional, pam_service, process_name) = parse_pam_flags(&args[1..]);
+
+    let timeout_secs = match positional.first() {
+        Some(value) => value.parse::<u32>()?,
+        None => 30,
+    };
+    let request_id = positional
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| format!("test-{}", std::process::id()));
+    // Print the request id before blocking so orchestrators can cancel it.
+    println!("REQUEST_ID={}", request_id);
+    let resp = send_pam_auth(user, timeout_secs, request_id, pam_service, process_name).await?;
+    println!("OUTCOME={}", outcome_name(resp.outcome));
+    println!("DETAIL={}", resp.detail);
+    if resp.outcome != 0 {
+        std::process::exit(resp.outcome);
+    }
+    Ok(())
+}
+
+/// Parse `pam-auth`'s context flags.
+///
+/// Positional arguments keep their historical meaning; the context flags are
+/// optional and default to empty (an unset context).
+fn parse_pam_flags(args: &[String]) -> (Vec<String>, String, String) {
+    let mut positional: Vec<String> = Vec::new();
+    let mut pam_service = String::new();
+    let mut process_name = String::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--pam-service" => {
+                pam_service = args.get(i + 1).cloned().unwrap_or_default();
+                i += 2;
+            }
+            "--process-name" => {
+                process_name = args.get(i + 1).cloned().unwrap_or_default();
+                i += 2;
+            }
+            other => {
+                positional.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    (positional, pam_service, process_name)
+}
+
+async fn cmd_pam_cancel(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.is_empty() {
+        eprintln!("Usage: tapauth-ipc-cli pam-cancel <request_id> [reason]");
+        std::process::exit(1);
+    }
+    let request_id = args[0].clone();
+    let reason = if args.len() >= 2 {
+        args[1].clone()
+    } else {
+        "cli-cancel".to_string()
+    };
+    let resp = send_pam_cancel(request_id, reason).await?;
+    println!("OUTCOME={}", outcome_name(resp.outcome));
+    println!("DETAIL={}", resp.detail);
     Ok(())
 }

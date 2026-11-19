@@ -6,6 +6,7 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import com.google.zxing.*
 import com.google.zxing.common.HybridBinarizer
+import dev.rourunisen.tapauth.service.scrubLogValue
 
 class QRCodeAnalyzer(private val onQRCodeDetected: (String) -> Unit) : ImageAnalysis.Analyzer {
 
@@ -60,7 +61,7 @@ class QRCodeAnalyzer(private val onQRCodeDetected: (String) -> Unit) : ImageAnal
             try {
                 val result = reader.decodeWithState(bitmap)
                 isProcessing = true
-                Log.i(TAG, "✓ QR Code detected: ${result.text}")
+                Log.i(TAG, "✓ QR Code detected: ${scrubLogValue(result.text)}")
                 onQRCodeDetected(result.text)
             } catch (e: NotFoundException) {
                 // No QR code in this frame - this is normal, don't log

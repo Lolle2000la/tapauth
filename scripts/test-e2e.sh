@@ -32,9 +32,877 @@ cd "$PROJECT_ROOT"
 
 echo "╔═══════════════════════════════════════════════════════════════╗"
 echo "║      TapAuth Full Real-Android End-to-End Test Suite          ║"
-echo "║      (TCP Pairing + UDP Network + BLE GATT Authentication)   ║"
+echo "║      (v2 UDP/BLE Pairing + UDP Network + BLE GATT Auth)       ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo ""
+
+# ── Phase registry ────────────────────────────────────────────────────────────
+#
+# The summary at the end of this suite is GENERATED from what each phase records
+# here while it runs; there is no second, hand-written copy of the phase list to
+# fall out of date. A phase that is added to the suite but not given a record
+# shows up as NOT RUN, and a phase that skipped shows SKIPPED with the reason it
+# skipped — neither can claim PASSED merely because the script reached the
+# summary.
+#
+# PHASE_ORDER    the ids the matrix prints, in PRINT order. That is deliberately
+#                not the run order: 7 and 6b run last but print at positions
+#                10-11, which reproduces the matrix this suite has always
+#                printed. It must name exactly the ids in PHASE_NAME, once each
+#                (checked at startup by registry_selfcheck).
+# PHASE_NAME     id -> phase label. These strings are part of the log surface CI
+#                and the per-distro E2E wrappers key off; do not renumber or
+#                reword them.
+# PHASE_OUTCOME  id -> pass | fail | skip, written only by phase_pass/phase_fail/
+#                phase_skip.
+# PHASE_ASSERTED id -> what that outcome actually asserted, or why it skipped.
+#
+# An id with no recorded outcome prints NOT RUN. Only a `pass` record can ever
+# produce PASSED.
+#
+# The two lists are kept in step by registry_selfcheck, which runs on every
+# invocation: an id that is in PHASE_NAME but not PHASE_ORDER would otherwise
+# record into a key the matrix never prints (no row, no counter, exit 0), and an
+# id in PHASE_ORDER with no label would print a nameless row.
+PHASE_ORDER=(
+    "1a" "1b" "1c" "2" "2-mcast" "2b" "2e" "2c" "2d" "7" "6b" "3" "4" "5" "5b" "6"
+)
+declare -A PHASE_NAME=(
+    ["1a"]="Phase 1a: Pairing negatives (SAS + pk pin)"
+    ["1b"]="Phase 1b: v2 UDP pairing (QEMU SLIRP)"
+    ["1c"]="Phase 1c: v2 BLE-only pairing (vhci)"
+    ["2"]="Phase 2: Local Network (UDP) Authentication"
+    ["2-mcast"]="Phase 2: Custom multicast groups (v4 + v6)"
+    ["2b"]="Phase 2b: Real PAM Module (pamtester)"
+    ["2e"]="Phase 2e: Mixed-stack PAM (grant path)"
+    ["2c"]="Phase 2c: Adversarial Replay + PamCancel"
+    ["2d"]="Phase 2d: Adversarial Tampered Ciphertext"
+    ["7"]="Phase 7: Admin IPC Authorization (PolKit)"
+    ["6b"]="Phase 6b: Mixed-stack PAM password fallback"
+    ["3"]="Phase 3: Bluetooth Low Energy (BLE)"
+    ["4"]="Phase 4: Parallel Race (UDP + BLE)"
+    ["5"]="Phase 5: Explicit Denial & Rejection"
+    ["5b"]="Phase 5b: Authentication Timeout"
+    ["6"]="Phase 6: Device Removal & Ignore Outcome"
+)
+declare -A PHASE_OUTCOME=()
+declare -A PHASE_ASSERTED=()
+
+# The number of phases the matrix publishes. Adding or removing a phase is a
+# deliberate change to a log surface other CI logs are read against, so it is
+# also a deliberate change here; registry_selfcheck fails until it is.
+EXPECTED_PHASE_COUNT=16
+
+# Summary counters, filled in by print_phase_summary.
+SUMMARY_PASSED=0
+SUMMARY_SKIPPED=0
+SUMMARY_FAILED=0
+SUMMARY_NOT_RUN=0
+
+# phase_id_registered <id>: 0 when <id> is one of the published phases.
+phase_id_registered() {
+    local want=$1 known
+    for known in "${PHASE_ORDER[@]}"; do
+        if [ "$known" = "$want" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# phase_record <id> <pass|fail|skip> <what it asserted / why it skipped>
+#
+# Pure bookkeeping: it returns 0 unconditionally, so it can never defuse `set -e`
+# and can never turn a phase's own failure into a pass. A phase still signals
+# failure the way it always has — by exiting non-zero itself — and this only
+# remembers what happened on the way there.
+#
+# An id that is not published by BOTH lists is a bug in this file, not in a
+# phase: recording it would be stored in a key the matrix never prints, so it
+# aborts rather than pass silently.
+phase_record() {
+    local id=$1 outcome=$2 note=${3:-}
+    if ! phase_id_registered "$id" || [ -z "${PHASE_NAME[$id]:-}" ]; then
+        echo "❌ ERROR (phase registry): '${id}' is not a published phase (it is missing from PHASE_ORDER or PHASE_NAME)." >&2
+        exit 1
+    fi
+    case "$outcome" in
+        pass|fail|skip) ;;
+        *)
+            echo "❌ ERROR (phase registry): invalid outcome '${outcome}' for phase '${id}'." >&2
+            exit 1
+            ;;
+    esac
+    PHASE_OUTCOME["$id"]="$outcome"
+    PHASE_ASSERTED["$id"]="$note"
+    return 0
+}
+
+phase_pass() { phase_record "$1" pass "${2:-assertion not recorded}"; }
+phase_fail() { phase_record "$1" fail "${2:-failure reason not recorded}"; }
+phase_skip() { phase_record "$1" skip "${2:-reason not recorded}"; }
+
+# outcome_label <pass|fail|skip|anything else>: the word the matrix prints for a
+# raw registry outcome. This is the ONE place an outcome becomes a word, so the
+# startup self-check and the rendered rows cannot disagree about it.
+outcome_label() {
+    case "$1" in
+        pass) printf 'PASSED' ;;
+        skip) printf 'SKIPPED' ;;
+        fail) printf 'FAILED' ;;
+        *)    printf 'NOT RUN' ;;
+    esac
+}
+
+# phase_outcome_label <id>: the word printed for a registry id. A recorded pass
+# is the only thing that can become PASSED.
+phase_outcome_label() {
+    outcome_label "${PHASE_OUTCOME[$1]:-}"
+}
+
+# count_phase_outcomes: fill the SUMMARY_* counters from the registry. Called by
+# print_phase_summary so the counts and the rows can never disagree.
+count_phase_outcomes() {
+    local id
+    SUMMARY_PASSED=0
+    SUMMARY_SKIPPED=0
+    SUMMARY_FAILED=0
+    SUMMARY_NOT_RUN=0
+    for id in "${PHASE_ORDER[@]}"; do
+        case "$(phase_outcome_label "$id")" in
+            PASSED)  SUMMARY_PASSED=$((SUMMARY_PASSED + 1)) ;;
+            SKIPPED) SUMMARY_SKIPPED=$((SUMMARY_SKIPPED + 1)) ;;
+            FAILED)  SUMMARY_FAILED=$((SUMMARY_FAILED + 1)) ;;
+            *)       SUMMARY_NOT_RUN=$((SUMMARY_NOT_RUN + 1)) ;;
+        esac
+    done
+    return 0
+}
+
+# phase_summary_verdict: 0 when the matrix may be accepted (every phase passed
+# or skipped with a recorded reason), 1 when any phase failed or never reported.
+# This is the gate the suite's own exit status rests on.
+phase_summary_verdict() {
+    if [ "$SUMMARY_FAILED" -ne 0 ] || [ "$SUMMARY_NOT_RUN" -ne 0 ]; then
+        return 1
+    fi
+    return 0
+}
+
+# registry_selfcheck: run on EVERY invocation, before any phase or device
+# interaction, so the registry's own coherence is checked by real runs instead of
+# only by the env-gated stub below (which is manual-only). Cheap and device-free:
+# it reads the two lists and the outcome mapping, never the host.
+#
+# It exists because the two lists are hand-kept. An id added to PHASE_NAME with a
+# record call but missing from PHASE_ORDER would record into a key nothing
+# renders — no row, no counter change, exit 0 — which is exactly the silent gap
+# the registry is meant to remove.
+registry_selfcheck() {
+    local id problems=""
+    # 1. Both lists must hold the published number of ids...
+    if [ "${#PHASE_ORDER[@]}" -ne "$EXPECTED_PHASE_COUNT" ] \
+        || [ "${#PHASE_NAME[@]}" -ne "$EXPECTED_PHASE_COUNT" ]; then
+        problems="${problems}expected ${EXPECTED_PHASE_COUNT} phases but PHASE_ORDER has ${#PHASE_ORDER[@]} and PHASE_NAME has ${#PHASE_NAME[@]}; "
+    fi
+    # ...the same ones, each once, each labelled.
+    for id in "${PHASE_ORDER[@]}"; do
+        if [ -z "${PHASE_NAME[$id]:-}" ]; then
+            problems="${problems}'${id}' is in PHASE_ORDER but has no PHASE_NAME; "
+        fi
+        if [ "$(printf '%s\n' "${PHASE_ORDER[@]}" | grep -c -x -F -- "$id")" -ne 1 ]; then
+            problems="${problems}'${id}' appears more than once in PHASE_ORDER; "
+        fi
+    done
+    for id in "${!PHASE_NAME[@]}"; do
+        if ! phase_id_registered "$id"; then
+            problems="${problems}'${id}' is in PHASE_NAME but not in PHASE_ORDER, so nothing would print it; "
+        fi
+    done
+    # 2. The outcome -> word mapping, probed through the very function the matrix
+    #    renders with (outcome_label), so it cannot drift from the rows.
+    if [ "$(outcome_label pass)" != "PASSED" ] \
+        || [ "$(outcome_label skip)" != "SKIPPED" ] \
+        || [ "$(outcome_label fail)" != "FAILED" ] \
+        || [ "$(outcome_label "")" != "NOT RUN" ]; then
+        problems="${problems}the pass/skip/fail/unset -> PASSED/SKIPPED/FAILED/NOT RUN mapping is broken; "
+    fi
+    for id in skip fail ""; do
+        if [ "$(outcome_label "$id")" = "PASSED" ]; then
+            problems="${problems}outcome '${id}' maps to PASSED, and only a recorded pass may; "
+        fi
+    done
+    if [ -n "$problems" ]; then
+        echo "❌ ERROR (phase registry): ${problems%; }" >&2
+        echo "   PHASE_ORDER and PHASE_NAME must name the same ${EXPECTED_PHASE_COUNT} phases, once each;" >&2
+        echo "   the matrix at the end of this suite is generated from them." >&2
+        exit 1
+    fi
+    echo "✅ Phase registry self-check: ${EXPECTED_PHASE_COUNT} phases, ids and outcome labels consistent."
+    return 0
+}
+
+registry_selfcheck
+
+# print_phase_summary: render the matrix and the assertion notes from the
+# registry. Sets the SUMMARY_* counters and returns 0 either way; the end of the
+# suite decides what a non-clean matrix means for the exit status.
+print_phase_summary() {
+    local id label note
+    count_phase_outcomes
+    echo "╔═══════════════════════════════════════════════════════════════╗"
+    echo "║  E2E TEST MATRIX SUMMARY                                      ║"
+    echo "╠═══════════════════════════════════════════════════════════════╣"
+    for id in "${PHASE_ORDER[@]}"; do
+        label="${PHASE_NAME[$id]}"
+        printf '║  %-46s %-9s     ║\n' "${label}:" "$(phase_outcome_label "$id")"
+    done
+    if [ "${E2E_DAEMON_MODE:-}" = "systemd" ]; then
+        # The ✔ marks the mode this run used, as the pre-registry matrix did. It
+        # is appended after the padded column because printf pads %s by BYTES and
+        # the glyph is 3 of them; the fixed 12-space tail keeps the row at the
+        # box's 63 content columns (2 + 48 + 1 + 12) and at the same column
+        # offsets the old hand-written row used.
+        printf '║  %-48s✔%12s║\n' "Daemon mode: systemd socket activation (prod)   " ""
+    else
+        # Same row shape as the systemd branch above: the glyph is appended after
+        # the padded column (printf pads %s by bytes, the glyph is 3 of them) and
+        # the fixed 12-space tail holds the row at 63 content columns, matching
+        # the offsets the old hand-written matrix used.
+        printf '║  %-48s✔%12s║\n' "Daemon mode: dev sandbox (fallback-socket)      " ""
+    fi
+    echo "╠═══════════════════════════════════════════════════════════════╣"
+    printf '║  %-61s║\n' \
+        "${SUMMARY_PASSED} passed, ${SUMMARY_SKIPPED} skipped, ${SUMMARY_FAILED} failed, ${SUMMARY_NOT_RUN} not run (of ${#PHASE_ORDER[@]} phases)"
+    echo "╚═══════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "Recorded assertions (what each recorded outcome actually checked):"
+    for id in "${PHASE_ORDER[@]}"; do
+        label="${PHASE_NAME[$id]}"
+        note="${PHASE_ASSERTED[$id]:-the phase never recorded an outcome}"
+        printf '  %s\n    %s: %s\n' "$label" "$(phase_outcome_label "$id")" "$note"
+    done
+    return 0
+}
+
+# finish_suite: print the generated summary and turn it into the suite's exit
+# status. Exits 1 when any phase failed or never reported, so a phase that never
+# recorded an outcome cannot ride the 🎉 line into a green run.
+finish_suite() {
+    echo ""
+    print_phase_summary
+    echo ""
+    if ! phase_summary_verdict; then
+        echo "❌ E2E SUITE INCOMPLETE: ${SUMMARY_FAILED} phase(s) FAILED and ${SUMMARY_NOT_RUN} phase(s) never reported an outcome."
+        echo "   A phase with no recorded outcome is a registry/phase mismatch in this script, not a pass."
+        exit 1
+    fi
+    if [ "$SUMMARY_SKIPPED" -ne 0 ]; then
+        echo "✅ Every phase that ran PASSED; ${SUMMARY_SKIPPED} phase(s) SKIPPED (reasons in the matrix above)."
+    else
+        echo "🎉 ALL MANDATORY END-TO-END TESTS PASSED SUCCESSFULLY!"
+    fi
+}
+
+# ── One prompt per challenge (Phase 4) ───────────────────────────────────────
+#
+# Phase 4 exists to prove the daemon does not open one auth session per
+# transport for the same challenge. The phone is the only place that shows
+# this, and it logs one line per prompt it raises:
+#
+#   Posting auth notification (id=…) for … @ user@host, challenge=<16 hex>…
+#   (server-android/.../service/AuthRequestManager.kt:400-409)
+#
+# The `challenge=` prefix is the grouping key, and it is the right one because
+# it is the key the product itself collapses on: the phone answers a challenge
+# it has already claimed on the other transport with "already claimed by …"
+# (TransportLockManager.tryClaimTransport, :39-46, :72), so one prompt per
+# challenge is exactly the property "one session per request" reduces to.
+#
+# The assertion is one prompt PER CHALLENGE, not one prompt in the window.
+# Phase 4 retries by design (authenticate_with_ble_retry, BLE_MAX_ATTEMPTS), and
+# a retry is a new request with a new challenge that may legitimately prompt
+# again; failing on that count would replace a real gap with an intermittent,
+# required CI failure. What must never happen is two prompt lines for the SAME
+# challenge. The residual is deliberate and worth naming: a defect that minted a
+# *fresh* challenge per transport would look like a retry here, because the
+# phone cannot tell the two apart. That shape is what the daemon's one-session
+# design rules out (a session owns its nonce and fans it out over both
+# transports), and it is not what this check claims to catch.
+#
+# Scope is the lines from the first `Auth request caller context:` line carrying
+# this phase's per-phase token onwards (:167-169). The token is what ties the
+# phone's lines to *this* phase — no earlier phase's line carries it — and
+# everything before it belongs to an earlier phase. That cut is load bearing:
+# the BLE disconnect-grace path deliberately re-raises a *released* challenge
+# on the retransmission that finally arrives (AGENTS.md, Transport Details), so
+# a same-challenge duplicate in Phase 3 is correct behaviour and must not be
+# charged to Phase 4. The cost of the cut is that a logcat rotation which drops
+# the caller-context line entirely is reported as "cannot attribute", never as
+# a pass.
+#
+# Defined here, before the self-test below, so `TAPAUTH_E2E_SELFTEST=race-prompts`
+# can exercise it on synthetic dumps; the suite proper calls it from Phase 4.
+race_prompt_check() {
+    local token=$1 dump=$2 start challenges prompts distinct duplicates dup
+    start=$(printf '%s\n' "$dump" | grep -nF "pamService=${token}," | head -n1 | cut -d: -f1 || true)
+    if [ -z "$start" ]; then
+        echo "❌ ERROR: the phone logged no caller-context line for this request ('pamService=${token},'),"
+        echo "   so no prompt can be attributed to this phase."
+        echo "---- caller-context lines in the phone log ----"
+        printf '%s\n' "$dump" | grep -F 'caller context' || true
+        return 1
+    fi
+
+    challenges=$(printf '%s\n' "$dump" | awk -v start="$start" '
+        NR < start { next }
+        /Posting auth notification/ {
+            if (match($0, /challenge=[0-9a-f]+/)) print substr($0, RSTART + 10, RLENGTH - 10)
+        }')
+    if [ -z "$challenges" ]; then
+        echo "❌ ERROR: no 'Posting auth notification … challenge=…' line in the phone log belongs to this"
+        echo "   request, so 'one prompt per challenge' would hold vacuously. The phone either never"
+        echo "   prompted, or its prompt line no longer carries the challenge= field this groups on."
+        echo "---- prompt lines in the phone log ----"
+        printf '%s\n' "$dump" | grep -F 'auth notification' || true
+        return 1
+    fi
+
+    prompts=$(printf '%s\n' "$challenges" | grep -c . || true)
+    distinct=$(printf '%s\n' "$challenges" | sort -u | grep -c . || true)
+    duplicates=$(printf '%s\n' "$challenges" | sort | uniq -d || true)
+    if [ -n "$duplicates" ]; then
+        dup=$(printf '%s\n' "$duplicates" | head -n1)
+        echo "❌ ERROR: the phone raised more than one prompt for the same challenge (${dup})."
+        echo "   That is what a per-transport session looks like from the phone: the daemon opened a"
+        echo "   session per transport and handed the phone two requests for one challenge."
+        echo "---- every prompt line carrying challenge=${dup} ----"
+        printf '%s\n' "$dump" | grep -F 'Posting auth notification' | grep -F "challenge=${dup}" || true
+        echo "---- prompts for this request, per challenge ----"
+        printf '%s\n' "$challenges" | sort | uniq -c | sed 's/^/  /'
+        return 1
+    fi
+
+    echo "✅ One prompt per challenge on the phone for this request (${prompts} prompt(s) across ${distinct} challenge(s); more than one challenge is a legitimate retry)."
+    return 0
+}
+
+# ── Daemon-log window helpers ─────────────────────────────────────────────────
+#
+# Both of these read the daemon log from a line offset taken before the request,
+# so a match left behind by an earlier phase cannot satisfy a later assertion.
+# They are defined here, before their first consumer (Phase 2), and not beside
+# Phase 2c where they used to live: this file is top-level sequential code, so a
+# function is only a command once the interpreter has reached its definition
+# line. A call above the definition is not a failed assertion — it is
+# `bash: grant_transport_since: command not found` and, under `set -e`, exit
+# 127, which reports a harness defect as though it were a test verdict.
+# `TAPAUTH_E2E_SELFTEST=helper-order` (below) keeps that from recurring.
+
+# Helper: assert a pattern is present in the daemon log AFTER a given line
+# offset (window-scoped, so stale matches from earlier phases don't count).
+assert_log_since() {
+    local base=$1 pattern=$2 label=$3
+    if tail -n +"$((base + 1))" "$DAEMON_LOG" 2>/dev/null | grep -q "$pattern"; then
+        echo "✅ ${label}"
+    else
+        echo "❌ ERROR (${label}): pattern '$pattern' not found in the daemon log for this phase."
+        exit 1
+    fi
+}
+
+# Print the transport named by the newest "Authentication granted over …" line
+# after a given line offset, or nothing when that window holds none.
+grant_transport_since() {
+    local base=$1
+    tail -n +"$((base + 1))" "$DAEMON_LOG" 2>/dev/null \
+        | grep -o "Authentication granted over [A-Za-z]*" \
+        | tail -n 1 \
+        | awk '{print $NF}'
+}
+
+# ── Helper definition order ──────────────────────────────────────────────────
+#
+# This suite is top-level sequential code with `set -e`: a shell function is a
+# command only from the line its definition was read onwards. Calling one above
+# its definition is neither a compile error nor a failed assertion — bash prints
+# `command not found` and, because the call sits in an assignment or a bare
+# command, `set -e` aborts the run with status 127. `bash -n` accepts it (the
+# name is a perfectly good word) and no assertion ever renders a verdict, so the
+# CI job reports a harness defect in the shape of a test failure. That is what
+# happened to the Phase 2 transport assertion when it was added beside the
+# phase instead of above it.
+#
+# helper_order_violations <file> prints one line per call site that can run
+# before the callee is defined, and returns 1 when it printed any. Execution
+# order is computed, not guessed:
+#
+#   * a call at top level runs at its own line, because the file is sequential;
+#   * a call inside a function body runs whenever that function is first
+#     reached, so it is charged to the enclosing function's earliest execution
+#     line — which is why a helper called from a function that only runs later
+#     is correctly *not* a violation, and why the same body is a violation as
+#     soon as its caller is reached too early;
+#   * a function that is never reached from top level cannot run at all, so
+#     nothing inside it is a violation.
+#
+# A function is recognised by a `name() {` definition line, and the call sites
+# are the command words of the line: the first word of each fragment split on
+# `| & ; ( ) { }`, after dropping leading keywords (`if`, `then`, `!`, …) and
+# leading `VAR=` assignments — the last of which is the `X=$(helper)` shape that
+# actually broke CI. The scan is deliberately structural rather than a git diff:
+# it reads the file as bash would encounter it.
+helper_order_violations() {
+    local target=${1:?helper_order_violations needs a file}
+    awk '
+    BEGIN {
+        INF = 1000000000
+        KW = "if|then|else|elif|while|until|do|!|time|command|builtin|exec"
+        KWRE = "^(" KW ")[ \t]+"
+        SQ = sprintf("%c", 39)
+        DQ = sprintf("%c", 34)
+        # Built rather than written out so this program cannot match itself: a
+        # literal home-of-a-heredoc pattern in here would be found by the very
+        # scan that reads this file.
+        HRE = "<<-?[ \t]*[" SQ DQ "]?[A-Za-z_][A-Za-z0-9_]*"
+    }
+    { src[NR] = $0 }
+    END {
+        n = NR
+
+        # Pass 0: mark heredoc bodies. They are data written somewhere, not
+        # shell this file runs, so a line inside one is neither a definition
+        # nor a call — that is also why this self-test can build its fixtures
+        # with heredocs without the scan treating them as part of the suite.
+        # An unterminated heredoc would make the scan skip the rest of the
+        # file, but `bash -n` already rejects that shape, so it cannot arrive
+        # here as a silent pass.
+        for (i = 1; i <= n; i++) {
+            if (skip[i]) continue
+            line = src[i]
+            if (line ~ /^[ \t]*#/) continue
+            if (!match(line, HRE)) continue
+            d = substr(line, RSTART, RLENGTH)
+            sub(/^<<-?[ \t]*/, "", d)
+            gsub(SQ, "", d)
+            gsub(DQ, "", d)
+            for (j = i + 1; j <= n; j++) {
+                skip[j] = 1
+                if (src[j] == d) break
+            }
+            i = j
+        }
+
+        # Pass 1: definitions and the line range of each body. A body ends at
+        # the first line that is nothing but a closing brace at the definition
+        # line indentation or less; the definition lines themselves are skipped
+        # so a brace inside a body cannot be mistaken for another definition.
+        for (i = 1; i <= n; i++) {
+            if (skip[i]) continue
+            line = src[i]
+            if (line ~ /^[ \t]*#/) continue
+            if (line !~ /^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)[ \t]*\{/) continue
+            nm = line
+            sub(/^[ \t]*/, "", nm)
+            sub(/[ \t]*\(\)[ \t]*\{.*/, "", nm)
+            if (nm in defline) continue
+            lead = line
+            sub(/[^ \t].*$/, "", lead)
+            ind = length(lead)
+            defline[nm] = i
+            deforder[++ndefs] = nm
+            after = line
+            sub(/^[^{]*\{/, "", after)
+            if (after ~ /\}/) { endline[nm] = i; continue }
+            endline[nm] = n
+            for (j = i + 1; j <= n; j++) {
+                if (src[j] !~ /^[ \t]*\}[ \t]*$/) continue
+                lead2 = src[j]
+                sub(/[^ \t].*$/, "", lead2)
+                if (length(lead2) <= ind) { endline[nm] = j; break }
+            }
+            i = endline[nm]
+        }
+
+        # Pass 2: call sites, each tagged with the function body it sits in.
+        for (i = 1; i <= n; i++) {
+            if (skip[i]) continue
+            line = src[i]
+            if (line ~ /^[ \t]*#/) continue
+            nseg = split(line, segs, /[|&;(){}]/)
+            for (s = 1; s <= nseg; s++) {
+                seg = segs[s]
+                sub(/^[ \t]+/, "", seg)
+                while (1) {
+                    if (seg ~ KWRE) { sub(KWRE, "", seg); continue }
+                    if (seg ~ /^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*/) {
+                        sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*/, "", seg)
+                        continue
+                    }
+                    break
+                }
+                w = seg
+                sub(/[ \t].*$/, "", w)
+                if (w == "") continue
+                if (!(w in defline)) continue
+                if (i == defline[w]) continue
+                ncalls++
+                callline[ncalls] = i
+                callname[ncalls] = w
+                enc = ""
+                for (d = 1; d <= ndefs; d++) {
+                    dn = deforder[d]
+                    if (i > defline[dn] && i <= endline[dn]) { enc = dn; break }
+                }
+                callenc[ncalls] = enc
+            }
+        }
+
+        # Pass 3: earliest line at which each function can be reached, to a
+        # fixpoint so a chain of calls propagates.
+        for (d = 1; d <= ndefs; d++) earliest[deforder[d]] = INF
+        for (it = 0; it <= ndefs + 1; it++) {
+            changed = 0
+            for (c = 1; c <= ncalls; c++) {
+                g = callenc[c]
+                t = (g == "") ? callline[c] : earliest[g]
+                if (t < earliest[callname[c]]) { earliest[callname[c]] = t; changed = 1 }
+            }
+            if (!changed) break
+        }
+
+        # Pass 4: report.
+        for (c = 1; c <= ncalls; c++) {
+            f = callname[c]
+            g = callenc[c]
+            t = (g == "") ? callline[c] : earliest[g]
+            if (t >= defline[f]) continue
+            where = (g == "") ? "top level" : ("inside " g)
+            printf "line %d: %s is called at line %d (%s) but is only defined at line %d\n",
+                t, f, callline[c], where, defline[f]
+            nviol++
+        }
+        exit (nviol > 0)
+    }
+    ' "$target"
+}
+
+# ── Registry self-test (dry run; needs no device, daemon or emulator) ────────
+#
+# Only entered when TAPAUTH_E2E_SELFTEST is set; the normal path ignores it
+# entirely. It exists so the two things this registry can get wrong are provable
+# without running a phase:
+#
+#   TAPAUTH_E2E_SELFTEST=summary
+#     Register a hand-made pass / skip / fail mix plus one phase deliberately
+#     left unrecorded, print the summary, and assert what it rendered. Exits 0
+#     only when every assertion below holds.
+#
+#   TAPAUTH_E2E_SELFTEST=fail-after-record
+#     Run a stub phase body that records a `pass` and then fails. The script must
+#     abort with the failing command's status: recording an outcome must not
+#     swallow a failure through a helper's return value.
+#
+#   TAPAUTH_E2E_SELFTEST=race-prompts
+#     Run race_prompt_check (above) on synthetic phone dumps: one prompt for one
+#     challenge, two prompts for two challenges (a legitimate retry), two prompts
+#     for the SAME challenge, no prompt at all, and an earlier phase's
+#     same-challenge duplicate. The first two must pass, the last three must fail.
+#
+#   TAPAUTH_E2E_SELFTEST=helper-order
+#     Assert that no line this suite can reach calls a shell function defined
+#     further down (helper_order_violations, above) — the shape that makes a
+#     phase abort with `command not found` / exit 127 instead of rendering a
+#     verdict — then exercise that check on synthetic files: three that must be
+#     accepted (a call after the definition; a call inside a function that runs
+#     later; a call in a function nothing calls) and three that must be rejected
+#     (a bare call before the definition; the `X=$(helper)` assignment shape
+#     that broke CI; a call inside a function that is itself reached too early).
+#
+# Placed before cleanup() is trapped and before any environment is touched, so a
+# dry run cannot alter the host.
+case "${TAPAUTH_E2E_SELFTEST:-}" in
+    "")
+        ;;
+    summary)
+        phase_pass "1a" "stub: recorded pass for the dry run"
+        phase_skip "2c" "stub: no captured grant packet available (not running as root)"
+        phase_fail "2d" "stub: the tampered packet was accepted"
+        # "4" is deliberately left without an outcome.
+        SELFTEST_OUT="$(print_phase_summary)"
+        printf '%s\n' "$SELFTEST_OUT"
+        # The render above ran in a subshell; recompute the counters in this
+        # shell from the same registry the rows came from.
+        count_phase_outcomes
+
+        selftest_fail() {
+            echo "❌ REGISTRY SELF-TEST FAILED: $1"
+            exit 1
+        }
+
+        # 1. A skip prints SKIPPED with its reason and never PASSED.
+        printf '%s\n' "$SELFTEST_OUT" \
+            | grep -Eq '^║  Phase 2c: Adversarial Replay \+ PamCancel: +SKIPPED +║$' \
+            || selftest_fail "the skipped phase did not render SKIPPED"
+        if printf '%s\n' "$SELFTEST_OUT" | grep -Eq '^║  Phase 2c: .*PASSED'; then
+            selftest_fail "the skipped phase also rendered PASSED"
+        fi
+        printf '%s\n' "$SELFTEST_OUT" \
+            | grep -qF 'SKIPPED: stub: no captured grant packet available (not running as root)' \
+            || selftest_fail "the skip reason is missing from the recorded assertions"
+        # 2. A fail prints FAILED and never PASSED.
+        printf '%s\n' "$SELFTEST_OUT" \
+            | grep -Eq '^║  Phase 2d: Adversarial Tampered Ciphertext: +FAILED +║$' \
+            || selftest_fail "the failed phase did not render FAILED"
+        if printf '%s\n' "$SELFTEST_OUT" | grep -Eq '^║  Phase 2d: .*PASSED'; then
+            selftest_fail "the failed phase also rendered PASSED"
+        fi
+        # 3. A phase with no recorded outcome prints NOT RUN and never PASSED.
+        printf '%s\n' "$SELFTEST_OUT" \
+            | grep -Eq '^║  Phase 4: Parallel Race \(UDP \+ BLE\): +NOT RUN +║$' \
+            || selftest_fail "the unrecorded phase did not render NOT RUN"
+        if printf '%s\n' "$SELFTEST_OUT" | grep -Eq '^║  Phase 4: .*PASSED'; then
+            selftest_fail "the unrecorded phase also rendered PASSED"
+        fi
+        # 4. A recorded pass still renders PASSED (the matrix can say yes).
+        printf '%s\n' "$SELFTEST_OUT" \
+            | grep -Eq '^║  Phase 1a: Pairing negatives \(SAS \+ pk pin\): +PASSED +║$' \
+            || selftest_fail "a recorded pass did not render PASSED"
+        # 5. Exactly one row per registered phase.
+        SELFTEST_ROWS="$(printf '%s\n' "$SELFTEST_OUT" | grep -c '^║  Phase ' || true)"
+        [ "$SELFTEST_ROWS" = "16" ] \
+            || selftest_fail "expected 16 phase rows, got ${SELFTEST_ROWS}"
+        # 6. The counters agree with the rows.
+        if [ "$SUMMARY_PASSED" != "1" ] || [ "$SUMMARY_SKIPPED" != "1" ] \
+            || [ "$SUMMARY_FAILED" != "1" ] || [ "$SUMMARY_NOT_RUN" != "13" ]; then
+            selftest_fail "counters are passed=$SUMMARY_PASSED skipped=$SUMMARY_SKIPPED failed=$SUMMARY_FAILED not_run=$SUMMARY_NOT_RUN"
+        fi
+        # 7. The gate the suite's exit status rests on rejects a matrix that
+        # holds a FAILED or an unreported phase — and the whole summary tail says
+        # so instead of claiming a pass.
+        if phase_summary_verdict; then
+            selftest_fail "the suite verdict accepted a FAILED phase and 13 unreported ones"
+        fi
+        set +e
+        SELFTEST_TAIL="$(finish_suite 2>&1)"
+        SELFTEST_RC=$?
+        set -e
+        [ "$SELFTEST_RC" = "1" ] \
+            || selftest_fail "the suite tail exited ${SELFTEST_RC} with a FAILED phase, expected 1"
+        printf '%s\n' "$SELFTEST_TAIL" \
+            | grep -qF "E2E SUITE INCOMPLETE: 1 phase(s) FAILED and 13 phase(s) never reported an outcome" \
+            || selftest_fail "the suite tail did not report the incomplete matrix"
+        # 8. ...and accepts one where every phase passed or skipped explicitly.
+        PHASE_OUTCOME=()
+        PHASE_ASSERTED=()
+        for selftest_id in "${PHASE_ORDER[@]}"; do
+            if [ "$selftest_id" = "2c" ]; then
+                phase_skip "2c" "stub: explicit skip"
+            else
+                phase_pass "$selftest_id" "stub: pass"
+            fi
+        done
+        count_phase_outcomes
+        if ! phase_summary_verdict; then
+            selftest_fail "the suite verdict rejected 15 passes and 1 explicit skip"
+        fi
+        set +e
+        SELFTEST_TAIL="$(finish_suite 2>&1)"
+        SELFTEST_RC=$?
+        set -e
+        [ "$SELFTEST_RC" = "0" ] \
+            || selftest_fail "the suite tail exited ${SELFTEST_RC} for 15 passes and 1 explicit skip, expected 0"
+        printf '%s\n' "$SELFTEST_TAIL" \
+            | grep -qF "Every phase that ran PASSED; 1 phase(s) SKIPPED (reasons in the matrix above)." \
+            || selftest_fail "the suite tail did not report the explicit skip"
+        echo "✅ REGISTRY SELF-TEST PASSED: 1 PASSED, 1 SKIPPED (with reason), 1 FAILED, 13 NOT RUN."
+        exit 0
+        ;;
+    fail-after-record)
+        selftest_phase_body() {
+            phase_pass "1b" "stub: recorded before the failure"
+            # Stands in for any assertion in a phase body that fails after the
+            # outcome was recorded.
+            false
+        }
+        selftest_phase_body
+        echo "❌ REGISTRY SELF-TEST FAILED: a phase body that failed did not abort the script."
+        exit 99
+        ;;
+    race-prompts)
+        # Synthetic logcat lines. The shape is the phone's own: one caller-context
+        # line per submitRequest, then one "Posting auth notification" line per
+        # prompt, with the challenge in its first 16 hex characters. Each dump is
+        # built with rp_dump so the lines stay separate lines — `$(...)` strips
+        # only the trailing newline, and a fixture that collapsed into one line
+        # would satisfy every case below for the wrong reason.
+        RP_SCOPE='D AuthRequestManager: Auth request caller context: pamService=e2e-ctx-race, processName=e2e-ctx-proc-race, commandPreview=/tmp/x pam-auth u 30 t'
+        RP_OTHER_SCOPE='D AuthRequestManager: Auth request caller context: pamService=e2e-ctx-ble, processName=e2e-ctx-proc-ble, commandPreview=/tmp/y pam-auth u 30 t'
+        rp_dump() {
+            local line
+            for line in "$@"; do printf '%s\n' "$line"; done
+        }
+        rp_prompt() {
+            printf 'D AuthRequestManager: Posting auth notification (id=1) for dev @ u@h, challenge=%s...' "$1"
+        }
+        rp_check() {
+            local want=$1 label=$2 dump=$3 got=0
+            set +e
+            race_prompt_check "e2e-ctx-race" "$dump" >/dev/null 2>&1
+            got=$?
+            set -e
+            if [ "$want" = "pass" ] && [ "$got" -ne 0 ]; then
+                echo "❌ REGISTRY SELF-TEST FAILED: ${label} was rejected (status ${got})."
+                race_prompt_check "e2e-ctx-race" "$dump" || true
+                exit 1
+            fi
+            if [ "$want" = "fail" ] && [ "$got" -eq 0 ]; then
+                echo "❌ REGISTRY SELF-TEST FAILED: ${label} was accepted; the assertion cannot fail."
+                exit 1
+            fi
+            echo "✅ race_prompt_check: ${label} → ${want} (status ${got})"
+        }
+
+        # 1. One prompt for one challenge: the healthy race.
+        rp_check pass "one prompt for one challenge" \
+            "$(rp_dump "$RP_SCOPE" "$(rp_prompt aaaaaaaaaaaaaaaa)")"
+        # 2. Two prompts for two different challenges: a legitimate retry, which
+        #    the old "exactly one prompt in the window" assertion failed on.
+        rp_check pass "two prompts for two challenges (retry)" \
+            "$(rp_dump "$RP_SCOPE" "$(rp_prompt aaaaaaaaaaaaaaaa)" \
+                "$RP_SCOPE" "$(rp_prompt bbbbbbbbbbbbbbbb)")"
+        # 3. Two prompts for the SAME challenge: a per-transport session.
+        rp_check fail "two prompts for the same challenge" \
+            "$(rp_dump "$RP_SCOPE" "$(rp_prompt aaaaaaaaaaaaaaaa)" "$(rp_prompt aaaaaaaaaaaaaaaa)")"
+        # 4. No prompt at all in this phase's window.
+        rp_check fail "no prompt in this phase's window" "$(rp_dump "$RP_SCOPE")"
+        # 5. An earlier phase's same-challenge duplicate (the BLE grace
+        #    re-prompt) is outside this phase's window and must not be charged
+        #    to it; this phase's own single prompt still passes.
+        rp_check pass "earlier phase's same-challenge duplicate stays out of scope" \
+            "$(rp_dump "$RP_OTHER_SCOPE" "$(rp_prompt cccccccccccccccc)" \
+                "$(rp_prompt cccccccccccccccc)" "$RP_SCOPE" "$(rp_prompt dddddddddddddddd)")"
+        # 6. ...and a prompt with no challenge= field anywhere in scope proves
+        #    nothing, so it fails rather than passing vacuously.
+        rp_check fail "prompt line without a challenge= field" \
+            "$(rp_dump "$RP_SCOPE" 'D AuthRequestManager: Posting auth notification (id=1) for dev @ u@h')"
+
+        # The failure has to NAME the offending challenge, or a real regression
+        # and a test artefact look the same in the CI log.
+        RP_DUP_OUT=$( { race_prompt_check "e2e-ctx-race" \
+            "$(rp_dump "$RP_SCOPE" "$(rp_prompt aaaaaaaaaaaaaaaa)" "$(rp_prompt aaaaaaaaaaaaaaaa)")"; } 2>&1 || true)
+        printf '%s\n' "$RP_DUP_OUT" | grep -qF "same challenge (aaaaaaaaaaaaaaaa)" \
+            || { echo "❌ REGISTRY SELF-TEST FAILED: the duplicate-challenge failure does not name the challenge."; exit 1; }
+        echo "✅ race_prompt_check: the duplicate-challenge failure names the offending challenge."
+        echo "✅ PROMPT-GROUPING SELF-TEST PASSED: 3 accepted (single, retry, earlier-phase duplicate), 3 rejected (same-challenge duplicate, no prompt, no challenge= field)."
+        exit 0
+        ;;
+    helper-order)
+        # helper_order_violations (above) is exercised on synthetic files here,
+        # not just on this suite: a check that has only ever been run against a
+        # clean input is indistinguishable from one that always passes.
+        ho_fail() {
+            echo "❌ HELPER-ORDER SELF-TEST FAILED: $1"
+            exit 1
+        }
+        HO_DIR=$(mktemp -d -t tapauth-e2e-helper-order.XXXXXX)
+        trap 'rm -rf "$HO_DIR"' EXIT
+        ho_case() {
+            local want=$1 label=$2 file=$3 out="" rc=0
+            set +e
+            out=$(helper_order_violations "$file")
+            rc=$?
+            set -e
+            if [ "$want" = "pass" ] && [ "$rc" -ne 0 ]; then
+                ho_fail "${label} was reported out of order (status ${rc}): ${out}"
+            fi
+            if [ "$want" = "fail" ] && [ "$rc" -eq 0 ]; then
+                ho_fail "${label} was accepted; the check cannot fail"
+            fi
+            echo "✅ helper_order_violations: ${label} → ${want} (status ${rc})"
+        }
+
+        # 1. The suite itself. This is the assertion that would have stopped the
+        #    defect instead of letting CI report exit 127 with no verdict: the
+        #    Phase 2 transport assertion calls grant_transport_since, which used
+        #    to be defined only beside Phase 2c, ~170 lines further down.
+        HO_REAL=$(helper_order_violations "$SCRIPT_DIR/test-e2e.sh") || true
+        if [ -n "$HO_REAL" ]; then
+            echo "❌ HELPER-ORDER SELF-TEST FAILED: this suite reaches a helper before defining it:"
+            printf '%s\n' "$HO_REAL"
+            exit 1
+        fi
+        echo "✅ helper_order_violations: test-e2e.sh defines every helper before any line that can reach it."
+
+        # 2. Definition then call, at top level: the healthy shape.
+        cat > "$HO_DIR/defined-first.sh" <<'EOF'
+helper_a() { echo a; }
+helper_a
+EOF
+        ho_case pass "a helper called after its definition" "$HO_DIR/defined-first.sh"
+
+        # 3. Call then definition, at top level: the defect.
+        cat > "$HO_DIR/called-first.sh" <<'EOF'
+helper_b
+helper_b() { echo b; }
+EOF
+        ho_case fail "a helper called before its definition" "$HO_DIR/called-first.sh"
+
+        # 4. The exact shape that broke CI: the call is the command substitution
+        #    of an assignment, so no assertion renders a verdict and `set -e`
+        #    aborts the run with 127 instead.
+        cat > "$HO_DIR/assignment-call.sh" <<'EOF'
+TRANSPORT=$(helper_c "$1")
+helper_c() { echo c; }
+EOF
+        ho_case fail "a helper called from an assignment before its definition" \
+            "$HO_DIR/assignment-call.sh"
+
+        # 5. A call inside a function body is charged to the caller, not to the
+        #    body's own line: here the caller runs after the definition, so this
+        #    must be accepted rather than flagged.
+        cat > "$HO_DIR/late-caller.sh" <<'EOF'
+run_phase_d() {
+    helper_d
+}
+helper_d() { echo d; }
+run_phase_d
+EOF
+        ho_case pass "a helper reached from a function that runs after its definition" \
+            "$HO_DIR/late-caller.sh"
+
+        # 6. ...and the same body is a defect once that caller is reached too
+        #    early. Without this the enclosing-function rule would excuse every
+        #    call that sits inside any function.
+        cat > "$HO_DIR/early-caller.sh" <<'EOF'
+run_phase_e() {
+    helper_e
+}
+run_phase_e
+helper_e() { echo e; }
+EOF
+        ho_case fail "a helper reached from a function that runs before its definition" \
+            "$HO_DIR/early-caller.sh"
+
+        # 7. A function nothing reaches cannot run, so what it calls is not a
+        #    violation: reporting it would make the check cry wolf on dead code.
+        cat > "$HO_DIR/unreached-caller.sh" <<'EOF'
+never_called() {
+    helper_f
+}
+helper_f() { echo f; }
+EOF
+        ho_case pass "a helper reached only from a function nothing calls" \
+            "$HO_DIR/unreached-caller.sh"
+
+        echo "✅ HELPER-ORDER SELF-TEST PASSED: 3 accepted (defined-first, late caller, unreached caller), 3 rejected (bare call before definition, assignment call before definition, early caller)."
+        exit 0
+        ;;
+    *)
+        echo "❌ ERROR: unknown TAPAUTH_E2E_SELFTEST value '$TAPAUTH_E2E_SELFTEST' (expected summary|fail-after-record|race-prompts|helper-order)" >&2
+        exit 2
+        ;;
+esac
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
@@ -97,6 +965,28 @@ fi
 # Sandbox directory for logs, captures and (dev mode) state redirection
 TEST_DIR=$(mktemp -d -t tapauth-e2e.XXXXXX)
 DAEMON_LOG="${TEST_DIR}/tapauthd.log"
+
+# Per-target trace directives added to the daemon's log filter for the E2E run.
+#
+# Three facts the suite asserts are logged below the level the daemon runs at
+# (INFO in journald, `debug` on stdout), and each is the *only* daemon-side
+# evidence of the thing asserted — none of them may be inferred from timing:
+#   * `BLE advertising started (attempt N)` (tapauthd/src/transport/ble.rs:671)
+#     — the advertisement for the session was registered with BlueZ. Phase 4
+#     asserts it while UDP is also live, so a daemon that quietly serves the
+#     race over UDP alone cannot pass.
+#   * `Sent IPv4 multicast on <N> interface(s)` (shared/src/network/udp.rs:461)
+#     — the UDP egress for the request. Phase 4 asserts it so "both transports
+#     participated" does not rest on the winner's name, and Phase 2d's sibling
+#     assertions need no addition (its transport attribution is an INFO line).
+#   * `Dropped a datagram from <addr> (<N> bytes): <reason>; still waiting for a
+#     response` (shared/src/network/udp.rs:78) — the per-frame decode drop.
+#     Phase 2d asserts it for its non-protobuf injection: the aggregate `warn`
+#     beside it is rate limited to one per 60 s, so only the per-frame line is
+#     deterministic.
+# The directives are per target, so every other module keeps the level it had
+# and no other phase's log volume or assertions change.
+E2E_TRACE_TARGETS="tapauthd::transport::ble=trace,shared::network::udp=trace"
 
 PAM_SERVICE_NAME="tapauth-test-e2e"
 PAM_MIXED_SERVICE_NAME="tapauth-mixed-stack"
@@ -203,9 +1093,6 @@ DAEMON_PID=""
 JOURNAL_PID=""
 CAPTURE_PID=""
 GROUPS_PID=""
-# Set to 1 only when the on-wire multicast egress assertions actually pass, so
-# the summary matrix does not claim PASSED for a skipped (non-root) run.
-MULTICAST_VERIFIED=0
 
 # systemd-mode teardown bookkeeping: only undo what this run actually installed.
 # (Set for real in the systemd setup block below; defaults keep cleanup() safe if
@@ -255,7 +1142,7 @@ cleanup() {
     fi
     if [ "$EXIT_CODE" -ne 0 ]; then
         echo "=== ANDROID LOGCAT DUMP ==="
-        adb logcat -d -v time -s AuthenticationService:* BleGattService:* AuthRequestManager:* TapAuthApplication:* PairingClient:* BiometricPromptActivity:* TapAuthCrypto:* AuthActionReceiver:* TemporalIdCache:* 2>/dev/null || true
+        adb logcat -d -v time -s AuthenticationService:* BleGattService:* AuthRequestManager:* TapAuthApplication:* PairingClient:* BiometricPromptActivity:* AuthActionReceiver:* TemporalIdCache:* 2>/dev/null || true
         echo "==========================="
     fi
     if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
@@ -620,14 +1507,22 @@ EOF
     #    State/config paths and socket activation stay production; the binary is
     #    built WITHOUT dev-state-override, so TAPAUTH_STATE_DIR cannot redirect
     #    anything even if it were set in the environment.
+    #
+    #    Note that under systemd the journal filter comes from
+    #    TAPAUTH_JOURNALD_LOG_LEVEL, NOT from TAPAUTH_LOG_LEVEL/RUST_LOG
+    #    (tapauthd/src/logging.rs:40-51 keys the stdout layer off the latter but
+    #    skips it when JOURNAL_STREAM is set). Assertions therefore read
+    #    TAPAUTH_JOURNALD_LOG_LEVEL, which is why the per-target trace directives
+    #    are added there as well as to the dev-mode run below.
     mkdir -p /etc/systemd/system/tapauthd.service.d
     cat > /etc/systemd/system/tapauthd.service.d/e2e.conf <<EOF
 # E2E-only override (not shipped in production packages)
 [Service]
 Environment=TAPAUTH_DEV_MODE=1
 Environment=TAPAUTH_DEV_UDP_TARGET=127.0.0.1:${DEV_HOST_PORT}
-Environment=TAPAUTH_LOG_LEVEL=debug
-Environment=RUST_LOG=debug
+Environment=TAPAUTH_LOG_LEVEL=debug,${E2E_TRACE_TARGETS}
+Environment=RUST_LOG=debug,${E2E_TRACE_TARGETS}
+Environment=TAPAUTH_JOURNALD_LOG_LEVEL=info,${E2E_TRACE_TARGETS}
 EOF
 
     # 5. Enable the real socket unit; the service is activated on first IPC
@@ -670,6 +1565,10 @@ TEST_PKG="dev.rourunisen.tapauth.e2e.test"
 if [ -f "server-android/app/build/outputs/apk/e2e/app-e2e.apk" ]; then
     adb install -r -t server-android/app/build/outputs/apk/e2e/app-e2e.apk || true
 elif [ -f "server-android/app/build/outputs/apk/debug/app-debug.apk" ]; then
+    # `debug` instead of `e2e`: the debug variant logs command_preview's length
+    # instead of its content (BuildConfig.E2E_TESTING is false for `debug`), so
+    # assert_caller_context_delivered skips its preview assertion for this run.
+    # Nothing else changes — every later phase still runs against this package.
     APP_PKG="dev.rourunisen.tapauth.debug"
     adb install -r -t server-android/app/build/outputs/apk/debug/app-debug.apk || true
 fi
@@ -687,6 +1586,13 @@ adb shell pm grant "$APP_PKG" android.permission.ACCESS_FINE_LOCATION 2>/dev/nul
 adb shell pm grant "$APP_PKG" android.permission.BLUETOOTH_CONNECT 2>/dev/null || true
 adb shell pm grant "$APP_PKG" android.permission.BLUETOOTH_ADVERTISE 2>/dev/null || true
 adb shell pm grant "$APP_PKG" android.permission.BLUETOOTH_SCAN 2>/dev/null || true
+# The grants above are all `|| true`, so a renamed package or a permission model
+# change would silently degrade into a 30 s BLE pairing mystery. Read them back.
+# A *denied* permission still lists its name, so match the granted state.
+PERM_DUMP=$(timeout 20 adb shell dumpsys package "$APP_PKG" 2>/dev/null || true)
+if ! printf '%s\n' "$PERM_DUMP" | grep -q 'android.permission.BLUETOOTH_SCAN: granted=true'; then
+    echo "⚠️  BLUETOOTH_SCAN is NOT granted to $APP_PKG — Phase 1c cannot work; check the pm grant calls above"
+fi
 
 # Step 3: Setup Bridges and Virtual Transport Layers
 echo "==> Step 3: Setting up Transport Bridges (BLE + UDP)..."
@@ -701,7 +1607,7 @@ echo "==> Step 3: Setting up Transport Bridges (BLE + UDP)..."
 # Step 4: Launch tapauthd daemon
 echo "==> Step 4: Launching tapauthd daemon..."
 if [ "$E2E_DAEMON_MODE" = "dev" ]; then
-    env TAPAUTH_DEV_MODE="1" TAPAUTH_DEV_UDP_TARGET="127.0.0.1:${DEV_HOST_PORT}" TAPAUTH_LOG_LEVEL="debug" RUST_LOG="debug" TAPAUTHD_SOCK="$TAPAUTHD_SOCK" ${TAPAUTH_STATE_DIR:+TAPAUTH_STATE_DIR="$TAPAUTH_STATE_DIR"} "$TAPAUTHD_BIN" > "$DAEMON_LOG" 2>&1 &
+    env TAPAUTH_DEV_MODE="1" TAPAUTH_DEV_UDP_TARGET="127.0.0.1:${DEV_HOST_PORT}" TAPAUTH_LOG_LEVEL="debug,${E2E_TRACE_TARGETS}" RUST_LOG="debug" TAPAUTHD_SOCK="$TAPAUTHD_SOCK" ${TAPAUTH_STATE_DIR:+TAPAUTH_STATE_DIR="$TAPAUTH_STATE_DIR"} "$TAPAUTHD_BIN" > "$DAEMON_LOG" 2>&1 &
     DAEMON_PID=$!
 
     echo -n "    Waiting for daemon socket"
@@ -721,64 +1627,718 @@ else
     echo "✅ tapauthd daemon is active (systemd socket activation)."
 fi
 
-# Step 5: Phase 1 - Real TCP Device Pairing
+# ── Phase 1 helpers: protocol-v2 pairing URL ──────────────────────────────────
+#
+# `start-pairing` prints the QR on a single `URL=` line, in the v2 form
+#
+#   tapauth://pair?v=2&sid=<32 hex>&pk=<64 hex>[&p=<udp port>][&ip4=…][&ip6=…]
+#
+# so every field has to be read as a query parameter. Splitting that line on `=`
+# (`cut -d'=' -f2`, what this phase used to do) truncates it at the first `=`
+# inside the URL and hands the phone a malformed QR, which the instrumentation
+# run then reports as an assertion failure the old harness ignored.
+
+# pair_url_param <url> <key>: first value of `key` in the query, empty if absent.
+pair_url_param() {
+    local url=$1 key=$2 query part
+    query="${url#*\?}"
+    if [ "$query" = "$url" ]; then
+        return 0
+    fi
+    local IFS='&'
+    for part in $query; do
+        if [ "${part%%=*}" = "$key" ]; then
+            printf '%s' "${part#*=}"
+            return 0
+        fi
+    done
+}
+
+# pair_url_set <url> <key> <value>: replace the first `key=…`, else append it.
+pair_url_set() {
+    local url=$1 key=$2 value=$3
+    local prefix query part out="" replaced=0
+    case "$url" in
+        *\?*) prefix="${url%%\?*}?"; query="${url#*\?}" ;;
+        *)    prefix="${url}?";      query="" ;;
+    esac
+    local IFS='&'
+    for part in $query; do
+        if [ "$replaced" = "0" ] && [ "${part%%=*}" = "$key" ]; then
+            out="${out:+$out&}${key}=${value}"
+            replaced=1
+        else
+            out="${out:+$out&}${part}"
+        fi
+    done
+    if [ "$replaced" = "0" ]; then
+        out="${out:+$out&}${key}=${value}"
+    fi
+    printf '%s' "${prefix}${out}"
+}
+
+# pair_url_del <url> <key>: the URL without `key=…` (used to strip the network
+# endpoints, which is what turns a QR into a BLE-only one).
+pair_url_del() {
+    local url=$1 key=$2 prefix query part out=""
+    case "$url" in
+        *\?*) prefix="${url%%\?*}?"; query="${url#*\?}" ;;
+        *)    printf '%s' "$url"; return 0 ;;
+    esac
+    local IFS='&'
+    for part in $query; do
+        if [ "${part%%=*}" = "$key" ]; then
+            continue
+        fi
+        out="${out:+$out&}${part}"
+    done
+    printf '%s' "${prefix}${out}"
+}
+
+# require_pair_url_v2 <url> <label> [require_udp_endpoint]
+#
+# Fails loudly (exit 1) unless the QR is a usable v2 pairing URL: `v=2`, a
+# 32-hex `sid`, a 64-hex non-zero `pk`. With `require_udp_endpoint=1` the QR must
+# also carry a UDP endpoint (`p` and `ip4`), which is what makes a run a *UDP*
+# pairing rather than a BLE one. Always echoes the reconstructed keys, so the
+# log shows exactly which URL the phone was given.
+require_pair_url_v2() {
+    local url=$1 label=$2 require_udp=${3:-0}
+    local v sid pk p ip4 ip6 err=""
+    v=$(pair_url_param "$url" v)
+    sid=$(pair_url_param "$url" sid)
+    pk=$(pair_url_param "$url" pk)
+    p=$(pair_url_param "$url" p)
+    ip4=$(pair_url_param "$url" ip4)
+    ip6=$(pair_url_param "$url" ip6)
+    if [ "$v" != "2" ]; then
+        err="v='$v' (expected '2')"
+    elif ! printf '%s' "$sid" | grep -Eq '^[0-9a-fA-F]{32}$'; then
+        err="sid='$sid' (expected 32 hex characters)"
+    elif printf '%s' "$pk" | grep -Eq '^0+$'; then
+        err="pk='$pk' is the all-zero key"
+    elif ! printf '%s' "$pk" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+        err="pk='$pk' (expected 64 hex characters)"
+    elif [ "$require_udp" = "1" ] && [ -z "$p" ]; then
+        err="p is empty (the QR carries no ephemeral UDP pairing port)"
+    elif [ "$require_udp" = "1" ] && [ -z "$ip4" ]; then
+        err="ip4 is empty (the QR carries no IPv4 endpoint)"
+    fi
+    if [ -n "$err" ]; then
+        echo "❌ ERROR (${label}): not a usable v2 pairing URL: $err"
+        echo "   QR keys: v='$v' sid='$sid' pk='$pk' p='$p' ip4='$ip4' ip6='$ip6'"
+        exit 1
+    fi
+    echo "✅ ${label}: v2 QR keys v='$v' sid='$sid' pk='$pk' p='$p' ip4='$ip4' ip6='$ip6'"
+}
+
+# pair_url_for_emulator <url>: rewrite the QR's `ip4` to 10.0.2.2, the QEMU SLIRP
+# alias for the host, because the QR's LAN address is not routable from inside
+# the guest. This does not weaken the handshake: the endpoints are NOT part of
+# the pairing transcript, and the identity pin (`pk`) travels in the same URL and
+# is still verified by the phone. `p`/`sid`/`pk`/`ip6` are left untouched, and a
+# BLE-only QR (no `ip4`) is returned unchanged instead of gaining a bogus one.
+pair_url_for_emulator() {
+    local url=$1
+    if [ -n "$(pair_url_param "$url" ip4)" ]; then
+        pair_url_set "$url" ip4 "10.0.2.2"
+    else
+        printf '%s' "$url"
+    fi
+}
+
+# instrument_ok <am-log>: true only when the runner itself reported success.
+# `am instrument`'s exit status is not trustworthy, so the verdict is read from
+# its output — the same distrust scripts/ci/run-all-e2e.sh applies.
+instrument_ok() {
+    local log=$1
+    if [ ! -f "$log" ]; then
+        return 1
+    fi
+    if grep -Eq 'FAILURES!!!|INSTRUMENTATION_FAILED|Process crashed' "$log"; then
+        return 1
+    fi
+    grep -q 'OK (' "$log"
+}
+
+# assert_instrument_ok <am-log> <label>: fail, dumping the log, unless the run
+# actually passed. Never replace this with `wait "$AM_PID"`: a crashed or
+# assertion-failing run must not be able to look like a pass.
+assert_instrument_ok() {
+    local log=$1 label=$2
+    if instrument_ok "$log"; then
+        echo "✅ ${label}: instrumentation reported OK"
+        return 0
+    fi
+    echo "❌ ERROR (${label}): instrumentation did not report a passing run."
+    echo "---- ${log} ----"
+    cat "$log" || true
+    exit 1
+}
+
+# phase_marker <am-log> <marker>: true when <marker> appears in the phase's
+# instrumentation output OR in logcat. Several observables (the rejected-SAS
+# outcome, "SAS reached the phone over BLE", "Pairing completed and persisted")
+# are reported with Log.i, and `am instrument`'s stream carries the test's stdout,
+# not logcat — so a run that only greps the instrumentation log would look like a
+# failure forever. Every phase clears the buffer with `adb logcat -c` before it
+# runs, so the logcat half cannot match a line from an earlier phase or run.
+phase_marker() {
+    local am_log=$1 marker=$2
+    if [ -f "$am_log" ] && grep -qF "$marker" "$am_log"; then
+        return 0
+    fi
+    adb logcat -d 2>/dev/null | grep -qF "$marker"
+}
+
+# servers_count <label>: the daemon's paired-device count as a validated integer.
+#
+# A bare `$(get-servers | grep 'COUNT=' | cut -f2)` is empty whenever the CLI or
+# the daemon fails, and `[ "" -ne 0 ]` / `[ "" -lt 1 ]` are errors (status 2) that
+# an `if` reads as false — so an empty count silently satisfied both the "must be
+# 0" and the "must be at least 1" assertions. This exits instead.
+servers_count() {
+    local label=$1 raw count
+    if ! raw=$("$CLI_BIN" get-servers 2>&1); then
+        echo "❌ ERROR (${label}): get-servers failed:" >&2
+        printf '%s\n' "$raw" >&2
+        exit 1
+    fi
+    count=$(printf '%s\n' "$raw" | sed -n 's/^COUNT=\([0-9][0-9]*\)$/\1/p' | head -n1)
+    if [ -z "$count" ]; then
+        echo "❌ ERROR (${label}): get-servers produced no COUNT= line:" >&2
+        printf '%s\n' "$raw" >&2
+        exit 1
+    fi
+    printf '%s' "$count"
+}
+
+# clear_logcat <label>: empty the logcat ring buffer, or fail.
+#
+# Every Phase 1 staleness claim rests on this having happened, so a rejected
+# `logcat -c` (adb hiccup, locked device) must not be swallowed the way
+# `2>/dev/null || true` swallows it — that would let a line from an earlier phase
+# or an earlier run satisfy a marker this phase is supposed to prove.
+clear_logcat() {
+    local label=$1 out
+    if ! out=$(adb logcat -c 2>&1); then
+        echo "❌ ERROR (${label}): 'adb logcat -c' failed:" >&2
+        printf '%s\n' "$out" >&2
+        exit 1
+    fi
+    if printf '%s' "$out" | grep -qi 'failed'; then
+        echo "❌ ERROR (${label}): 'adb logcat -c' reported a failure:" >&2
+        printf '%s\n' "$out" >&2
+        exit 1
+    fi
+}
+
+# phone_sas <am-log> <label>: the SAS the phone derived, as one value.
+#
+# The daemon's own `SAS=` (from `wait-for-pairing`) is authoritative — that is
+# the code the user is asked to compare. The phone's value is corroboration, and
+# it has to come from something THIS run produced: the instrumentation's stdout
+# (`ANDROID_DERIVED_SAS=` via println) or the logcat buffer, which every sub-phase
+# clears before it starts. The file the test writes to filesDir is deliberately
+# not consulted: it survives across runs, so a stale value would satisfy the
+# comparison on a run where the phone derived nothing at all.
+phone_sas() {
+    local am_log=$1 label=$2 sas
+    sas=$(grep -o 'ANDROID_DERIVED_SAS=[0-9-]*' "$am_log" 2>/dev/null | head -n1 | cut -d'=' -f2 || true)
+    if [ -z "$sas" ]; then
+        sas=$(adb logcat -d 2>/dev/null | grep -o 'Derived SAS: [0-9-]*' | tail -n1 | cut -d':' -f2 | tr -d ' \r\n' || true)
+    fi
+    if [ -z "$sas" ]; then
+        echo "❌ ERROR (${label}): the phone never reported a derived SAS." >&2
+        echo "   (looked for ANDROID_DERIVED_SAS= in ${am_log} and 'Derived SAS:' in logcat)" >&2
+        tail -n 40 "$am_log" 2>/dev/null >&2 || true
+        exit 1
+    fi
+    printf '%s' "$sas"
+}
+
+# log_since_present <base-line-count> <fixed-string> [tries]
+#
+# The probe behind `wait_log_since`: poll until the line shows up, return 1
+# instead of exiting when it does not. Callers that want to fold "the daemon
+# never logged this" into their own evidence dump use it directly.
+log_since_present() {
+    local base=$1 needle=$2 tries=${3:-40} _i
+    for _i in $(seq 1 "$tries"); do
+        if tail -n +"$((base + 1))" "$DAEMON_LOG" 2>/dev/null | grep -qF "$needle"; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+# wait_log_since <base-line-count> <fixed-string> <label> [tries]
+#
+# Poll the daemon log for a line emitted after `base`, 0.5 s apart (40 tries by
+# default, i.e. 20 s), then fail with the log tail. DAEMON_LOG is followed
+# asynchronously — a redirect in dev mode, `journalctl -f` in systemd mode — so a
+# line the daemon just emitted may not be on disk yet when the assertion runs.
+# That is why the window is anchored to a line count and why this polls.
+#
+# This is the Phase 1 poll-based variant. `assert_log_since` further down stays
+# single-shot and is untouched for the later phases, whose sequences are settled
+# by the time it runs; Phase 1 asserts while a session and a journald follower
+# are still moving, which is the only reason the two differ. The divergence is
+# intentional and scoped to Phase 1.
+wait_log_since() {
+    local base=$1 needle=$2 label=$3 tries=${4:-40}
+    if log_since_present "$base" "$needle" "$tries"; then
+        echo "✅ ${label}"
+        return 0
+    fi
+    echo "❌ ERROR (${label}): '${needle}' never appeared in the daemon log for this phase."
+    echo "---- tail -n 80 ${DAEMON_LOG} ----"
+    tail -n 80 "$DAEMON_LOG" || true
+    exit 1
+}
+
+# pairing_sas_match <desktop-sas> <am-log> <label>: bilateral SAS comparison.
+# The daemon's value is authoritative (see phone_sas); the phone's is read from
+# this run's stdout or the logcat buffer that the phase cleared on entry.
+pairing_sas_match() {
+    local desktop=$1 am_log=$2 label=$3 android_sas
+    android_sas=$(phone_sas "$am_log" "$label")
+    echo "    Android Derived SAS: $android_sas"
+    # Both sides must be present: an empty desktop value and an empty phone value
+    # would otherwise compare equal and "pass" a comparison nobody made.
+    if [ -n "$desktop" ] && [ -n "$android_sas" ] && [ "$android_sas" = "$desktop" ]; then
+        echo "✅ ${label}: SAS Anti-MITM verification PASSED, both sides derived $desktop"
+    else
+        echo "❌ ERROR (${label}): SAS Anti-MITM verification mismatch! Desktop='$desktop', Android='$android_sas'"
+        cat "$am_log" || true
+        exit 1
+    fi
+}
+
+# Step 5: Phase 1 - Protocol v2 unified pairing (UDP + BLE)
 echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
-echo "║  PHASE 1: Real TCP Pairing & SAS Anti-MITM Verification       ║"
+echo "║  PHASE 1: Protocol v2 Pairing (UDP + BLE) & SAS Anti-MITM     ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
-echo "==> Step 1a: Negative pairing test (SAS mismatch / user rejection)..."
-START_NEG_OUTPUT=$("$CLI_BIN" start-pairing)
+# Phase outcomes are recorded in the registry at the top of this file
+# (phase_pass / phase_skip / phase_fail); the summary at the end is generated
+# from it. Phase 1a is one registry entry covering the three sub-cases below, so
+# it is recorded once, after the last of them has asserted.
+
+# The daemon's own SAS display form, e.g. 123-456.
+SAS_PATTERN='^[0-9][0-9][0-9]-[0-9][0-9][0-9]$'
+
+# ── 1a-i: the phone rejects the SAS ──────────────────────────────────────────
+#
+# The phone derives its SAS from the desktop's PairingResponse, so getting as far
+# as the rejection proves the phone reached this daemon and verified its packet.
+# The daemon's side of the evidence is two log lines: the accepted PairingInit
+# (the SAS was derived) and the abort with the phone's reason.
+echo "==> Step 1a-i: the phone rejects the SAS..."
+clear_logcat "Phase 1a-i"
+LOG_BASE=$(wc -l < "$DAEMON_LOG")
+
+if ! START_NEG_OUTPUT=$("$CLI_BIN" start-pairing); then
+    echo "❌ ERROR (Phase 1a-i): start-pairing failed (a previous session may still be active):"
+    printf '%s\n' "$START_NEG_OUTPUT"
+    exit 1
+fi
 PORT_NEG=$(echo "$START_NEG_OUTPUT" | grep 'PORT=' | cut -d'=' -f2)
+PAIR_URL_NEG=$(echo "$START_NEG_OUTPUT" | grep 'URL=' | cut -d'=' -f2-)
+SESSION_ID_NEG=$(echo "$START_NEG_OUTPUT" | grep 'SESSION_ID=' | cut -d'=' -f2)
+echo "    Pairing port: $PORT_NEG  session: $SESSION_ID_NEG"
+# No UDP endpoint is demanded here: a rejection is equally valid over BLE, so
+# this sub-case only requires a well-formed v2 QR.
+require_pair_url_v2 "$PAIR_URL_NEG" "Phase 1a-i QR"
+PAIR_URL_NEG=$(pair_url_for_emulator "$PAIR_URL_NEG")
+echo "    Pairing URL (emulator view): $PAIR_URL_NEG"
+
 WAIT_NEG_LOG="${TEST_DIR}/wait_neg_pairing.log"
 "$CLI_BIN" wait-for-pairing "$PORT_NEG" > "$WAIT_NEG_LOG" 2>&1 &
 WAIT_NEG_PID=$!
 
+# The whole device command is ONE quoted string: `adb shell` re-parses its command
+# line on the device, and the QR contains `&` — unquoted, the device shell would
+# split the URL there and background half the command. The host-side double quotes
+# let `$PAIR_URL_NEG` expand here; the device sees it single-quoted.
 AM_NEG_LOG="${TEST_DIR}/am_neg_pairing.log"
-adb shell am instrument -w \
+adb shell "am instrument -w \
     -e class dev.rourunisen.tapauth.e2e.PairingE2eTest \
-    -e pairing_host 10.0.2.2 \
-    -e pairing_port "$PORT_NEG" \
+    -e pairing_url '$PAIR_URL_NEG' \
     -e reject_sas true \
-    "$TEST_PKG/dev.rourunisen.tapauth.crypto.TapAuthTestRunner" > "$AM_NEG_LOG" 2>&1 || true
+    '$TEST_PKG/dev.rourunisen.tapauth.crypto.TapAuthTestRunner'" > "$AM_NEG_LOG" 2>&1 || true
 
-wait "$WAIT_NEG_PID" || true
+# The phone has rejected the SAS by now, so the session is over. Before the
+# desktop attempts its own approval, require the daemon to have logged the abort:
+# if that datagram were lost or late, `complete-pairing` would enter provisioning
+# and block for its full 120 s deadline, then fail with the misleading "before
+# the phone confirmed the CSK" instead of the abort reason. An approval must only
+# be attempted against a session the daemon already knows the phone abandoned.
+set +e
+wait "$WAIT_NEG_PID"
+WAIT_NEG_EXIT=$?
+set -e
+
+DAEMON_SAW=1
+if ! log_since_present "$LOG_BASE" 'PairingInit accepted over'; then
+    echo "❌ ERROR (Phase 1a-i): the daemon never logged an accepted PairingInit (the phone never reached it)."
+    DAEMON_SAW=0
+fi
+if [ "$DAEMON_SAW" = "1" ] \
+    && ! log_since_present "$LOG_BASE" 'Pairing aborted by the phone (USER_REJECTED_SAS)'; then
+    echo "❌ ERROR (Phase 1a-i): the daemon never logged the phone's USER_REJECTED_SAS abort, so no approval is attempted."
+    DAEMON_SAW=0
+fi
+if [ "$DAEMON_SAW" != "1" ]; then
+    echo "---- ${AM_NEG_LOG} ----"
+    cat "$AM_NEG_LOG" || true
+    echo "---- ${WAIT_NEG_LOG} ----"
+    cat "$WAIT_NEG_LOG" || true
+    echo "---- logcat (PairingSession / PairingE2eTest) ----"
+    adb logcat -d -v time -s 'PairingSession:*' 'PairingE2eTest:*' 2>/dev/null | tail -n 40 || true
+    echo "---- tail -n 80 ${DAEMON_LOG} ----"
+    tail -n 80 "$DAEMON_LOG" || true
+    exit 1
+fi
+echo "✅ Phase 1a-i: the daemon logged the accepted PairingInit and the phone's USER_REJECTED_SAS abort."
 
 set +e
 "$CLI_BIN" complete-pairing "$PORT_NEG" > "${TEST_DIR}/complete_neg_pairing.log" 2>&1
 COMPLETE_NEG_EXIT=$?
 set -e
 
-NEG_SERVERS_COUNT=$("$CLI_BIN" get-servers | grep 'COUNT=' | cut -d'=' -f2)
-if [ "$COMPLETE_NEG_EXIT" -ne 0 ] && [ "$NEG_SERVERS_COUNT" -eq 0 ]; then
-    echo "✅ Negative pairing test PASSED: SAS rejection aborted the handshake (complete-pairing exit $COMPLETE_NEG_EXIT), 0 paired devices stored."
-else
-    echo "❌ ERROR: negative pairing did not abort cleanly (complete-pairing exit=$COMPLETE_NEG_EXIT, devices=$NEG_SERVERS_COUNT)!"
+NEG_SAS=$(grep 'SAS=' "$WAIT_NEG_LOG" | head -n1 | cut -d'=' -f2 || true)
+NEG_SERVERS_COUNT=$(servers_count "Phase 1a-i")
+
+NEG_OK=1
+if ! instrument_ok "$AM_NEG_LOG"; then
+    echo "❌ ERROR (Phase 1a-i): the SAS-rejection instrumentation run did not report OK."
+    NEG_OK=0
+fi
+if ! phase_marker "$AM_NEG_LOG" 'Negative pairing test passed: SAS rejected, no device stored.'; then
+    echo "❌ ERROR (Phase 1a-i): the phone never reported the rejected-SAS outcome."
+    NEG_OK=0
+fi
+if [ "$WAIT_NEG_EXIT" -ne 0 ]; then
+    echo "❌ ERROR (Phase 1a-i): wait-for-pairing exited $WAIT_NEG_EXIT instead of reporting the SAS."
+    NEG_OK=0
+fi
+if ! printf '%s' "$NEG_SAS" | grep -Eq "$SAS_PATTERN"; then
+    echo "❌ ERROR (Phase 1a-i): the daemon never displayed a SAS (got '$NEG_SAS')."
+    NEG_OK=0
+fi
+if [ "$COMPLETE_NEG_EXIT" -ne 1 ]; then
+    echo "❌ ERROR (Phase 1a-i): complete-pairing exited $COMPLETE_NEG_EXIT, expected a refusal (1)."
+    NEG_OK=0
+fi
+if ! grep -qF 'ERROR: Pairing session failed: the phone aborted the pairing (USER_REJECTED_SAS)' \
+    "${TEST_DIR}/complete_neg_pairing.log"; then
+    echo "❌ ERROR (Phase 1a-i): the desktop refused for the wrong reason — expected the phone's USER_REJECTED_SAS."
+    NEG_OK=0
+fi
+if [ "$NEG_SERVERS_COUNT" -ne 0 ]; then
+    echo "❌ ERROR (Phase 1a-i): $NEG_SERVERS_COUNT device(s) stored despite a rejected SAS."
+    NEG_OK=0
+fi
+if [ "$NEG_OK" != "1" ]; then
+    echo "---- ${AM_NEG_LOG} ----"
+    cat "$AM_NEG_LOG" || true
+    echo "---- ${WAIT_NEG_LOG} ----"
+    cat "$WAIT_NEG_LOG" || true
+    echo "---- ${TEST_DIR}/complete_neg_pairing.log ----"
     cat "${TEST_DIR}/complete_neg_pairing.log" || true
+    echo "---- logcat (PairingSession / PairingE2eTest) ----"
+    adb logcat -d -v time -s 'PairingSession:*' 'PairingE2eTest:*' 2>/dev/null | tail -n 40 || true
+    echo "---- tail -n 80 ${DAEMON_LOG} ----"
+    tail -n 80 "$DAEMON_LOG" || true
     exit 1
 fi
+# Both sides must have shown the same code before the phone rejected it.
+pairing_sas_match "$NEG_SAS" "$AM_NEG_LOG" "Phase 1a-i"
+echo "✅ Phase 1a-i PASSED: both sides derived SAS $NEG_SAS, the phone rejected it, the desktop refused with USER_REJECTED_SAS and 0 devices were stored."
 
-echo "==> Step 1b: Legitimate pairing handshake..."
-START_OUTPUT=$("$CLI_BIN" start-pairing)
+# ── 1a-ii: the phone pins the QR `pk` ────────────────────────────────────────
+#
+# The protocol declares `PairingAbortReason::KEY_MISMATCH`, but NO implementation
+# emits it. On a mismatched `pk` the phone's Rust pin check simply rejects the
+# packet (constant-time comparison via shared/src/ffi/ops.rs), logs
+# "PairingResponse rejected: challenge does not match the session" and waits out
+# its own response deadline without sending any abort — so the daemon cannot
+# observe that reason and this phase cannot assert it. What is assertable is the
+# phone-side pin rejection, the phone's resulting failure, and a session that
+# this harness then tears down from the desktop with `cancel-pairing`.
+echo "==> Step 1a-ii: the phone rejects a PairingResponse that does not match the QR pk..."
+clear_logcat "Phase 1a-ii"
+LOG_BASE=$(wc -l < "$DAEMON_LOG")
+
+if ! START_MISMATCH_OUTPUT=$("$CLI_BIN" start-pairing); then
+    echo "❌ ERROR (Phase 1a-ii): start-pairing failed (a previous session may still be active):"
+    printf '%s\n' "$START_MISMATCH_OUTPUT"
+    exit 1
+fi
+PORT_MISMATCH=$(echo "$START_MISMATCH_OUTPUT" | grep 'PORT=' | cut -d'=' -f2)
+PAIR_URL_MISMATCH=$(echo "$START_MISMATCH_OUTPUT" | grep 'URL=' | cut -d'=' -f2-)
+SESSION_ID_MISMATCH=$(echo "$START_MISMATCH_OUTPUT" | grep 'SESSION_ID=' | cut -d'=' -f2)
+echo "    Pairing port: $PORT_MISMATCH  session: $SESSION_ID_MISMATCH"
+# require_udp_endpoint=1: the pin must be exercised on a path the phone can
+# actually reach, otherwise the run fails for "no endpoint" and would look like
+# a correct rejection for the wrong reason.
+require_pair_url_v2 "$PAIR_URL_MISMATCH" "Phase 1a-ii QR" 1
+# A different but well-formed, non-zero 64-hex X25519 public key.
+PAIR_URL_MISMATCH=$(pair_url_set "$PAIR_URL_MISMATCH" pk "$(printf '%064d' 1)")
+PAIR_URL_MISMATCH=$(pair_url_for_emulator "$PAIR_URL_MISMATCH")
+echo "    Mismatched URL pk: $(pair_url_param "$PAIR_URL_MISMATCH" pk)"
+echo "    Pairing URL (emulator view): $PAIR_URL_MISMATCH"
+
+WAIT_MISMATCH_LOG="${TEST_DIR}/wait_mismatch_pairing.log"
+"$CLI_BIN" wait-for-pairing "$PORT_MISMATCH" > "$WAIT_MISMATCH_LOG" 2>&1 &
+WAIT_MISMATCH_PID=$!
+
+# Synchronous: the phone rejects the mismatched `PairingResponse` and then waits out its own 30 s
+# response deadline, which is the terminal state `PairingE2eTest` observes (`Pairing failed while
+# waiting for the derived SAS: …`). The test's own await is 45 s — deliberately above that
+# deadline so it can never win the race — so this returns (failing) within about 45 s.
+AM_MISMATCH_LOG="${TEST_DIR}/am_mismatch_pairing.log"
+adb shell "am instrument -w \
+    -e class dev.rourunisen.tapauth.e2e.PairingE2eTest \
+    -e pairing_url '$PAIR_URL_MISMATCH' \
+    '$TEST_PKG/dev.rourunisen.tapauth.crypto.TapAuthTestRunner'" > "$AM_MISMATCH_LOG" 2>&1 || true
+
+set +e
+wait "$WAIT_MISMATCH_PID"
+WAIT_MISMATCH_EXIT=$?
+set -e
+
+LOGCAT_MISMATCH=$(adb logcat -d 2>/dev/null || true)
+MISMATCH_SAS=$(grep 'SAS=' "$WAIT_MISMATCH_LOG" | head -n1 | cut -d'=' -f2 || true)
+MISMATCH_SERVERS_COUNT=$(servers_count "Phase 1a-ii")
+
+MISMATCH_OK=1
+if ! printf '%s\n' "$LOGCAT_MISMATCH" | grep -qF 'PairingResponse rejected: challenge does not match the session'; then
+    echo "❌ ERROR (Phase 1a-ii): the phone did not reject the mismatched PairingResponse."
+    MISMATCH_OK=0
+fi
+# `Starting E2E pairing:` is a Log.i, so it is a logcat line; `phase_marker` also
+# accepts it from the instrumentation stream, which carries the test's stdout.
+if ! phase_marker "$AM_MISMATCH_LOG" 'Starting E2E pairing:'; then
+    echo "❌ ERROR (Phase 1a-ii): the instrumentation run never started the pairing flow."
+    MISMATCH_OK=0
+fi
+if ! phase_marker "$AM_MISMATCH_LOG" 'Pairing failed while waiting for the derived SAS'; then
+    echo "❌ ERROR (Phase 1a-ii): the phone did not fail waiting for the (never accepted) response."
+    MISMATCH_OK=0
+fi
+if [ "$WAIT_MISMATCH_EXIT" -ne 0 ]; then
+    echo "❌ ERROR (Phase 1a-ii): wait-for-pairing exited $WAIT_MISMATCH_EXIT instead of reporting the SAS."
+    MISMATCH_OK=0
+fi
+if ! printf '%s' "$MISMATCH_SAS" | grep -Eq "$SAS_PATTERN"; then
+    echo "❌ ERROR (Phase 1a-ii): the daemon never displayed a SAS (got '$MISMATCH_SAS')."
+    MISMATCH_OK=0
+fi
+if [ "$MISMATCH_SERVERS_COUNT" -ne 0 ]; then
+    echo "❌ ERROR (Phase 1a-ii): $MISMATCH_SERVERS_COUNT device(s) stored despite a pk mismatch."
+    MISMATCH_OK=0
+fi
+if [ "$MISMATCH_OK" != "1" ]; then
+    echo "---- ${AM_MISMATCH_LOG} ----"
+    cat "$AM_MISMATCH_LOG" || true
+    echo "---- ${WAIT_MISMATCH_LOG} ----"
+    cat "$WAIT_MISMATCH_LOG" || true
+    echo "---- logcat (PairingSession / PairingE2eTest) ----"
+    adb logcat -d -v time -s 'PairingSession:*' 'PairingE2eTest:*' 2>/dev/null | tail -n 40 || true
+    echo "---- tail -n 80 ${DAEMON_LOG} ----"
+    tail -n 80 "$DAEMON_LOG" || true
+    exit 1
+fi
+echo "✅ Phase 1a-ii: the phone pinned the QR pk and dropped the daemon's PairingResponse; the desktop had derived SAS $MISMATCH_SAS and 0 devices were stored."
+
+# Teardown. `complete-pairing` would block for the daemon's `SESSION_REPLY_TIMEOUT`
+# (135 s, tapauthd/src/pairing.rs) here — the phone is gone and will never send
+# PairingConfirmServer — so the session is cancelled from the desktop instead, and
+# only then is the completion refusal checked. The CLI's own 150 s deadline outlives
+# that daemon bound, so it would report the daemon's timeout rather than its own.
+if ! "$CLI_BIN" cancel-pairing --port "$PORT_MISMATCH" --session-id "$SESSION_ID_MISMATCH" \
+    > "${TEST_DIR}/cancel_mismatch_pairing.log" 2>&1; then
+    echo "❌ ERROR (Phase 1a-ii): cancel-pairing failed:"
+    cat "${TEST_DIR}/cancel_mismatch_pairing.log" || true
+    exit 1
+fi
+if ! grep -qF 'CANCELLED=true' "${TEST_DIR}/cancel_mismatch_pairing.log"; then
+    echo "❌ ERROR (Phase 1a-ii): cancel-pairing did not confirm the cancellation:"
+    cat "${TEST_DIR}/cancel_mismatch_pairing.log" || true
+    exit 1
+fi
+set +e
+"$CLI_BIN" complete-pairing "$PORT_MISMATCH" > "${TEST_DIR}/complete_mismatch_pairing.log" 2>&1
+COMPLETE_MISMATCH_EXIT=$?
+set -e
+if [ "$COMPLETE_MISMATCH_EXIT" -ne 1 ] \
+    || ! grep -qF 'ERROR: Pairing session failed: the pairing was cancelled' \
+        "${TEST_DIR}/complete_mismatch_pairing.log"; then
+    echo "❌ ERROR (Phase 1a-ii): a cancelled session did not refuse completion as cancelled (exit $COMPLETE_MISMATCH_EXIT):"
+    cat "${TEST_DIR}/complete_mismatch_pairing.log" || true
+    tail -n 80 "$DAEMON_LOG" || true
+    exit 1
+fi
+echo "✅ Phase 1a-ii PASSED: pin mismatch rejected phone-side, session cancelled from the desktop, completion refused (the pairing was cancelled)."
+
+# ── 1a-iii: the desktop cancels a live session ───────────────────────────────
+#
+# `hold_sas_ms` keeps the phone in `awaitApproval` after it has displayed the
+# SAS, so the cancel lands on a session that is genuinely still deciding rather
+# than on one the phone already abandoned.
+echo "==> Step 1a-iii: the desktop cancels a live session..."
+clear_logcat "Phase 1a-iii"
+LOG_BASE=$(wc -l < "$DAEMON_LOG")
+
+if ! START_CANCEL_OUTPUT=$("$CLI_BIN" start-pairing); then
+    echo "❌ ERROR (Phase 1a-iii): start-pairing failed (a previous session may still be active):"
+    printf '%s\n' "$START_CANCEL_OUTPUT"
+    exit 1
+fi
+PORT_CANCEL=$(echo "$START_CANCEL_OUTPUT" | grep 'PORT=' | cut -d'=' -f2)
+PAIR_URL_CANCEL=$(echo "$START_CANCEL_OUTPUT" | grep 'URL=' | cut -d'=' -f2-)
+SESSION_ID_CANCEL=$(echo "$START_CANCEL_OUTPUT" | grep 'SESSION_ID=' | cut -d'=' -f2)
+echo "    Pairing port: $PORT_CANCEL  session: $SESSION_ID_CANCEL"
+require_pair_url_v2 "$PAIR_URL_CANCEL" "Phase 1a-iii QR" 1
+PAIR_URL_CANCEL=$(pair_url_for_emulator "$PAIR_URL_CANCEL")
+echo "    Pairing URL (emulator view): $PAIR_URL_CANCEL"
+
+AM_CANCEL_LOG="${TEST_DIR}/am_cancel_pairing.log"
+adb shell "am instrument -w \
+    -e class dev.rourunisen.tapauth.e2e.PairingE2eTest \
+    -e pairing_url '$PAIR_URL_CANCEL' \
+    -e hold_sas_ms 8000 \
+    '$TEST_PKG/dev.rourunisen.tapauth.crypto.TapAuthTestRunner'" > "$AM_CANCEL_LOG" 2>&1 &
+AM_CANCEL_PID=$!
+
+# Cancel once the phone actually shows its SAS (its `hold_sas_ms` window), so the
+# abort arrives while `awaitApproval` is still waiting for a decision.
+#
+# 100 polls at 0.5 s ≈ 50 s, which outlives the phone's own 30 s response race
+# (`PairingSession.RESPONSE_DEADLINE_MS`) plus app start. A window that expired
+# first would report "the phone never displayed a SAS" for a phone that was
+# simply still racing for the response.
+CANCEL_SAS_SEEN=0
+for _ in $(seq 1 100); do
+    if adb logcat -d 2>/dev/null | grep -q 'ANDROID_DERIVED_SAS='; then
+        CANCEL_SAS_SEEN=1
+        break
+    fi
+    sleep 0.5
+done
+if [ "$CANCEL_SAS_SEEN" != "1" ]; then
+    echo "❌ ERROR (Phase 1a-iii): the phone never displayed a SAS, so there was nothing to cancel."
+    adb logcat -d -v time -s 'PairingSession:*' 'PairingE2eTest:*' 2>/dev/null | tail -n 40 || true
+    cat "$AM_CANCEL_LOG" || true
+    exit 1
+fi
+echo "    Phone displayed its SAS; cancelling from the desktop..."
+
+if ! "$CLI_BIN" cancel-pairing --port "$PORT_CANCEL" --session-id "$SESSION_ID_CANCEL" \
+    > "${TEST_DIR}/cancel_pairing.log" 2>&1; then
+    echo "❌ ERROR (Phase 1a-iii): cancel-pairing failed:"
+    cat "${TEST_DIR}/cancel_pairing.log" || true
+    exit 1
+fi
+if ! grep -qF 'CANCELLED=true' "${TEST_DIR}/cancel_pairing.log"; then
+    echo "❌ ERROR (Phase 1a-iii): cancel-pairing did not confirm the cancellation:"
+    cat "${TEST_DIR}/cancel_pairing.log" || true
+    exit 1
+fi
+echo "✅ The desktop cancelled the session (CANCELLED=true)."
+
+wait "$AM_CANCEL_PID" || true
+
+CANCEL_OK=1
+if instrument_ok "$AM_CANCEL_LOG"; then
+    echo "❌ ERROR (Phase 1a-iii): the instrumentation reported success — a cancelled pairing must never pass."
+    CANCEL_OK=0
+fi
+if ! phase_marker "$AM_CANCEL_LOG" 'The desktop aborted the pairing'; then
+    echo "❌ ERROR (Phase 1a-iii): the phone never reported the desktop's abort."
+    CANCEL_OK=0
+fi
+# Negated via `phase_marker` (which also reads logcat) rather than a plain grep of
+# the instrumentation log: "Pairing completed and persisted" is a Log.i line, so
+# an AM-log-only grep would pass without looking at anything.
+if phase_marker "$AM_CANCEL_LOG" 'Pairing completed and persisted'; then
+    echo "❌ ERROR (Phase 1a-iii): the phone completed the pairing even though the desktop cancelled."
+    CANCEL_OK=0
+fi
+set +e
+"$CLI_BIN" complete-pairing "$PORT_CANCEL" > "${TEST_DIR}/complete_cancel_pairing.log" 2>&1
+COMPLETE_CANCEL_EXIT=$?
+set -e
+if [ "$COMPLETE_CANCEL_EXIT" -ne 1 ] \
+    || ! grep -qF 'ERROR: Pairing session failed: the pairing was cancelled' \
+        "${TEST_DIR}/complete_cancel_pairing.log"; then
+    echo "❌ ERROR (Phase 1a-iii): a cancelled session did not refuse completion as cancelled (exit $COMPLETE_CANCEL_EXIT):"
+    CANCEL_OK=0
+fi
+CANCEL_SERVERS_COUNT=$(servers_count "Phase 1a-iii")
+if [ "$CANCEL_SERVERS_COUNT" -ne 0 ]; then
+    echo "❌ ERROR (Phase 1a-iii): $CANCEL_SERVERS_COUNT device(s) stored despite a cancelled pairing."
+    CANCEL_OK=0
+fi
+if [ "$CANCEL_OK" != "1" ]; then
+    echo "---- ${AM_CANCEL_LOG} ----"
+    cat "$AM_CANCEL_LOG" || true
+    echo "---- ${TEST_DIR}/cancel_pairing.log ----"
+    cat "${TEST_DIR}/cancel_pairing.log" || true
+    echo "---- ${TEST_DIR}/complete_cancel_pairing.log ----"
+    cat "${TEST_DIR}/complete_cancel_pairing.log" || true
+    echo "---- logcat (PairingSession / PairingE2eTest) ----"
+    adb logcat -d -v time -s 'PairingSession:*' 'PairingE2eTest:*' 2>/dev/null | tail -n 40 || true
+    echo "---- tail -n 80 ${DAEMON_LOG} ----"
+    tail -n 80 "$DAEMON_LOG" || true
+    exit 1
+fi
+wait_log_since "$LOG_BASE" 'Cancelling the pairing session' \
+    "Phase 1a-iii: the daemon logged the desktop-initiated cancellation"
+echo "✅ Phase 1a-iii PASSED: the desktop cancelled a live session, the phone reported the abort, nothing was stored."
+# One registry entry for the three sub-cases above: the rejected SAS (1a-i), the
+# pinned pk (1a-ii) and the desktop-initiated cancel (1a-iii).
+phase_pass "1a" "the phone rejected SAS ${NEG_SAS} and 0 devices were stored (1a-i), the phone dropped a PairingResponse whose pk did not match the QR and the cancelled completion was refused (1a-ii), and a desktop cancel of a live session was reported by the phone and stored nothing (1a-iii)"
+
+# ── 1b: legitimate UDP pairing over QEMU SLIRP ───────────────────────────────
+echo "==> Step 1b: Legitimate UDP pairing over QEMU SLIRP (10.0.2.2)..."
+clear_logcat "Phase 1b"
+LOG_BASE=$(wc -l < "$DAEMON_LOG")
+
+if ! START_OUTPUT=$("$CLI_BIN" start-pairing); then
+    echo "❌ ERROR (Phase 1b): start-pairing failed (a previous session may still be active):"
+    printf '%s\n' "$START_OUTPUT"
+    exit 1
+fi
 PORT=$(echo "$START_OUTPUT" | grep 'PORT=' | cut -d'=' -f2)
-PAIR_URL=$(echo "$START_OUTPUT" | grep 'URL=' | cut -d'=' -f2)
-
-echo "    Pairing Port: $PORT"
+PAIR_URL=$(echo "$START_OUTPUT" | grep 'URL=' | cut -d'=' -f2-)
+SESSION_ID=$(echo "$START_OUTPUT" | grep 'SESSION_ID=' | cut -d'=' -f2)
+echo "    Pairing port: $PORT  session: $SESSION_ID"
+# require_udp_endpoint=1: this phase is the UDP one, so a QR without `p`/`ip4`
+# would prove nothing about UDP delivery.
+require_pair_url_v2 "$PAIR_URL" "Phase 1b QR" 1
+PAIR_URL=$(pair_url_for_emulator "$PAIR_URL")
 echo "    Pairing URL:  $PAIR_URL"
+echo "    QR keys (emulator view): v='$(pair_url_param "$PAIR_URL" v)' sid='$(pair_url_param "$PAIR_URL" sid)' pk='$(pair_url_param "$PAIR_URL" pk)' p='$(pair_url_param "$PAIR_URL" p)' ip4='$(pair_url_param "$PAIR_URL" ip4)' ip6='$(pair_url_param "$PAIR_URL" ip6)'"
 
-# Wait for pairing in background
+wait_log_since "$LOG_BASE" "Started pairing session on UDP port ${PORT} (session ${SESSION_ID})" \
+    "Phase 1b: the daemon opened the ephemeral UDP pairing socket (port ${PORT}, session ${SESSION_ID})"
+
 WAIT_LOG="${TEST_DIR}/wait_pairing.log"
 "$CLI_BIN" wait-for-pairing "$PORT" > "$WAIT_LOG" 2>&1 &
 WAIT_PID=$!
 
-# Trigger Android PairingClient via Instrumentation Test in background
 echo "==> Triggering PairingClient inside Android Emulator..."
 AM_LOG="${TEST_DIR}/am_pairing.log"
-adb shell am instrument -w \
+adb shell "am instrument -w \
     -e class dev.rourunisen.tapauth.e2e.PairingE2eTest \
-    -e pairing_host 10.0.2.2 \
-    -e pairing_port "$PORT" \
-    "$TEST_PKG/dev.rourunisen.tapauth.crypto.TapAuthTestRunner" > "$AM_LOG" 2>&1 &
+    -e pairing_url '$PAIR_URL' \
+    -e pairing_username '${TAPAUTH_E2E_PAIRING_USERNAME:-$TEST_USER}' \
+    '$TEST_PKG/dev.rourunisen.tapauth.crypto.TapAuthTestRunner'" > "$AM_LOG" 2>&1 &
 AM_PID=$!
 
 wait "$WAIT_PID" || {
@@ -786,47 +2346,92 @@ wait "$WAIT_PID" || {
     cat "$WAIT_LOG"
     exit 1
 }
-
 SAS_CODE=$(grep 'SAS=' "$WAIT_LOG" | cut -d'=' -f2)
+if ! printf '%s' "$SAS_CODE" | grep -Eq "$SAS_PATTERN"; then
+    echo "❌ ERROR (Phase 1b): the daemon did not display a SAS (got '$SAS_CODE')."
+    cat "$WAIT_LOG" || true
+    exit 1
+fi
 echo "    Desktop Derived SAS: $SAS_CODE"
 
-echo "==> Completing pairing handshake..."
-COMPLETE_OUTPUT=$("$CLI_BIN" complete-pairing "$PORT")
-SERVER_HEX=$(echo "$COMPLETE_OUTPUT" | grep 'SERVER_HEX=' | cut -d'=' -f2)
-echo "✅ Device pairing finalized successfully! Server Key: $SERVER_HEX"
-
-# Wait for Android pairing test to finish successfully
-wait "$AM_PID" || {
-    echo "❌ Android pairing instrumentation test failed. Log:"
-    cat "$AM_LOG"
-    exit 1
-}
-cat "$AM_LOG"
-
-# Verify SAS matching between Desktop and Android
-ANDROID_SAS=$(grep -o 'ANDROID_DERIVED_SAS=[0-9-]*' "$AM_LOG" | head -n1 | cut -d'=' -f2 || true)
-if [ -z "$ANDROID_SAS" ]; then
-    ANDROID_SAS=$(adb shell run-as "$APP_PKG" cat files/derived_sas.txt 2>/dev/null | tr -d '\r\n' || true)
-fi
-if [ -z "$ANDROID_SAS" ]; then
-    ANDROID_SAS=$(adb logcat -d | grep -o 'Derived SAS: [0-9-]*' | tail -n1 | cut -d':' -f2 | tr -d ' \r\n' || true)
-fi
-echo "    Android Derived SAS: $ANDROID_SAS"
-
-if [ -n "$SAS_CODE" ] && [ -n "$ANDROID_SAS" ] && [ "$ANDROID_SAS" = "$SAS_CODE" ]; then
-    echo "✅ SAS Anti-MITM Verification PASSED! Both sides derived identical code: $SAS_CODE"
-else
-    echo "❌ ERROR: SAS Anti-MITM verification mismatch! Desktop=$SAS_CODE, Android=$ANDROID_SAS"
+# The approval is held back so the phone's keepalive path is actually exercised:
+# after `PairingE2eTest` displays the SAS it approves its own side immediately and
+# parks in `awaitProvision`, which rewrites an idle UDP mapping every 1000 ms. The
+# harness's hold is exactly that window: QEMU SLIRP drops a UDP mapping after ~4 s
+# of silence, so only a hold longer than that proves the keepalives (rather than
+# the mapping's freshness) carry the session across to the approval.
+#
+# `wait-for-pairing` answers as soon as the *daemon* has derived the SAS, not when
+# the phone has received and shown it, so the hold must start from the phone's own
+# announcement — otherwise the exercised window is `hold − Δ`, not the hold. The
+# logcat buffer was cleared at the start of 1b, so this cannot match an older run.
+# 100 polls at 0.5 s ≈ 50 s, above the phone's own 30 s response race plus app
+# start (see the Phase 1a-iii poll for the same bound).
+PHONE_SAS_SEEN=0
+for _ in $(seq 1 100); do
+    if adb logcat -d 2>/dev/null | grep -q 'ANDROID_DERIVED_SAS='; then
+        PHONE_SAS_SEEN=1
+        break
+    fi
+    sleep 0.5
+done
+if [ "$PHONE_SAS_SEEN" != "1" ]; then
+    echo "❌ ERROR (Phase 1b): the phone never announced its derived SAS, so the keepalive window cannot be measured."
+    adb logcat -d -v time -s 'PairingSession:*' 'PairingE2eTest:*' 2>/dev/null | tail -n 40 || true
+    cat "$AM_LOG" || true
     exit 1
 fi
+echo "    Phone displayed its derived SAS."
+PAIRING_SAS_PAUSE_SECS="${TAPAUTH_E2E_SAS_PAUSE_SECS:-6}"
+echo "    Holding the handshake at SAS confirmation for ${PAIRING_SAS_PAUSE_SECS}s (SLIRP UDP mapping keepalive)..."
+sleep "$PAIRING_SAS_PAUSE_SECS"
 
-# Verify paired servers in daemon
-SERVERS_COUNT=$("$CLI_BIN" get-servers | grep 'COUNT=' | cut -d'=' -f2)
+if ! COMPLETE_OUTPUT=$("$CLI_BIN" complete-pairing "$PORT" 2>&1); then
+    echo "❌ ERROR (Phase 1b): complete-pairing failed:"
+    printf '%s\n' "$COMPLETE_OUTPUT"
+    echo "---- ${AM_LOG} ----"
+    cat "$AM_LOG" || true
+    echo "---- tail -n 80 ${DAEMON_LOG} ----"
+    tail -n 80 "$DAEMON_LOG" || true
+    exit 1
+fi
+SERVER_HEX=$(printf '%s\n' "$COMPLETE_OUTPUT" | grep 'SERVER_HEX=' | cut -d'=' -f2)
+if ! printf '%s' "$SERVER_HEX" | grep -Eq '^[0-9a-f]{64}$'; then
+    echo "❌ ERROR (Phase 1b): complete-pairing did not print a 64-hex SERVER_HEX (got '$SERVER_HEX'):"
+    printf '%s\n' "$COMPLETE_OUTPUT"
+    exit 1
+fi
+echo "✅ The desktop approved the SAS and provisioned the CSK (server key $SERVER_HEX)."
+
+wait "$AM_PID" || true
+assert_instrument_ok "$AM_LOG" "Phase 1b"
+if ! phase_marker "$AM_LOG" 'Pairing completed and persisted'; then
+    echo "❌ ERROR (Phase 1b): the phone never logged 'Pairing completed and persisted'."
+    cat "$AM_LOG" || true
+    exit 1
+fi
+pairing_sas_match "$SAS_CODE" "$AM_LOG" "Phase 1b"
+
+wait_log_since "$LOG_BASE" 'PairingInit accepted over Udp' \
+    "Phase 1b: the daemon accepted the phone's PairingInit over UDP"
+wait_log_since "$LOG_BASE" 'SAS confirmed: provisioning the CSK to the phone over Udp' \
+    "Phase 1b: the daemon provisioned the CSK over UDP"
+wait_log_since "$LOG_BASE" "Pairing complete: phone key ${SERVER_HEX}" \
+    "Phase 1b: the daemon proved the CSK to the paired phone key"
+wait_log_since "$LOG_BASE" "Paired server ${SERVER_HEX} saved for user" \
+    "Phase 1b: the daemon persisted the paired phone"
+
+SERVERS_COUNT=$(servers_count "Phase 1b")
 if [ "$SERVERS_COUNT" -lt 1 ]; then
     echo "❌ ERROR: No paired servers recorded in daemon state."
     exit 1
 fi
-echo "✅ Verified 1 paired Android device registered."
+if ! "$CLI_BIN" get-servers | grep -qF "key=${SERVER_HEX}"; then
+    echo "❌ ERROR (Phase 1b): get-servers does not list the paired key ${SERVER_HEX}:"
+    "$CLI_BIN" get-servers || true
+    exit 1
+fi
+echo "✅ Verified ${SERVERS_COUNT} paired Android device(s), including ${SERVER_HEX}."
 
 # Verify on-disk security properties of the real state directory (systemd mode)
 if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
@@ -849,21 +2454,335 @@ if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
         find /var/lib/tapauth -type f -perm /go+w
         exit 1
     fi
+    phase_pass "1b" "the phone paired over UDP (both sides derived SAS ${SAS_CODE}), the daemon logged PairingInit/SAS-confirm/persist for ${SERVER_HEX}, get-servers lists it, ${SERVERS_COUNT} device(s) were stored, and the state dir/socket modes+owners and 600 file modes held"
+else
+    phase_pass "1b" "the phone paired over UDP (both sides derived SAS ${SAS_CODE}), the daemon logged PairingInit/SAS-confirm/persist for ${SERVER_HEX}, get-servers lists it, and ${SERVERS_COUNT} device(s) were stored"
 fi
+
+# ── 1c: BLE-only pairing over the Bumble /dev/vhci bridge ────────────────────
+#
+# A v2 QR carrying no `ip4`/`ip6` describes a BLE-only pairing: the phone
+# has no address to send PairingInit to, so it scans for the GATT service and
+# writes the init to the characteristic instead. `p` is still present — the format
+# allows a portless QR, but the daemon always emits its configured UDP port — so
+# the strip below removes only the addresses. The Bumble bridge and its
+# /dev/vhci adapter were brought up in Step 3, and the daemon advertises on that
+# adapter — but only when BLE is enabled in the config it reads at session start.
+echo "==> Step 1c: BLE-only pairing over the Bumble /dev/vhci bridge..."
+"$CLI_BIN" set-transports --ble true --network true
+clear_logcat "Phase 1c"
+LOG_BASE=$(wc -l < "$DAEMON_LOG")
+
+if ! START_BLE_OUTPUT=$("$CLI_BIN" start-pairing); then
+    echo "❌ ERROR (Phase 1c): start-pairing failed (a previous session may still be active):"
+    printf '%s\n' "$START_BLE_OUTPUT"
+    exit 1
+fi
+PORT_BLE=$(echo "$START_BLE_OUTPUT" | grep 'PORT=' | cut -d'=' -f2)
+PAIR_URL_BLE=$(echo "$START_BLE_OUTPUT" | grep 'URL=' | cut -d'=' -f2-)
+SESSION_ID_BLE=$(echo "$START_BLE_OUTPUT" | grep 'SESSION_ID=' | cut -d'=' -f2)
+echo "    Pairing port: $PORT_BLE  session: $SESSION_ID_BLE"
+# require_udp_endpoint=0: a BLE-only QR legitimately carries no endpoint.
+require_pair_url_v2 "$PAIR_URL_BLE" "Phase 1c QR"
+# Strip the endpoints from the QR the phone is given: with no address to reach,
+# the phone's UDP candidate is not even started and BLE is the only transport.
+PAIR_URL_BLE=$(pair_url_del "$PAIR_URL_BLE" ip4)
+PAIR_URL_BLE=$(pair_url_del "$PAIR_URL_BLE" ip6)
+if [ -n "$(pair_url_param "$PAIR_URL_BLE" ip4)" ] || [ -n "$(pair_url_param "$PAIR_URL_BLE" ip6)" ]; then
+    echo "❌ ERROR (Phase 1c): failed to strip the network endpoints from the QR: $PAIR_URL_BLE"
+    exit 1
+fi
+if [ -z "$(pair_url_param "$PAIR_URL_BLE" p)" ]; then
+    echo "❌ ERROR (Phase 1c): the BLE-only QR lost its 'p' parameter: $PAIR_URL_BLE"
+    exit 1
+fi
+echo "    Pairing URL (no endpoints): $PAIR_URL_BLE"
+echo "    QR keys: v='$(pair_url_param "$PAIR_URL_BLE" v)' sid='$(pair_url_param "$PAIR_URL_BLE" sid)' pk='$(pair_url_param "$PAIR_URL_BLE" pk)' p='$(pair_url_param "$PAIR_URL_BLE" p)' ip4='$(pair_url_param "$PAIR_URL_BLE" ip4)' ip6='$(pair_url_param "$PAIR_URL_BLE" ip6)'"
+
+wait_log_since "$LOG_BASE" 'Pairing BLE advertisement started (adv_id ' \
+    "Phase 1c: the daemon is advertising the pairing over BLE"
+
+WAIT_BLE_LOG="${TEST_DIR}/wait_ble_pairing.log"
+"$CLI_BIN" wait-for-pairing "$PORT_BLE" > "$WAIT_BLE_LOG" 2>&1 &
+WAIT_BLE_PID=$!
+
+AM_BLE_LOG="${TEST_DIR}/am_ble_pairing.log"
+adb shell "am instrument -w \
+    -e class dev.rourunisen.tapauth.e2e.PairingE2eTest \
+    -e pairing_url '$PAIR_URL_BLE' \
+    -e pairing_username '${TAPAUTH_E2E_PAIRING_USERNAME:-$TEST_USER}' \
+    '$TEST_PKG/dev.rourunisen.tapauth.crypto.TapAuthTestRunner'" > "$AM_BLE_LOG" 2>&1 &
+AM_BLE_PID=$!
+
+wait "$WAIT_BLE_PID" || {
+    echo "❌ wait-for-pairing failed (BLE). Log:"
+    cat "$WAIT_BLE_LOG"
+    # The phone-side evidence matters here: the daemon only knows it never saw a
+    # PairingInit, while the phone knows whether it scanned, connected or failed
+    # for an adapter/permission reason. Without this dump a BLE regression looks
+    # like a daemon hang.
+    echo "---- ${AM_BLE_LOG} ----"
+    cat "$AM_BLE_LOG" || true
+    echo "---- logcat (PairingSession / BlePairingClient / PairingE2eTest) ----"
+    adb logcat -d -v time -s 'PairingSession:*' 'BlePairingClient:*' 'PairingE2eTest:*' \
+        2>/dev/null | tail -n 200 || true
+    echo "---- tail -n 80 ${DAEMON_LOG} ----"
+    tail -n 80 "$DAEMON_LOG" || true
+    # Three BLE failure modes look identical from the daemon side: the phone never
+    # registered a scan, the scan ran and returned nothing, or results arrived and
+    # the filter dropped them. The guest's own BLE state separates them.
+    echo "--- guest BLE state (dumpsys bluetooth_manager) ---"
+    # `dumpsys bluetooth_manager` blocks on the adapter service; `|| true` guards
+    # the exit code, not the wall clock (see scripts/ci/setup-emulator-ble-bridge.sh).
+    DUMP=$(timeout 20 adb shell dumpsys bluetooth_manager 2>/dev/null || true)
+    printf '%s\n' "$DUMP" | head -n 12
+    printf '%s\n' "$DUMP" | grep -A 12 'GATT Scanner Map' || true
+    adb shell settings get global bluetooth_on 2>/dev/null || true
+    adb shell settings get secure location_mode 2>/dev/null || true
+    timeout 20 adb shell dumpsys package "$APP_PKG" 2>/dev/null | grep -i 'BLUETOOTH_\|FINE_LOCATION' || true
+    exit 1
+}
+SAS_BLE=$(grep 'SAS=' "$WAIT_BLE_LOG" | cut -d'=' -f2)
+if ! printf '%s' "$SAS_BLE" | grep -Eq "$SAS_PATTERN"; then
+    echo "❌ ERROR (Phase 1c): the daemon did not display a SAS (got '$SAS_BLE')."
+    cat "$WAIT_BLE_LOG" || true
+    exit 1
+fi
+echo "    Desktop Derived SAS: $SAS_BLE"
+
+if ! COMPLETE_BLE_OUTPUT=$("$CLI_BIN" complete-pairing "$PORT_BLE" 2>&1); then
+    echo "❌ ERROR (Phase 1c): complete-pairing failed:"
+    printf '%s\n' "$COMPLETE_BLE_OUTPUT"
+    echo "---- ${AM_BLE_LOG} ----"
+    cat "$AM_BLE_LOG" || true
+    exit 1
+fi
+SERVER_HEX_BLE=$(printf '%s\n' "$COMPLETE_BLE_OUTPUT" | grep 'SERVER_HEX=' | cut -d'=' -f2)
+if ! printf '%s' "$SERVER_HEX_BLE" | grep -Eq '^[0-9a-f]{64}$'; then
+    echo "❌ ERROR (Phase 1c): complete-pairing did not print a 64-hex SERVER_HEX (got '$SERVER_HEX_BLE'):"
+    printf '%s\n' "$COMPLETE_BLE_OUTPUT"
+    exit 1
+fi
+echo "✅ The desktop approved over BLE and provisioned the CSK (server key $SERVER_HEX_BLE)."
+
+wait "$AM_BLE_PID" || true
+assert_instrument_ok "$AM_BLE_LOG" "Phase 1c"
+if ! phase_marker "$AM_BLE_LOG" 'SAS reached the phone over BLE'; then
+    echo "❌ ERROR (Phase 1c): the phone did not report the SAS over BLE — this phase must not pass over UDP."
+    cat "$AM_BLE_LOG" || true
+    exit 1
+fi
+if ! phase_marker "$AM_BLE_LOG" 'Pairing completed and persisted'; then
+    echo "❌ ERROR (Phase 1c): the phone never logged 'Pairing completed and persisted'."
+    cat "$AM_BLE_LOG" || true
+    exit 1
+fi
+pairing_sas_match "$SAS_BLE" "$AM_BLE_LOG" "Phase 1c"
+
+wait_log_since "$LOG_BASE" 'PairingInit accepted over Ble' \
+    "Phase 1c: the daemon accepted the phone's PairingInit over BLE"
+wait_log_since "$LOG_BASE" 'SAS confirmed: provisioning the CSK to the phone over Ble' \
+    "Phase 1c: the daemon provisioned the CSK over BLE"
+wait_log_since "$LOG_BASE" "Paired server ${SERVER_HEX_BLE}" \
+    "Phase 1c: the daemon persisted the paired phone"
+
+# Re-pairing the same emulator reuses its persistent identity key, so the daemon
+# overwrites the entry instead of adding one: only "at least one" is meaningful.
+# The real BLE proof is the phone's `SAS reached the phone over BLE` marker above.
+SERVERS_COUNT=$(servers_count "Phase 1c")
+if [ "$SERVERS_COUNT" -lt 1 ]; then
+    echo "❌ ERROR (Phase 1c): no paired device recorded after the BLE-only pairing, daemon reports $SERVERS_COUNT."
+    exit 1
+fi
+if ! "$CLI_BIN" get-servers | grep -qF "key=${SERVER_HEX_BLE}"; then
+    echo "❌ ERROR (Phase 1c): get-servers does not list the BLE-paired key ${SERVER_HEX_BLE}:"
+    "$CLI_BIN" get-servers || true
+    exit 1
+fi
+echo "✅ Verified the BLE-paired device is present (${SERVERS_COUNT}) after the BLE-only pairing."
+phase_pass "1c" "with no endpoint in the QR the phone paired over BLE only (both sides derived SAS ${SAS_BLE}), it logged 'SAS reached the phone over BLE', the daemon logged PairingInit/SAS-confirm/persist for ${SERVER_HEX_BLE}, and get-servers lists it"
 
 # Step 5b: Ensure runtime permissions and start Android app/background services
 echo "==> Starting Android foreground services for authentication..."
 adb shell am force-stop "$APP_PKG" 2>/dev/null || true
 # Clear the log buffer so the group-configuration line the next phase asserts on
 # is guaranteed to still be present even on a noisy runner (the logcat ring buffer
-# can rotate between app start and Phase 2).
-adb logcat -c 2>/dev/null || true
+# can rotate between app start and Phase 2). A rejected clear must fail the run
+# rather than be swallowed: the caller-context tokens below carry no per-run
+# entropy, so a stale line from an earlier run would satisfy Phase 2/2b/3.
+clear_logcat "Phase 2"
 adb shell am start -n "$APP_PKG/dev.rourunisen.tapauth.MainActivity"
 sleep 2
 
 # Start background biometric auto-grant listener for auth tests
 "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
 sleep 1
+
+# ── Caller-context (protocol v2) helpers ─────────────────────────────────────
+#
+# Protocol v2 carries the Client's caller context — `pam_service`,
+# `process_name`, `command_preview` — so the phone can show what is being
+# approved. A daemon-side line only proves a request was *sent*, so every
+# assertion below reads the phone's own line instead:
+#
+#   Auth request caller context: pamService=…, processName=…, commandPreview=…
+#
+# emitted by AuthRequestManager.submitRequest, the single funnel both transports
+# pass through (AuthenticationService for UDP, BleGattService for BLE), so one
+# line proves delivery over either transport. Each field is asserted on its own
+# so a failure names the field that did not arrive.
+
+# assert_phone_logged <fixed-string> <label>
+#
+# Fails unless the phone's logcat dump contains <fixed-string>. The whole dump is
+# grepped, deliberately not a window anchored to a line count: the logcat ring
+# buffer can rotate between taking a mark and checking it, which slides a counted
+# window forward and drops a line the phase did emit — a spurious failure. What
+# keeps an earlier phase's line from satisfying this assertion is the per-phase
+# token in every fixed string below, together with the `clear_logcat` issued
+# before the app is started for Phase 2 (see Step 5b), so a stale line cannot
+# match and this can only ever fail for a line that is genuinely missing.
+#
+# The dump is captured into a variable and grepped through a here-string instead
+# of being piped straight into `grep -q`: `grep -q` exits at the first match and
+# SIGPIPEs the producer, which this script only survives because it does not set
+# `pipefail` — under `set -o pipefail` that SIGPIPE would turn a match into a
+# failed pipeline. Capturing first keeps the pattern pipefail-safe, and it also
+# means one assertion greps one snapshot instead of re-reading logcat mid-write.
+assert_phone_logged() {
+    local needle=$1 label=$2 dump
+    dump=$(adb logcat -d 2>/dev/null || true)
+    if grep -qF "$needle" <<< "$dump"; then
+        echo "✅ ${label}"
+        return 0
+    fi
+    echo "❌ ERROR (${label}): the phone never logged '${needle}'."
+    echo "---- caller-context lines in the phone log ----"
+    grep -F 'caller context' <<< "$dump" || true
+    exit 1
+}
+
+# caller_context_tokens <label>: per-phase context values in CTX_SERVICE,
+# CTX_PROCESS, CTX_REQUEST_ID and CTX_CLI.
+#
+# The tokens are phase-unique ASCII with no control characters, so neither
+# sanitiser (Rust on the Client, ContextSanitizer on the phone) can rewrite them
+# and a logcat line from an earlier phase cannot satisfy this phase's assertion.
+#
+# `process_name` needs the copy. The daemon asks the kernel first, in this order:
+# `/proc/<pid>/exe` basename, then the `cmdline` `argv[0]` basename, then
+# `/proc/<pid>/comm` (tapauthd/src/caller_context.rs:190-194), and falls back to
+# the Client's self-report only when none of those three answers (:371-374). The
+# first entry is the one `ptrace_may_access` gates, so it is EACCES for another
+# UID and `argv[0]` answers in the shipped unit, while `exe` answers in dev mode,
+# where the daemon runs as the caller. Invoking a copy of the CLI named after the
+# token makes both of those yield the token, and the same token travels as
+# `--process-name`. (`comm` would be the kernel's 15-byte truncation of the
+# token, but it is never reached while `argv[0]` answers.)
+caller_context_tokens() {
+    local label=$1
+    CTX_SERVICE="e2e-ctx-${label}"
+    CTX_PROCESS="e2e-ctx-proc-${label}"
+    CTX_REQUEST_ID="e2e-ctx-${label}-$$"
+    CTX_CLI="${TEST_DIR}/${CTX_PROCESS}"
+    cp -f "$CLI_BIN" "$CTX_CLI"
+    chmod +x "$CTX_CLI"
+}
+
+# assert_caller_context_preview_readable: fail unless the daemon can read a
+# caller's `/proc/<pid>/cmdline` on this host.
+#
+# `command_preview` is the kernel's `cmdline` split on NUL
+# (tapauthd/src/caller_context.rs:304-310) and joined by single spaces
+# (:175; the IPC request has no command field), so the assertion below only
+# means something if the daemon can read that file. Only
+# `readlink(/proc/<pid>/exe)` is gated by `ptrace_may_access`:
+# `cmdline` is 0444 and `comm` 0644, world-readable across UIDs. The shipped unit
+# runs as `tapauthd` with `CAP_SYS_PTRACE` deliberately absent
+# (systemd/tapauthd.service) and still fills the preview in from a root caller,
+# which is why comparing the daemon's uid against ours — as this helper used to —
+# switched the assertion off in every `systemd` run, i.e. in every run CI makes.
+#
+# What can still empty the preview for real is a `hidepid=1`/`hidepid=2` procfs
+# mount, which hides other users' entries. So probe by *opening* the file as the
+# daemon user instead of assuming, and treat a failure as fatal rather than a
+# skip: an assertion that turns itself off reports the same green as one that held
+# while checking nothing.
+#
+# The probe pid is this shell's. Every phase invokes the CLI copy (`$CTX_CLI`) or
+# `pamtester` from here, so the caller the daemon resolves runs as this same uid
+# and a procfs that answers for `$$` answers for it too.
+assert_caller_context_preview_readable() {
+    local daemon_user probe="/proc/$$/cmdline" readable=0
+    if [ "$E2E_DAEMON_MODE" = "dev" ]; then
+        # Dev mode starts the daemon from this script, so it runs as this uid.
+        daemon_user=$(id -un)
+        if cat "$probe" >/dev/null 2>&1; then
+            readable=1
+        fi
+    else
+        daemon_user=$(systemctl show -p User --value tapauthd.service 2>/dev/null || true)
+        # Older systemctl ignores --value and prints `User=<name>`.
+        daemon_user=${daemon_user#User=}
+        if [ -z "$daemon_user" ] || ! id -u "$daemon_user" >/dev/null 2>&1; then
+            echo "❌ ERROR: cannot resolve the daemon's user from tapauthd.service (got '${daemon_user}')."
+            echo "   The unit this suite installs runs as User=tapauthd. Without it the"
+            echo "   command_preview assertion cannot be armed, and skipping it would"
+            echo "   report a passing run that never checked the preview."
+            systemctl cat tapauthd.service --no-pager 2>&1 | head -n 20 || true
+            exit 1
+        fi
+        if runuser -u "$daemon_user" -- cat "$probe" >/dev/null 2>&1; then
+            readable=1
+        fi
+    fi
+    if [ "$readable" -ne 1 ]; then
+        echo "❌ ERROR: the daemon user '${daemon_user}' cannot read ${probe}."
+        echo "   /proc/<pid>/cmdline is mode 0444 and needs no CAP_SYS_PTRACE, so a"
+        echo "   cross-uid failure here means procfs hides other users' entries: look"
+        echo "   for hidepid=1 / hidepid=2 on the /proc mount (mount | grep ' /proc ')."
+        echo "   Fix the mount; this security assertion is not skipped."
+        exit 1
+    fi
+    echo "✅ ${daemon_user} can read ${probe} — command_preview is asserted."
+}
+
+# assert_caller_context_delivered <label> <pam_service> <process_name> <preview_argv>
+#
+# One assertion per field, so a failure names the field that did not arrive.
+# <preview_argv> is the argv prefix the phone must show as `command_preview`; the
+# daemon truncates that field to 128 bytes, so it is matched as a prefix.
+#
+# The `commandPreview=` assertion only works against the e2e build variant: the
+# app logs the preview's content when BuildConfig.E2E_TESTING is true, which
+# app/build.gradle.kts sets for the `e2e` build type alone (false for `release`
+# and `debug`), because the desktop's argv can carry credentials such as
+# `-p <password>` and Log.d is not stripped from release builds. Shipped builds
+# log `commandPreview=<N chars, E2E build only>` instead.
+assert_caller_context_delivered() {
+    local label=$1 service=$2 process=$3 preview=$4
+    assert_phone_logged "pamService=${service}," \
+        "${label}: the phone received pam_service='${service}'"
+    assert_phone_logged "processName=${process}," \
+        "${label}: the phone received process_name='${process}'"
+    # Step 2 installs the debug APK when the e2e one is absent, and the debug
+    # variant logs the preview's length rather than its content (see above). Only
+    # this assertion is skipped: the phases still to come (2b, 3) run against the
+    # same package and must not be aborted by a preview the variant cannot print.
+    if [ "$APP_PKG" != "dev.rourunisen.tapauth.e2e" ]; then
+        echo "ℹ️  ${label}: command_preview content is NOT asserted with package ${APP_PKG}."
+        echo "    BuildConfig.E2E_TESTING is true only for the 'e2e' build type; the installed"
+        echo "    package logs the preview's length instead of its content."
+        echo "    Install the e2e variant to assert it: (cd server-android && ./gradlew assembleE2e)"
+        return 0
+    fi
+    # Only the branch that really asserts may arm the probe: on a `hidepid` host
+    # the probe is fatal, and it must not be fatal for an assertion this run does
+    # not make.
+    assert_caller_context_preview_readable
+    assert_phone_logged "commandPreview=${preview}" \
+        "${label}: the phone received command_preview beginning '${preview}'"
+}
 
 # Step 6: Phase 2 - Local Network (UDP) Authentication
 echo ""
@@ -942,7 +2861,16 @@ if [ "$(id -u)" -eq 0 ]; then
 fi
 
 echo "==> Requesting authentication for user '$TEST_USER'..."
-UDP_AUTH_OUTPUT=$("$CLI_BIN" pam-auth "$TEST_USER" 20 || true)
+# The request carries a protocol-v2 caller context so the phone-side assertions
+# below have something to check (see the caller-context helpers above). The
+# request id is passed explicitly because it also appears in the expected
+# command preview.
+# The log offset is taken before the request so the transport attribution below
+# is scoped to this phase's session (the same window idiom Phase 2d uses).
+LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
+caller_context_tokens "udp"
+UDP_AUTH_OUTPUT=$("$CTX_CLI" pam-auth "$TEST_USER" 20 "$CTX_REQUEST_ID" \
+    --pam-service "$CTX_SERVICE" --process-name "$CTX_PROCESS" || true)
 echo "$UDP_AUTH_OUTPUT"
 
 if echo "$UDP_AUTH_OUTPUT" | grep -q 'OUTCOME=SUCCESS'; then
@@ -956,6 +2884,30 @@ else
     fi
     exit 1
 fi
+
+# The grant above proves *something* answered; it does not prove the phone ever
+# received the caller context, which is what protocol v2 added. Assert the three
+# fields on the phone itself, over this (UDP-only) transport.
+assert_caller_context_delivered "Phase 2 (UDP)" \
+    "$CTX_SERVICE" "$CTX_PROCESS" \
+    "${CTX_CLI} pam-auth ${TEST_USER} 20 ${CTX_REQUEST_ID}"
+
+# ...and assert the grant came over the transport this phase left enabled.
+# `enable_ble = false` above is only a line in config.toml until a grant arrives
+# on the transport the daemon actually used: a daemon that ignores the toggle and
+# rings the phone over BLE passes every assertion above, because OUTCOME=SUCCESS
+# says nothing about which transport delivered it. This is the same assertion
+# Phase 2d makes (grant_transport_since + a required transport name), with the
+# expected winner kept as Udp.
+sleep 1
+PHASE2_TRANSPORT=$(grant_transport_since "$LOG_BASE")
+if [ "$PHASE2_TRANSPORT" != "Udp" ]; then
+    echo "❌ ERROR: expected the grant to be attributed to Udp, got '${PHASE2_TRANSPORT}'."
+    tail -n +"$((LOG_BASE + 1))" "$DAEMON_LOG" 2>/dev/null | tail -n 20
+    exit 1
+fi
+echo "✅ Phase 2 grant attributed to Udp (BLE is disabled for this phase)."
+phase_pass "2" "pam-auth returned OUTCOME=SUCCESS, the daemon attributed the grant to Udp (so the enable_ble=false toggle is verified behaviourally), and the phone logged the v2 caller context for this request (pam_service='${CTX_SERVICE}', process_name='${CTX_PROCESS}', and command_preview when the e2e build variant is installed)"
 
 # Stop capture and take the first captured server grant packet
 CAPTURE_OK=0
@@ -1004,9 +2956,10 @@ if [ -n "$GROUPS_PID" ]; then
         echo "--- host IPv6 addresses:"; ip -6 addr show 2>/dev/null || true
         exit 1
     fi
-    MULTICAST_VERIFIED=1
+    phase_pass "2-mcast" "the daemon emitted an EncryptedPacket to IPv4 ${IPV4_MCAST} and to IPv6 ${IPV6_MCAST} (observed on the wire, not just configured)"
 else
     echo "ℹ️  Multicast-group egress verification skipped (not running as root)."
+    phase_skip "2-mcast" "not running as root, so the AF_PACKET egress watcher that observes the discovery groups cannot be started"
 fi
 
 # Step 6b: Phase 2b - Real PAM Module Authentication (pamtester)
@@ -1034,8 +2987,6 @@ PAM_TESTABLE="false"
 if command -v pamtester >/dev/null 2>&1 && [ -w /etc/pam.d ] && [ -f "$PAM_LIB" ]; then
     PAM_TESTABLE="true"
 fi
-PAM_GRANT_STACK_OK=0
-PAM_FALLBACK_OK=0
 
 if [ "$PAM_TESTABLE" = "true" ]; then
     echo "==> Configuring temporary PAM service at ${PAM_CONFIG_PATH}..."
@@ -1058,6 +3009,17 @@ if [ "$PAM_TESTABLE" = "true" ]; then
         echo "❌ Real PAM Module Authentication FAILED (exit code: $PAM_EXIT)."
         exit 1
     fi
+
+    # The exit code only says the module returned success. This is the one phase
+    # that exercises the *shipped* caller: libpam loaded into `pamtester`, so it
+    # also has to prove the module projected the caller context onto the wire and
+    # that the phone received it — `pam_service` as libpam spelled it, and
+    # `process_name` as this process's own image (the daemon's kernel view and the
+    # module's self-report agree on that name, so the assertion holds either way).
+    assert_caller_context_delivered "Phase 2b (PAM module)" \
+        "$PAM_SERVICE_NAME" "pamtester" \
+        "pamtester ${PAM_SERVICE_NAME} ${TEST_USER} authenticate"
+    phase_pass "2b" "pamtester exited ${PAM_EXIT} with the real pam_tapauth.so in the stack, and the phone received the shipped module's caller context (pam_service='${PAM_SERVICE_NAME}', process_name='pamtester')"
 
     # Phase 2e: mixed-stack semantics — a REAL PAM stack where TapAuth's
     # PAM_AUTHINFO_UNAVAIL is expanded to `ignore` by the [success=1
@@ -1083,26 +3045,21 @@ if [ "$PAM_TESTABLE" = "true" ]; then
 
     if [ "$MIXED_GRANT_EXIT" -eq 0 ]; then
         echo "✅ Grant path: TapAuth SUCCESS bypassed the password module in a mixed stack."
-        PAM_GRANT_STACK_OK=1
+        phase_pass "2e" "a TapAuth grant in a [success=1 default=ignore] mixed stack bypassed pam_unix and the stack returned ${MIXED_GRANT_EXIT}"
     else
         echo "❌ ERROR: mixed-stack grant path failed (exit $MIXED_GRANT_EXIT)."
         exit 1
     fi
 else
     echo "ℹ️  Real PAM module testing skipped (/etc/pam.d not writable or pamtester missing)."
+    phase_skip "2b" "pamtester missing, pam_tapauth.so absent, or /etc/pam.d not writable"
+    phase_skip "2e" "pamtester missing, pam_tapauth.so absent, or /etc/pam.d not writable"
 fi
 
-# Helper: assert a pattern is present in the daemon log AFTER a given line
-# offset (window-scoped, so stale matches from earlier phases don't count).
-assert_log_since() {
-    local base=$1 pattern=$2 label=$3
-    if tail -n +"$((base + 1))" "$DAEMON_LOG" 2>/dev/null | grep -q "$pattern"; then
-        echo "✅ ${label}"
-    else
-        echo "❌ ERROR (${label}): pattern '$pattern' not found in the daemon log for this phase."
-        exit 1
-    fi
-}
+# The daemon-log window helpers (assert_log_since, grant_transport_since) are
+# defined near the top of the file, before their first consumer — see the
+# "Daemon-log window helpers" section above. They used to live here, beside
+# Phase 2c, which put the first of their consumers above their definitions.
 
 # ── BLE scan resiliency helpers ───────────────────────────────────────────────
 #
@@ -1145,12 +3102,18 @@ restart_android_app_for_ble() {
 # Authenticate over the currently-configured transport(s), retrying with an app
 # restart a bounded number of times. Returns 0 on success; returns 1 after the
 # final attempt so the caller can dump diagnostics and fail the phase.
+#
+# Optional: `authenticate_with_ble_retry <label> [cli] [extra pam-auth args…]`,
+# so a phase can send a caller context through a copy of the CLI (Phase 3 does;
+# see caller_context_tokens). Without them the behaviour is unchanged.
 authenticate_with_ble_retry() {
     local label="$1"
+    local cli="${2:-$CLI_BIN}"
+    local -a extra=("${@:3}")
     local attempt output
     for ((attempt = 1; attempt <= BLE_MAX_ATTEMPTS; attempt++)); do
         echo "==> ${label}: BLE authentication attempt ${attempt}/${BLE_MAX_ATTEMPTS}..."
-        output=$("$CLI_BIN" pam-auth "$TEST_USER" 30 || true)
+        output=$("$cli" pam-auth "$TEST_USER" 30 "${extra[@]}" || true)
         echo "$output"
         if echo "$output" | grep -q 'OUTCOME=SUCCESS'; then
             return 0
@@ -1228,32 +3191,68 @@ if [ "$CAPTURE_OK" = "1" ]; then
     # Restore auto-grant for the following positive phases
     "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
     sleep 1
+    phase_pass "2c" "the replayed grant failed challenge verification, the nonce cache detected the duplicate replay, and pam-cancel ended the pending session with OUTCOME=IGNORE"
 else
     echo "ℹ️  SKIPPED (no captured grant packet available)."
+    phase_skip "2c" "no captured server grant packet available (packet capture needs root)"
 fi
 
-# Step 6d: Phase 2d - Adversarial UDP: Tampered packet must never authenticate
+# Step 6d: Phase 2d - Adversarial UDP: a tampered datagram must not end the
+# session, and must never authenticate on its own. The rule under test is the
+# one `fix(net)` established: an attempt concludes only on (a) a valid,
+# cryptographically verified response from an authorised server, (b) its own
+# deadline, or (c) an explicit local cancel or user denial. A tampered frame is
+# none of those, so it is dropped and the attempt keeps waiting for the answer
+# the phone really sends — which is what makes this phase stronger than the
+# fail-closed shape it replaced: passing now requires the injection to be
+# dropped *and* the genuine grant to still authenticate.
 echo ""
 echo "╔═══════════════════════════════════════════════════════════════╗"
 echo "║  PHASE 2d: Adversarial UDP (Tampered Ciphertext)              ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
 if [ "$CAPTURE_OK" = "1" ]; then
-    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" stop-auto-grant
+    # Auto-grant stays ON for this whole phase (unlike Phase 2c, which pauses it
+    # so nothing answers): the phone's real grant landing after the injection is
+    # half of what is asserted. `start-auto-grant` is not idempotent — a second
+    # listener would double every touch — and Phase 2c left the one listener
+    # running, so restore it only if it is actually gone.
+    if [ ! -f /tmp/bio-auto-grant.pid ] \
+        || ! kill -0 "$(cat /tmp/bio-auto-grant.pid)" 2>/dev/null; then
+        "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
+        sleep 1
+    fi
     # Settle: keep the next same-user auth outside the 1s PAM-PAM dedup window (previous auth: Phase 2c).
     settle_for_dedup "Phase 2c"
 
     LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
     TAMPER_REQUEST_ID="e2e-tamper-$$"
-    echo "==> Starting auth session (request id $TAMPER_REQUEST_ID) with no grant expected..."
+    echo "==> Starting auth session (request id $TAMPER_REQUEST_ID); auto-grant will answer it..."
     TAMPER_LOG="${TEST_DIR}/tamper-cli.log"
     "$CLI_BIN" pam-auth "$TEST_USER" 30 "$TAMPER_REQUEST_ID" > "$TAMPER_LOG" 2>&1 &
     TAMPER_CLI_PID=$!
-    # Inject inside the pre-grant window (DEBUG_AUTO_APPROVE_DELAY_MS is 1s).
+    # Inject inside the pre-grant window (DEBUG_AUTO_APPROVE_DELAY_MS is 1s), so
+    # the corrupted frame reaches the daemon before the phone's real grant does.
     sleep 0.4
 
     echo "==> Injecting grant with a flipped AES-GCM tag byte..."
     "$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" send "$GRANT_HEX" --port "$UDP_PORT" --corrupt
+
+    # The injection above is the expensive half of this attack: it needs a
+    # captured grant and the CSK to look authentic enough to reach decryption.
+    # The cheaper one needs neither — a datagram that is not a protobuf at all.
+    # It is dropped a layer lower (shared/src/network/udp.rs:706-717, before any
+    # crypto runs) and counted by a different counter from the AEAD drop above,
+    # so it gets its own assertion below. Sent in the same pre-grant window, so
+    # the session is still pending when it lands.
+    echo "==> Injecting a non-protobuf datagram (no key, no captured packet)..."
+    GARBAGE_OUT=$("$PYTHON_BIN" "$SCRIPT_DIR/ci/udp_attack.py" send --garbage --port "$UDP_PORT")
+    echo "$GARBAGE_OUT"
+    GARBAGE_LEN=$(printf '%s\n' "$GARBAGE_OUT" | sed -n 's/^GARBAGE_LEN=\([0-9][0-9]*\)$/\1/p' | head -n1)
+    if [ -z "$GARBAGE_LEN" ]; then
+        echo "❌ ERROR: udp_attack.py send --garbage did not print GARBAGE_LEN, so the drop cannot be attributed."
+        exit 1
+    fi
 
     set +e
     wait_pid_with_timeout "$TAMPER_CLI_PID" 15
@@ -1263,38 +3262,58 @@ if [ "$CAPTURE_OK" = "1" ]; then
     sleep 1
     cat "$TAMPER_LOG"
 
-    # The daemon maps any authentication error to OUTCOME=IGNORE so that PAM
-    # falls back to password authentication (fail-closed). The important
-    # property: the tampered packet must abort the session IMMEDIATELY with a
-    # crypto error instead of being accepted, and must be visible in the audit
-    # log. A session that silently continued to timeout would still pass the
-    # exit-code check below, so the DETAIL and log assertions are mandatory.
-    if grep -q "OUTCOME=IGNORE" "$TAMPER_LOG"; then
-        echo "✅ Tampered packet rejected; session ended fail-closed (OUTCOME=IGNORE → PAM password fallback)."
-    else
-        echo "❌ ERROR: expected fail-closed OUTCOME=IGNORE after tampered packet injection."
-        exit 1
-    fi
-    if grep -q "DETAIL=Authentication failed" "$TAMPER_LOG"; then
-        echo "✅ Session ended with the crypto error, not a silent timeout."
-    else
-        echo "❌ ERROR: expected DETAIL=Authentication failed... (got the output above)."
-        exit 1
-    fi
+    # The tampered frame keeps protobuf framing and the temporal identifier and
+    # only fails AEAD, so the daemon must reach decryption and drop it there.
+    # That warn is the aggregate drop warning: it carries the phrase on its first
+    # occurrence and is then rate-limited to one per 60 s (DROP_WARN_INTERVAL in
+    # tapauthd/src/auth_handler.rs), with per-drop detail at debug. This phase's
+    # injection is the only frame in the run that fails AEAD, so the first
+    # occurrence is this one.
     assert_log_since "$LOG_BASE" "Failed to decrypt response packet" \
-        "Daemon logged the decryption failure (audit trail present)"
-    if [ "$TAMPER_EXIT" -ne 0 ]; then
-        echo "✅ Exit code non-zero ($TAMPER_EXIT) — no successful authentication."
+        "Daemon dropped the tampered datagram instead of treating it as a response (audit trail present)"
+
+    # The non-protobuf frame never reaches AEAD: `receive_udp_packet` fails the
+    # decode and calls `record_dropped_datagram` (shared/src/network/udp.rs:77-82),
+    # whose per-frame line names the byte length it was handed. That length is
+    # this harness's own GARBAGE_PAYLOAD size, printed by the helper above, so the
+    # line can only be this injection. The per-frame line is asserted rather than
+    # the aggregate warn beside it, which is rate limited to one per 60 s and
+    # therefore not deterministic. Note that "unusable UDP datagram" (this
+    # counter) and "unauthenticated frame(s)" (the AEAD counter above) are
+    # deliberately different strings: one drop must not satisfy both assertions.
+    assert_log_since "$LOG_BASE" \
+        "Dropped a datagram from .* (${GARBAGE_LEN} bytes)" \
+        "Daemon dropped the non-protobuf datagram before any crypto ran (${GARBAGE_LEN}-byte frame)"
+
+    # The dropped frame must not conclude anything: the session is still waiting,
+    # so the auto-granted grant that follows still authenticates it.
+    if grep -q "OUTCOME=SUCCESS" "$TAMPER_LOG"; then
+        echo "✅ Tampered datagram dropped; the phone's real grant still authenticated the session (OUTCOME=SUCCESS)."
     else
-        echo "❌ ERROR: tampered injection must not produce a successful exit code."
+        echo "❌ ERROR: expected the dropped injection to leave the session waiting for the real grant (OUTCOME=SUCCESS)."
+        exit 1
+    fi
+    if [ "$TAMPER_EXIT" -eq 0 ]; then
+        echo "✅ Exit code 0 — the session concluded on the phone's verified grant."
+    else
+        echo "❌ ERROR: an arbitrary datagram must not end the attempt; pam-auth exited ${TAMPER_EXIT}."
+        exit 1
+    fi
+    # ...and it concluded over the transport the tampered frame arrived on: BLE
+    # is disabled for this phase (`set-transports --ble false --network true`
+    # above), so a drop that cost the UDP path its grant could not be papered
+    # over by the other transport.
+    TAMPER_TRANSPORT=$(grant_transport_since "$LOG_BASE")
+    if [ "$TAMPER_TRANSPORT" != "Udp" ]; then
+        echo "❌ ERROR: expected the grant to be attributed to Udp, got '${TAMPER_TRANSPORT}'."
+        tail -n +"$((LOG_BASE + 1))" "$DAEMON_LOG" 2>/dev/null | tail -n 20
         exit 1
     fi
 
-    # Restore auto-grant for the following positive phases
-    "$SCRIPT_DIR/ci/emulator-bio-helper.sh" start-auto-grant
-    sleep 1
+    phase_pass "2d" "the corrupted grant was dropped rather than answered (the daemon logged the decryption failure and kept waiting), a non-protobuf datagram was dropped one layer lower without needing any key, and the phone's real grant then authenticated the session over Udp (OUTCOME=SUCCESS, exit code ${TAMPER_EXIT})"
 else
     echo "ℹ️  SKIPPED (no captured grant packet available)."
+    phase_skip "2d" "no captured server grant packet available (packet capture needs root)"
 fi
 
 
@@ -1332,9 +3351,26 @@ restart_android_app_for_ble
 echo "==> Setting transport config: BLE enabled, UDP disabled..."
 "$CLI_BIN" set-transports --ble true --network false
 
+LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
 echo "==> Requesting authentication for user '$TEST_USER' over virtual BLE..."
-if authenticate_with_ble_retry "Bluetooth Low Energy (BLE) Authentication"; then
+# The same protocol-v2 caller context as Phase 2, now carried over BLE (UDP is
+# switched off above, so a phone-side line here can only have arrived over BLE).
+caller_context_tokens "ble"
+if authenticate_with_ble_retry "Bluetooth Low Energy (BLE) Authentication" "$CTX_CLI" \
+    "$CTX_REQUEST_ID" --pam-service "$CTX_SERVICE" --process-name "$CTX_PROCESS"; then
+    # UDP is switched off above, so `OUTCOME=SUCCESS` alone does not prove BLE did
+    # anything — it only proves *something* satisfied the request. The daemon names
+    # the transport that carried the grant, and this phase requires it to say Ble:
+    # a dead BLE path that falls back to another transport (or to a stale session)
+    # must fail here, which is what the earlier blind spot hid.
+    sleep 1
+    assert_log_since "$LOG_BASE" "Authentication granted over Ble" \
+        "Daemon reports the grant was delivered over BLE"
+    assert_caller_context_delivered "Phase 3 (BLE)" \
+        "$CTX_SERVICE" "$CTX_PROCESS" \
+        "${CTX_CLI} pam-auth ${TEST_USER} 30 ${CTX_REQUEST_ID}"
     echo "✅ Bluetooth Low Energy (BLE) Authentication PASSED!"
+    phase_pass "3" "with UDP disabled, pam-auth returned OUTCOME=SUCCESS, the daemon attributed the grant to Ble, and the phone logged the v2 caller context for this request"
 else
     echo "❌ Bluetooth Low Energy (BLE) Authentication FAILED after ${BLE_MAX_ATTEMPTS} attempts."
     if [ -f "$DAEMON_LOG" ]; then
@@ -1357,8 +3393,62 @@ settle_for_dedup "Phase 3"
 echo "==> Setting transport config: Both BLE and UDP enabled..."
 "$CLI_BIN" set-transports --ble true --network true
 
-if authenticate_with_ble_retry "Parallel Discovery Race Authentication"; then
+LOG_BASE=$(wc -l < "$DAEMON_LOG" 2>/dev/null || echo 0)
+# The phase-3 style caller context is used here for one extra reason: its
+# per-phase token is what the prompt count below counts. Both transports funnel
+# through AuthRequestManager.submitRequest, which logs that line once per prompt
+# it raises (server-android/.../service/AuthRequestManager.kt:168-175), so the
+# token counts prompts for this phase's request and no earlier phase's line can
+# satisfy it.
+caller_context_tokens "race"
+if authenticate_with_ble_retry "Parallel Discovery Race Authentication" "$CTX_CLI" \
+    "$CTX_REQUEST_ID" --pam-service "$CTX_SERVICE" --process-name "$CTX_PROCESS"; then
+    # The race is decided by whichever transport answers first, so requiring a
+    # particular winner would encode a scheduling accident. What must hold is that
+    # the daemon named one: with both transports live, "passed" is only meaningful
+    # if a grant was actually attributed to a transport.
+    sleep 1
+    GRANT_TRANSPORT=$(grant_transport_since "$LOG_BASE")
+    if [ -z "$GRANT_TRANSPORT" ]; then
+        echo "❌ ERROR: the daemon logged no 'Authentication granted over …' line for this phase."
+        tail -n +"$((LOG_BASE + 1))" "$DAEMON_LOG" 2>/dev/null | tail -n 20
+        exit 1
+    fi
+    echo "ℹ️  Parallel race: the grant arrived over ${GRANT_TRANSPORT} (either winner is a pass by design)."
+
+    # A named winner says nothing about the loser having been *tried*: a daemon
+    # that serves this phase over UDP alone, or over BLE alone, names a transport
+    # too. Both transports must have participated, and each half is asserted
+    # separately so a failure names the one that did not:
+    #   * the BLE advertisement for the session was registered with BlueZ
+    #     (tracing::trace! in start_advertising, tapauthd/src/transport/ble.rs:671);
+    #   * the request went out to the IPv4 discovery group
+    #     (tracing::trace!, shared/src/network/udp.rs:461).
+    # Both are LOGGED facts, not timing ones, and neither depends on which
+    # transport won. The two lines are at TRACE, which the daemon's E2E log filter
+    # raises for these two targets only (see E2E_TRACE_TARGETS above).
+    assert_log_since "$LOG_BASE" "BLE advertising started" \
+        "Daemon registered the BLE advertisement for this session (BLE participated in the race)"
+    # The only other IPv4 send this window can hold is the AuthenticationCancel a
+    # BLE winner multicasts through the same helper, so this line cannot be
+    # produced by a session in which neither transport ran.
+    assert_log_since "$LOG_BASE" "Sent IPv4 multicast on" \
+        "Daemon sent the request to the IPv4 discovery group over UDP (UDP participated in the race)"
+
+    # ...and the phone must have been asked once per *challenge* for this
+    # request: the daemon opening one session per transport would hand the phone
+    # two requests for one challenge, which is what race_prompt_check groups on
+    # (see its comment above). A retry is a new request with a new challenge, and
+    # is deliberately not a failure. The dump is grepped whole rather than
+    # through a line-offset window, for the reason the Phase 2 caller-context
+    # helpers give: the logcat ring buffer can rotate between taking a mark and
+    # checking it.
+    RACE_DUMP=$(adb logcat -d 2>/dev/null || true)
+    if ! race_prompt_check "$CTX_SERVICE" "$RACE_DUMP"; then
+        exit 1
+    fi
     echo "✅ Parallel Discovery Race Authentication PASSED!"
+    phase_pass "4" "with both transports live pam-auth returned OUTCOME=SUCCESS, the daemon registered the BLE advertisement and sent the request to the IPv4 multicast group (both transports participated, winner ${GRANT_TRANSPORT}), and the phone raised no more than one prompt per challenge for the request"
 else
     echo "❌ Parallel Discovery Race Authentication FAILED after ${BLE_MAX_ATTEMPTS} attempts."
     if [ -f "$DAEMON_LOG" ]; then
@@ -1413,6 +3503,7 @@ cat "$DENIAL_OUT_LOG"
 
 if [ "$DENIAL_EXIT" -ne 0 ] && grep -q "OUTCOME=DENIED" "$DENIAL_OUT_LOG"; then
     echo "✅ Explicit Denial correctly rejected with OUTCOME=DENIED (exit code: $DENIAL_EXIT)."
+    phase_pass "5" "a simulated biometric rejection ended the request with OUTCOME=DENIED and exit code ${DENIAL_EXIT}"
 else
     echo "❌ ERROR: Expected explicit denial with OUTCOME=DENIED, but got exit code $DENIAL_EXIT."
     if [ -f "$DAEMON_LOG" ]; then
@@ -1443,6 +3534,7 @@ cat "$TIMEOUT_OUT_LOG"
 
 if grep -q "OUTCOME=TIMEOUT" "$TIMEOUT_OUT_LOG"; then
     echo "✅ Authentication Timeout correctly detected OUTCOME=TIMEOUT!"
+    phase_pass "5b" "with the phone stopped and a 2s deadline, the request ended with OUTCOME=TIMEOUT"
 else
     echo "❌ ERROR: Expected OUTCOME=TIMEOUT, but got:"
     cat "$TIMEOUT_OUT_LOG"
@@ -1455,6 +3547,13 @@ echo "╔═══════════════════════�
 echo "║  PHASE 6: Device Removal / Un-pairing Lifecycle               ║"
 echo "╚═══════════════════════════════════════════════════════════════╝"
 
+if [ -z "$SERVER_HEX" ]; then
+    echo "❌ ERROR (Phase 6): SERVER_HEX is empty, so there is no paired device to remove."
+    echo "   Phase 1b must set it from the pairing completion step; without it this"
+    echo "   phase would call 'remove-device \"\"' and prove nothing."
+    "$CLI_BIN" get-servers || true
+    exit 1
+fi
 echo "==> Removing paired device $SERVER_HEX..."
 "$CLI_BIN" remove-device "$SERVER_HEX"
 
@@ -1475,6 +3574,7 @@ cat "$UNPAIRED_AUTH_LOG"
 
 if grep -q "OUTCOME=IGNORE" "$UNPAIRED_AUTH_LOG"; then
     echo "✅ Un-paired authentication correctly returns OUTCOME=IGNORE (password fallback enabled)!"
+    phase_pass "6" "remove-device left COUNT=0, and an authentication with no paired device returned OUTCOME=IGNORE"
 else
     echo "❌ ERROR: Expected OUTCOME=IGNORE after device removal, but got:"
     cat "$UNPAIRED_AUTH_LOG"
@@ -1519,7 +3619,7 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ]; then
 
     if [ "$FALLBACK_OK_EXIT" -eq 0 ]; then
         echo "✅ TapAuth's skip verdict fell through to pam_unix; correct password authenticated."
-        PAM_FALLBACK_OK=1
+        phase_pass "6b" "with no paired device the module's skip verdict fell through to pam_unix: the correct password authenticated and a wrong password was rejected"
     else
         echo "❌ ERROR: password fallback did not work after the TapAuth skip verdict (rc=$FALLBACK_OK_EXIT)."
         exit 1
@@ -1531,6 +3631,8 @@ if [ "$PAM_TESTABLE" = "true" ] && [ "$(id -u)" -eq 0 ]; then
         exit 1
     fi
     passwd -l "$PAM_FALLBACK_USER" >/dev/null 2>&1 || true
+else
+    phase_skip "6b" "needs a testable PAM stack and root (PAM_TESTABLE=${PAM_TESTABLE}, uid=$(id -u))"
 fi
 
 # Step 11: Phase 7 - IPC Authorization (PolKit) Enforcement
@@ -1572,63 +3674,16 @@ if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
     cat "${TEST_DIR}/deny-socket.log"
     if [ "$SOCKET_DENY_EXIT" -ne 0 ]; then
         echo "✅ Unprivileged non-group member could not reach the IPC socket (exit code: $SOCKET_DENY_EXIT)."
+        phase_pass "7" "an unprivileged admin request was denied and audited by the daemon, and a user outside tapauthd-clients could not reach the IPC socket"
     else
         echo "❌ ERROR: 'nobody' unexpectedly reached the IPC socket!"
         exit 1
     fi
 else
     echo "ℹ️  SKIPPED (systemd mode only — dev-mode sandbox does not model production authz)."
+    phase_skip "7" "systemd mode only — the dev-mode sandbox does not model production PolKit authorization"
 fi
 
-echo ""
-echo "╔═══════════════════════════════════════════════════════════════╗"
-echo "║  E2E TEST MATRIX SUMMARY                                      ║"
-echo "╠═══════════════════════════════════════════════════════════════╣"
-echo "║  Phase 1: Real TCP Pairing & SAS Anti-MITM:      PASSED       ║"
-echo "║  Phase 2: Local Network (UDP) Authentication:    PASSED       ║"
-if [ "$MULTICAST_VERIFIED" = "1" ]; then
-echo "║  Phase 2: Custom multicast groups (v4 + v6):     PASSED       ║"
-else
-echo "║  Phase 2: Custom multicast groups (v4 + v6):     SKIPPED      ║"
-fi
-if [ "$PAM_TESTABLE" = "true" ]; then
-echo "║  Phase 2b: Real PAM Module (pamtester):          PASSED       ║"
-if [ "$PAM_GRANT_STACK_OK" = "1" ]; then
-echo "║  Phase 2e: Mixed-stack PAM (grant path):         PASSED       ║"
-else
-echo "║  Phase 2e: Mixed-stack PAM (grant path):         SKIPPED      ║"
-fi
-else
-echo "║  Phase 2b: Real PAM Module (pamtester):          SKIPPED      ║"
-echo "║  Phase 2e: Mixed-stack PAM (grant path):         SKIPPED      ║"
-fi
-if [ "$CAPTURE_OK" = "1" ]; then
-echo "║  Phase 2c: Adversarial Replay + PamCancel:       PASSED       ║"
-echo "║  Phase 2d: Adversarial Tampered Ciphertext:      PASSED       ║"
-else
-echo "║  Phase 2c: Adversarial Replay + PamCancel:       SKIPPED      ║"
-echo "║  Phase 2d: Adversarial Tampered Ciphertext:      SKIPPED      ║"
-fi
-if [ "$E2E_DAEMON_MODE" = "systemd" ]; then
-echo "║  Phase 7: Admin IPC Authorization (PolKit):      PASSED       ║"
-echo "║  Daemon mode: systemd socket activation (prod)   ✔            ║"
-else
-echo "║  Daemon mode: dev sandbox (fallback-socket)      ✔            ║"
-fi
-# Phase 6b runs whenever the PAM stack is testable and the suite is root —
-# which includes a root-forced dev-mode run — so report it mode-independently.
-if [ "$PAM_FALLBACK_OK" = "1" ]; then
-echo "║  Phase 6b: Mixed-stack PAM password fallback:    PASSED       ║"
-else
-echo "║  Phase 6b: Mixed-stack PAM password fallback:    SKIPPED      ║"
-fi
-# BLE has no skip path: an unreachable BlueZ or a failed BLE auth exits above,
-# so reaching the summary means both phases ran and passed.
-echo "║  Phase 3: Bluetooth Low Energy (BLE):            PASSED       ║"
-echo "║  Phase 4: Parallel Race (UDP + BLE):             PASSED       ║"
-echo "║  Phase 5: Explicit Denial & Rejection:           PASSED       ║"
-echo "║  Phase 5b: Authentication Timeout:               PASSED       ║"
-echo "║  Phase 6: Device Removal & Ignore Outcome:       PASSED       ║"
-echo "╚═══════════════════════════════════════════════════════════════╝"
-echo ""
-echo "🎉 ALL MANDATORY END-TO-END TESTS PASSED SUCCESSFULLY!"
+# The matrix and its assertion notes are generated from the registry at the top
+# of this file; finish_suite turns that matrix into the suite's exit status.
+finish_suite

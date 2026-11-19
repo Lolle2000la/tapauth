@@ -29,6 +29,7 @@ import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
 import dev.rourunisen.tapauth.R
 import dev.rourunisen.tapauth.data.PairingUrl
+import dev.rourunisen.tapauth.service.scrubLogValue
 import java.util.concurrent.Executors
 
 @OptIn(ExperimentalPermissionsApi::class, ExperimentalMaterial3Api::class)
@@ -195,7 +196,10 @@ private fun CameraPreview(
                                         Executors.newSingleThreadExecutor(),
                                         QRCodeAnalyzer { qrCode ->
                                             if (!hasScanned) {
-                                                Log.d("QRScanner", "QR Code detected: $qrCode")
+                                                Log.d(
+                                                    "QRScanner",
+                                                    "QR Code detected: ${scrubLogValue(qrCode)}",
+                                                )
                                                 onCodeDetected(qrCode)
                                                 onScanStatus(
                                                     context.getString(R.string.scanner_detected),
@@ -222,9 +226,13 @@ private fun CameraPreview(
                                                     )
                                                     Log.w(
                                                         "QRScanner",
-                                                        "Expected: tapauth://pair?v=1&pk=...&p=...",
+                                                        "Expected: tapauth://pair?v=2&sid=...&pk=..." +
+                                                            "[&p=...&ip4=...&ip6=...]",
                                                     )
-                                                    Log.w("QRScanner", "Received: $qrCode")
+                                                    Log.w(
+                                                        "QRScanner",
+                                                        "Received: ${scrubLogValue(qrCode)}",
+                                                    )
                                                     onScanStatus(
                                                         context.getString(
                                                             R.string.scanner_invalid_format,

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Custom content view for an authentication-request notification (protocol v2 §3.3).
+
+  Two text rows only: the primary `username@hostname` header, and the secondary caller-context
+  line (PAM service / process / command preview), which is capped at two lines with an end
+  ellipsis so a long or hostile command line can never grow the notification.
+
+  The root is clickable via a PendingIntent set from Kotlin, because a custom content view does
+  not inherit the notification's content intent. Approve/Deny remain standard notification
+  actions (addAction), which the platform renders in the action row of the template.
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+  android:id="@+id/notification_root"
+  android:layout_width="match_parent"
+  android:layout_height="wrap_content"
+  android:orientation="vertical"
+  android:paddingStart="4dp"
+  android:paddingTop="8dp"
+  android:paddingEnd="4dp"
+  android:paddingBottom="8dp">
+
+  <TextView
+    android:id="@+id/notification_title"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:ellipsize="end"
+    android:maxLines="1"
+    android:textAppearance="@android:style/TextAppearance.Material.Notification.Title" />
+
+  <TextView
+    android:id="@+id/notification_context"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:ellipsize="end"
+    android:maxLines="2"
+    android:textAppearance="@android:style/TextAppearance.Material.Notification.Line2" />
+</LinearLayout>

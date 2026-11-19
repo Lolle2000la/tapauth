@@ -2,6 +2,7 @@ use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use secrecy::{ExposeSecret, SecretBox};
 use serde::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
+use zeroize::Zeroizing;
 
 /// Ed25519 key pair for signing
 pub struct Ed25519KeyPair {
@@ -12,13 +13,15 @@ pub struct Ed25519KeyPair {
 impl Ed25519KeyPair {
     /// Generate a new Ed25519 key pair
     pub fn generate() -> Result<Self, CryptoError> {
-        // Use OS CSPRNG to generate 32 bytes and construct the signing key
-        let mut seed = [0u8; 32];
-        getrandom::fill(&mut seed).map_err(|_| CryptoError::RandomGenerationFailed)?;
+        // Use OS CSPRNG to generate 32 bytes and construct the signing key.
+        // `Zeroizing` clears the stack copy on every return path, including the
+        // `getrandom` error.
+        let mut seed = Zeroizing::new([0u8; 32]);
+        getrandom::fill(&mut *seed).map_err(|_| CryptoError::RandomGenerationFailed)?;
         let signing_key = SigningKey::from_bytes(&seed);
         let verifying_key = signing_key.verifying_key();
         Ok(Self {
-            signing_key_bytes: SecretBox::new(Box::new(seed)),
+            signing_key_bytes: SecretBox::new(Box::new(*seed)),
             verifying_key,
         })
     }
@@ -49,11 +52,11 @@ impl Ed25519KeyPair {
 }
 impl Clone for Ed25519KeyPair {
     fn clone(&self) -> Self {
-        let bytes = *self.signing_key_bytes.expose_secret();
+        let bytes = Zeroizing::new(*self.signing_key_bytes.expose_secret());
         let signing_key = SigningKey::from_bytes(&bytes);
         let verifying_key = signing_key.verifying_key();
         Ed25519KeyPair {
-            signing_key_bytes: SecretBox::new(Box::new(bytes)),
+            signing_key_bytes: SecretBox::new(Box::new(*bytes)),
             verifying_key,
         }
     }
@@ -68,13 +71,14 @@ pub struct X25519KeyPair {
 impl X25519KeyPair {
     /// Generate a new X25519 key pair
     pub fn generate() -> Result<Self, CryptoError> {
-        // Use OS CSPRNG to fill 32 random bytes for the static secret
-        let mut sk = [0u8; 32];
-        getrandom::fill(&mut sk).map_err(|_| CryptoError::RandomGenerationFailed)?;
-        let secret = X25519StaticSecret::from(sk);
+        // Use OS CSPRNG to fill 32 random bytes for the static secret.
+        // `Zeroizing` clears the stack copy on every return path.
+        let mut sk = Zeroizing::new([0u8; 32]);
+        getrandom::fill(&mut *sk).map_err(|_| CryptoError::RandomGenerationFailed)?;
+        let secret = X25519StaticSecret::from(*sk);
         let public = X25519PublicKey::from(&secret);
         Ok(Self {
-            secret_bytes: SecretBox::new(Box::new(sk)),
+            secret_bytes: SecretBox::new(Box::new(*sk)),
             public,
         })
     }
@@ -102,7 +106,10 @@ impl X25519KeyPair {
     /// Perform Diffie-Hellman key exchange
     pub fn diffie_hellman(&self, their_public: &[u8; 32]) -> Result<[u8; 32], CryptoError> {
         let their_public_key = X25519PublicKey::from(*their_public);
-        let secret = X25519StaticSecret::from(*self.secret_bytes.expose_secret());
+        // The static secret is only ever materialized in a `Zeroizing` buffer;
+        // `StaticSecret` itself zeroizes its own copy on drop.
+        let secret_bytes = Zeroizing::new(*self.secret_bytes.expose_secret());
+        let secret = X25519StaticSecret::from(*secret_bytes);
         let shared_secret = secret.diffie_hellman(&their_public_key);
         Ok(shared_secret.to_bytes())
     }
@@ -114,9 +121,10 @@ pub struct ClientSymmetricKey(SecretBox<[u8; 32]>);
 impl ClientSymmetricKey {
     /// Generate a new random CSK
     pub fn generate() -> Result<Self, CryptoError> {
-        let mut key = [0u8; 32];
-        getrandom::fill(&mut key).map_err(|_| CryptoError::RandomGenerationFailed)?;
-        Ok(Self(SecretBox::new(Box::new(key))))
+        // `Zeroizing` clears the stack copy on every return path.
+        let mut key = Zeroizing::new([0u8; 32]);
+        getrandom::fill(&mut *key).map_err(|_| CryptoError::RandomGenerationFailed)?;
+        Ok(Self(SecretBox::new(Box::new(*key))))
     }
 
     /// Create from bytes
@@ -137,8 +145,8 @@ impl ClientSymmetricKey {
 
 impl Clone for ClientSymmetricKey {
     fn clone(&self) -> Self {
-        let bytes = *self.0.expose_secret();
-        ClientSymmetricKey(SecretBox::new(Box::new(bytes)))
+        let bytes = Zeroizing::new(*self.0.expose_secret());
+        ClientSymmetricKey(SecretBox::new(Box::new(*bytes)))
     }
 }
 
@@ -159,21 +167,6 @@ impl<'de> Deserialize<'de> for ClientSymmetricKey {
     {
         let bytes: [u8; 32] = Deserialize::deserialize(deserializer)?;
         Ok(Self::from_bytes(bytes))
-    }
-}
-
-/// Pairing Symmetric Key (PSK) - ephemeral key for pairing only
-pub struct PairingSymmetricKey(SecretBox<[u8; 32]>);
-
-impl PairingSymmetricKey {
-    /// Create from derived key material
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(SecretBox::new(Box::new(bytes)))
-    }
-
-    /// Get key bytes (exposes secret for cryptographic operations)
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        self.0.expose_secret()
     }
 }
 

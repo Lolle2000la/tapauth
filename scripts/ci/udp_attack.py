@@ -15,10 +15,13 @@ Two subcommands:
       The E2E uses this to prove tapauthd targets the custom groups. Requires
       root (CAP_NET_RAW).
 
-  send <hex_payload> [--corrupt] [--host H] [--port N]
+  send [<hex_payload>] [--corrupt | --garbage] [--host H] [--port N]
       Re-inject a captured datagram. With --corrupt, the last byte (inside the
       AES-GCM tag region) is flipped so that AEAD verification must fail while
-      the protobuf framing and temporal identifier stay intact. Sending itself
+      the protobuf framing and temporal identifier stay intact. With --garbage
+      no payload is read at all: GARBAGE_PAYLOAD below is sent instead, a byte
+      string that cannot decode as an `EncryptedPacket`, which is the one
+      injection that needs neither a captured packet nor the CSK. Sending itself
       works unprivileged.
 
 Requires only the Python standard library.
@@ -45,6 +48,18 @@ ETH_P_IP = 0x0800
 ETH_P_VLAN = 0x8100
 
 MIN_ENCRYPTED_PACKET_LEN = 40  # 16B temporal id + alg + nonce + tag minimum
+
+# The `--garbage` payload: 16 bytes that cannot decode as an `EncryptedPacket`.
+#
+# `EncryptedPacket` is a protobuf message whose first field is `temporal_identifier`
+# (field 1, wire type 2, so the leading byte is 0x0A), and every byte here has the
+# varint continuation bit set, so the very first tag varint overruns protobuf's
+# 10-byte maximum and decoding fails before any field is read. The daemon drops
+# such a datagram in `receive_udp_packet` before any crypto runs
+# (`record_dropped_datagram`, shared/src/network/udp.rs:706-717), which is the
+# rule E2E Phase 2d asserts: a datagram that is not a response cannot end an
+# attempt, and getting there costs an attacker no key at all.
+GARBAGE_PAYLOAD = b"\xff" * 16
 
 
 def parse_ipv4(data: bytes) -> tuple[str, str, int, int, bytes] | None:
@@ -259,6 +274,11 @@ def is_broadcast_dst(dst: str) -> bool:
     return addr.is_multicast
 
 
+def send_bytes(data: bytes, host: str, port: int) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.sendto(data, (host, port))
+
+
 def send_packet(hex_payload: str, host: str, port: int, corrupt: bool) -> None:
     data = bytes.fromhex(hex_payload)
     if corrupt:
@@ -266,8 +286,7 @@ def send_packet(hex_payload: str, host: str, port: int, corrupt: bool) -> None:
         # framing and the temporal identifier stay intact, so the packet must
         # fail AEAD verification (and only that).
         data = data[:-1] + bytes([data[-1] ^ 0x01])
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.sendto(data, (host, port))
+    send_bytes(data, host, port)
 
 
 def main() -> int:
@@ -275,8 +294,17 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_send = sub.add_parser("send", help="re-inject a captured payload")
-    p_send.add_argument("hex_payload")
+    p_send.add_argument(
+        "hex_payload",
+        nargs="?",
+        help="captured payload; omitted only with --garbage",
+    )
     p_send.add_argument("--corrupt", action="store_true", help="flip a tag bit (must fail AEAD)")
+    p_send.add_argument(
+        "--garbage",
+        action="store_true",
+        help="send GARBAGE_PAYLOAD instead of a captured one (must fail protobuf decoding)",
+    )
     p_send.add_argument("--host", default="127.0.0.1")
     p_send.add_argument("--port", type=int, default=36692)
 
@@ -299,6 +327,19 @@ def main() -> int:
     if args.command == "watch-groups":
         return watch_groups(args.ipv4, args.ipv6, args.port, args.duration)
     if args.command == "send":
+        if args.garbage:
+            if args.corrupt:
+                parser.error("--garbage and --corrupt are mutually exclusive")
+            if args.hex_payload is not None:
+                parser.error("--garbage sends GARBAGE_PAYLOAD; drop the hex payload argument")
+            # The length is printed so the caller can assert on the daemon's own
+            # per-drop line ("Dropped a datagram from <addr> (<N> bytes): ...")
+            # without hardcoding the payload size in two places.
+            print(f"GARBAGE_LEN={len(GARBAGE_PAYLOAD)}", flush=True)
+            send_bytes(GARBAGE_PAYLOAD, args.host, args.port)
+            return 0
+        if args.hex_payload is None:
+            parser.error("send requires <hex_payload> unless --garbage is given")
         send_packet(args.hex_payload, args.host, args.port, args.corrupt)
         return 0
     return 1

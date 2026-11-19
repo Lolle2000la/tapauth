@@ -7,6 +7,13 @@ build = "build.rs"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# Bindings generator for the UniFFI surface in `src/ffi.rs`. Only built on
+# demand (`--features cli`); the Android build consumes the generated Kotlin.
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]
+
 [dependencies]
 # Cryptography
 aes-gcm = "0.11.0"
@@ -24,6 +31,7 @@ hkdf = "0.13"
 sha2 = "0.11"
 hmac = "0.13"
 rand = "0.10"
+subtle = "2"
 zeroize = { version = "1.9", features = ["derive"] }
 secrecy.workspace = true
 
@@ -53,8 +61,10 @@ hostname = { workspace = true }
 socket2.workspace = true
 nix.workspace = true
 
-# JNI support (optional)
-jni = { version = "0.22", optional = true }
+# JNI/UniFFI support (optional)
+# The Rust↔Kotlin surface is generated from the proc-macro declarations in
+# `src/ffi.rs`; `uniffi` is optional so no other workspace crate gains it.
+uniffi = { version = "=0.32.2", optional = true }
 tracing-subscriber = { workspace = true, features = ["registry", "fmt"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
@@ -63,9 +73,20 @@ paranoid-android = { version = "0.2", features = ["api-30"] }
 [build-dependencies]
 prost-build.workspace = true
 
+[dev-dependencies]
+# Property-based tests: the in-file `property_tests` modules prove the invariants the
+# example-based tests can only sample (see `protocol/messages/context.rs` and
+# `protocol/pairing/fields.rs`).
+proptest = "1.12"
+
 [features]
 default = []
-jni = ["dep:jni"]
+# Enables the UniFFI-exported Rust↔Kotlin surface (`src/ffi.rs`). The Gradle
+# build passes this; nothing else in the workspace enables it.
+jni = ["dep:uniffi"]
+# Builds the `uniffi-bindgen` binary that generates the Kotlin bindings from
+# this crate's compiled library.
+cli = ["dep:uniffi", "uniffi/cli"]
 tpm = [] # TPM 2.0 support (requires tpm2-tools on system)
 firewall = [] # Firewall management support (requires iptables/nftables on system)
 # dev-state-override: enables the TAPAUTH_STATE_DIR env var to relocate the
@@ -76,3 +97,18 @@ dev-state-override = []
 # addresses (loopback/NAT) so a daemon can be tested against a locally emulated
 # peer. For testing/dev only; production builds must NOT enable it.
 dev-udp-loopback = []
+# fuzz-api: the `fuzz/` targets at the repository root drive the shipped entry
+# points (`PairingInfo::parse`, `EncryptedPacket::decode`, `sanitize_context_string`).
+# Two of the predicates those targets assert against are crate-private, and nothing
+# may become public in a shipped configuration, so this feature adds one
+# `#[doc(hidden)]` one-line delegate beside each (`is_forbidden_context_char_for_fuzz`,
+# `datagram_within_size_cap_for_fuzz`). No other crate and no packaging build enables
+# it: `fuzz/` is excluded from the workspace and is the only dependent.
+fuzz-api = []
+
+# `#[cfg(kani)]` is how the in-file Kani harnesses (pairing/negotiation.rs,
+# pairing/fields.rs) gate themselves. Kani sets that cfg; no other build does, so it
+# must be registered here or `unexpected_cfgs` fires — and at `deny` a misspelled
+# `cfg(kanii)` becomes a build error instead of a harness the suite silently skips.
+[lints.rust]
+unexpected_cfgs = { level = "deny", check-cfg = ['cfg(kani)'] }

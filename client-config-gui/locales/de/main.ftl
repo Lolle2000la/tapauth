@@ -7,6 +7,7 @@ app-title = TapAuth Konfiguration
 # ── Button Labels ──
 btn-back = Zurück
 btn-cancel = Abbrechen
+btn-cancel-and-retry = Abbrechen und erneut versuchen
 btn-done = Fertig
 btn-confirm = Bestätigen
 btn-remove = Entfernen

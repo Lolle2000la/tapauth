@@ -109,9 +109,6 @@
     <string name="settings_allow_background_dialog_message">アプリが閉じているときにもTapAuthが認証リクエストに応答できるようにするには、アプリをバッテリー最適化の対象から除外してください。システム設定画面に移動します。</string>
     <string name="settings_footer">TapAuth – 安全な生体認証</string>
     <string name="settings_app_version">アプリバージョン</string>
-    <string name="settings_protocol_version">プロトコルバージョン</string>
-    <string name="settings_encryption">暗号化</string>
     <string name="settings_key_exchange">鍵交換</string>
-    <string name="settings_signing">署名</string>
     <string name="settings_never">なし</string>
 </resources>

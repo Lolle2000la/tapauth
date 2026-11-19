@@ -29,7 +29,20 @@ ProtectControlGroups=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-# Allow the unprivileged service to manage netfilter rules (pairing opens ephemeral TCP ports)
+# Allow the unprivileged service to manage netfilter rules (pairing opens an ephemeral UDP port)
+#
+# CAP_SYS_PTRACE is deliberately absent: `caller_context.rs` reads the kernel's
+# view of the calling process, and `/proc/<pid>/exe` (the executable path) is
+# guarded by ptrace_may_access, so it is EACCES for another UID's process.
+# Without the capability the daemon takes the process name from the
+# world-readable `/proc/<pid>/cmdline` argv[0] and then `/proc/<pid>/comm`, and
+# only falls back to the caller-supplied name when neither can be read; that
+# EACCES is logged at debug, not as a warning, because it is this unit's normal
+# operation. A missing cmdline leaves no command preview at all (the IPC request
+# has no command field), so the capability would only add executable paths. It
+# would also let the daemon inspect any process on the host; authorization is
+# unaffected either way (it is decided by `allowed_users`, not by the displayed
+# name).
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 

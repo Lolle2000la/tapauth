@@ -33,6 +33,8 @@ pub(super) fn send_authenticate_request(
         request.has_tty,
         request.timeout_secs,
         request.request_id,
+        request.pam_service,
+        request.process_name,
     )
 }
 

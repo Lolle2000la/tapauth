@@ -19,13 +19,17 @@ use std::time::{Duration, Instant};
 
 /// What the transaction puts on the wire.
 ///
-/// The send closure sees exactly these four request facts — no plan, no cache, no caller
-/// context.
+/// The send closure sees exactly these six request facts — no plan, no cache, no caller
+/// context. `pam_service` and `process_name` are the caller's context projected onto the wire
+/// (empty when the context has none); the context itself stays out, so nothing here can
+/// re-branch on it.
 pub(crate) struct SendParams<'a> {
     pub(crate) username: &'a str,
     pub(crate) has_tty: bool,
     pub(crate) timeout_secs: u32,
     pub(crate) request_id: &'a str,
+    pub(crate) pam_service: &'a str,
+    pub(crate) process_name: &'a str,
 }
 
 /// The four things a transaction asks the platform to do.
@@ -46,9 +50,11 @@ pub(crate) struct Effects<'a, T> {
 
 /// One authentication transaction, from the classification to the conclusion.
 ///
-/// It takes the participation, not the caller's captured identity: the only caller fact it
-/// needs is the service name the reuse record keys on, so it cannot re-branch on identity and a
-/// mechanism selected by the policy cannot be overridden here.
+/// It takes the participation, not the caller's captured identity: the caller facts it
+/// needs — the service name the reuse record keys on, and the process name it forwards to the
+/// daemon — arrive as plain values, so it cannot re-branch on identity and a mechanism selected
+/// by the policy cannot be overridden here. A missing service forwards an empty `pam_service`,
+/// which is the wire's "not known".
 ///
 /// Everything before the request is on the wire — the pre-collected handoff, a failed request
 /// id, a failed connect or send — returns `Finished::Unrecorded`: recording one would answer a
@@ -56,6 +62,7 @@ pub(crate) struct Effects<'a, T> {
 /// returns `Finished::Concluded`; see [`finish`] for what each return shows.
 pub(crate) fn run<T: IpcResponseReader>(
     service: Option<&ServiceName>,
+    process_name: &str,
     username: &str,
     participation: &Participation,
     host: &mut HostIo<'_>,
@@ -168,6 +175,10 @@ pub(crate) fn run<T: IpcResponseReader>(
         has_tty,
         timeout_secs,
         request_id: &request_id,
+        // The caller's context, projected onto the wire: the service as libpam spelled it, and
+        // the process name when `/proc` resolved one.
+        pam_service: service.map(ServiceName::original).unwrap_or_default(),
+        process_name,
     };
     // Cloned because `SendParams` borrows the id and the closure that consumes it runs inside
     // `open`, after the `Armed` exists.

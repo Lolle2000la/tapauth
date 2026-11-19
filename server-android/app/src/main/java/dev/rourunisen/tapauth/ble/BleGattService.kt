@@ -16,12 +16,24 @@ import android.os.ParcelUuid
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import dev.rourunisen.tapauth.biometric.BiometricHelper
-import dev.rourunisen.tapauth.crypto.TapAuthCrypto
+import dev.rourunisen.tapauth.crypto.TapauthException
+import dev.rourunisen.tapauth.crypto.createDenialWrapperMessage
+import dev.rourunisen.tapauth.crypto.createGrantWrapperMessage
+import dev.rourunisen.tapauth.crypto.decryptEncryptedPacket
+import dev.rourunisen.tapauth.crypto.determineMessageType
+import dev.rourunisen.tapauth.crypto.extractTemporalIdentifier
+import dev.rourunisen.tapauth.crypto.parseAndVerifyAuthCancel
+import dev.rourunisen.tapauth.crypto.parseAndVerifyAuthRequest
+import dev.rourunisen.tapauth.crypto.parseAndVerifyGrantConfirmation
+import dev.rourunisen.tapauth.crypto.rawMessage
 import dev.rourunisen.tapauth.data.DeviceRepository
 import dev.rourunisen.tapauth.service.ReplayMitigationCache
+import dev.rourunisen.tapauth.service.RequestRateLimiter
 import dev.rourunisen.tapauth.service.TransportLockManager
+import dev.rourunisen.tapauth.service.scrubLogValue
 import java.util.UUID
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 /**
@@ -46,11 +58,35 @@ class BleGattService : Service() {
         const val ACTION_SCAN_RESULT = "dev.rourunisen.tapauth.ACTION_BLE_SCAN_RESULT"
 
         /**
-         * Grace period after a GATT disconnect before pending requests for that device are
-         * cancelled. Short enough to bound an orphaned prompt's lifetime, long enough to ride out
-         * transient link drops and duplicate connection callbacks.
+         * Grace after a GATT disconnect before the peer's prompt is cancelled and its claim
+         * released for a retry.
+         *
+         * This bounds the prompt and this transport's claim, **not** the reconnect: the Phone is
+         * the BLE central, so it reconnects only when its `SCAN_MODE_LOW_POWER` scan (512 ms window
+         * / 5 s interval) next reports the Client's advertisement, and the foreground-service hop,
+         * connect, discovery, MTU, CCCD and read sequence come on top — a scan-driven reconnect can
+         * therefore exceed this by design of the scanner. That is why the expiry releases the claim
+         * instead of concluding it ([BleDisconnectGrace], [BleAuthRequestGate.releaseForRetry]):
+         * the retransmission that finally arrives raises a fresh prompt, where a concluded claim
+         * would be answered as a replay and disconnect the link again.
          */
         const val BLE_DISCONNECT_CANCEL_GRACE_MS = 5_000L
+
+        /**
+         * Upper bound for a single serialized GATT operation. A stack that never delivers the
+         * matching callback must not wedge the queue, so each queued op gives up after this and
+         * releases the connection for the next one.
+         */
+        const val GATT_OPERATION_TIMEOUT_MS = 5_000L
+
+        /** ATT MTU requested on connect: large enough for one whole EncryptedPacket write. */
+        const val GATT_REQUESTED_MTU = 517
+
+        /**
+         * How long a retransmission tick waits for the CCCD notification carrying the Client's
+         * GrantConfirmation before falling back to a characteristic read.
+         */
+        const val CONFIRMATION_NOTIFICATION_WAIT_MS = 15L
 
         // UUIDs from shared library specification
         // SERVICE_UUID is also used as the key for service data in BLE advertisements
@@ -60,6 +96,12 @@ class BleGattService : Service() {
             UUID.fromString("ca6238be-c194-49b7-855b-58f41d3da626")
         val CLIENT_CONFIRMATION_CHAR_UUID: UUID =
             UUID.fromString("ace3e9ad-5f0d-48bf-825a-5b7f4dc49cdf")
+
+        /** Client Characteristic Configuration Descriptor (0x2902). */
+        val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+        /** `reason` carried by the AuthenticationDenial sent when the user declines the prompt. */
+        const val DENIAL_REASON_USER_DENIED = "Denied by user"
 
         fun start(context: Context) {
             val intent = Intent(context, BleGattService::class.java)
@@ -99,7 +141,53 @@ class BleGattService : Service() {
     private val replayMitigationCache = ReplayMitigationCache.getInstance()
     private val transportLockManager = TransportLockManager.getInstance()
 
+    /**
+     * The process's one post-authentication limiter, shared with the UDP path.
+     *
+     * This is the same instance `AuthenticationService` holds: a Client that hammers one transport
+     * and then the other is working against one budget, not two. See [RequestRateLimiter] for the
+     * schedule and for why the key material is the paired Client's public key.
+     */
+    private val requestRateLimiter = RequestRateLimiter.getInstance()
+
+    /**
+     * Orders duplicate in-flight AuthenticationRequests ahead of the replay cache, so a same-peer
+     * repeat of a challenge the user is approving on cannot be classified as a replay and tear the
+     * GATT link down.
+     */
+    private val authRequestGate =
+        BleAuthRequestGate(
+            isReplay = { challenge, timestampUnixSeconds ->
+                replayMitigationCache.isReplay(challenge, timestampUnixSeconds)
+            },
+            elapsedMillis = { android.os.SystemClock.elapsedRealtime() },
+        )
+
+    /**
+     * Decides what the disconnect grace and a duplicate-in-flight arrival mean, so this service
+     * performs one effect per outcome: whether a peer that dropped still gets its claim released,
+     * and whether a duplicate needs the held answer re-delivered, a fresh prompt, or nothing.
+     */
+    private val disconnectGrace =
+        BleDisconnectGrace(
+            graceMillis = BLE_DISCONNECT_CANCEL_GRACE_MS,
+            elapsedMillis = { android.os.SystemClock.elapsedRealtime() },
+        )
+
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    /**
+     * The answer built for an in-flight BLE challenge, held until the Client confirms it.
+     *
+     * The bytes are written to the handle that was live when the user answered, but the Client can
+     * lose that link before they land and reconnect retransmitting the same request. Holding them
+     * here is what lets [redeliverPendingResponse] write them on the new handle; the class
+     * documents the whole handover.
+     */
+    private val pendingResponses =
+        BleResponseHandoff<BluetoothGatt>(
+            elapsedMillis = { android.os.SystemClock.elapsedRealtime() },
+        )
 
     // Track active GATT connections by challenge for cancellation
     private val activeConnectionsByChallenge =
@@ -110,8 +198,65 @@ class BleGattService : Service() {
     private val connectingOrConnectedDevices =
         java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
-    // Store confirmation characteristic values from onCharacteristicRead callback (API 33+)
-    private val confirmationValues = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
+    /**
+     * Per-connection serialized GATT operation state.
+     *
+     * A BluetoothGatt stack allows only ONE asynchronous operation in flight per connection, so
+     * every async call routes through [runGattOperation], which holds [GattConnectionState.lock]
+     * while it awaits the matching callback.
+     *
+     * A torn-down handle keeps its entry with [GattConnectionState.closed] set until the disconnect
+     * grace expires ([BLE_DISCONNECT_CANCEL_GRACE_MS]), so its identity cannot be mistaken for a
+     * live connection again; after that its entry is dropped and the registry's tombstone carries
+     * that fact alone, so one entry per reconnection does not pile up. [onDestroy] clears both.
+     */
+    private val gattConnections =
+        BleGattConnectionRegistry<BluetoothGatt, GattConnectionState> { GattConnectionState() }
+
+    /** Paired device matched to each connection, so callbacks can verify what arrives on it. */
+    private val connectionDevices =
+        java.util.concurrent.ConcurrentHashMap<
+            BluetoothGatt,
+            dev.rourunisen.tapauth.data.PairedDevice,
+        >()
+
+    /** The single op kinds that a connection may have in flight, one at a time. */
+    private enum class GattOperationKind {
+        MTU,
+        DISCOVER_SERVICES,
+        DESCRIPTOR_WRITE,
+        READ,
+        WRITE,
+    }
+
+    private class GattOperationResult(val success: Boolean, val value: ByteArray? = null)
+
+    private class PendingGattOperation(
+        val kind: GattOperationKind,
+        /** Characteristic the op targets, so a late callback for another one cannot satisfy it. */
+        val characteristicUuid: UUID? = null,
+    ) {
+        val result = CompletableDeferred<GattOperationResult>()
+    }
+
+    private class GattConnectionState {
+        val lock = Mutex()
+
+        @Volatile var pending: PendingGattOperation? = null
+
+        /**
+         * Waiter for the CCCD notification carrying the in-flight challenge's GrantConfirmation.
+         * Completed only once the notification has been verified, cleared when retransmission ends.
+         */
+        @Volatile var confirmationNotification: CompletableDeferred<ByteArray>? = null
+
+        /**
+         * Set once the GATT handle is torn down. State is never re-created for such a handle: a
+         * coroutine resumed after teardown must fail instead of installing a live-looking entry for
+         * a closed handle that nothing would ever remove.
+         */
+        @Volatile var closed: Boolean = false
+    }
 
     // BroadcastReceiver for handling cancellation requests
     private val cancelReceiver =
@@ -136,11 +281,20 @@ class BleGattService : Service() {
             }
         }
 
-    // Map of temporal IDs to device CSKs for quick lookup
-    @Volatile private var temporalIdCache = java.util.concurrent.ConcurrentHashMap<String, String>()
-    private val cacheMutex = kotlinx.coroutines.sync.Mutex()
-    private var cacheUpdateJob: Job? = null
-    @Volatile private var bleLastComputedWindow: Long = -1
+    /**
+     * Temporal-ID → paired-device index for both BLE paths (advertisement ids and GATT packet ids).
+     *
+     * A lookup is a map read: the index is rebuilt only when the paired-device list changes
+     * ([BleTemporalIdIndex.invalidate], driven by the [DeviceRepository] observer registered in
+     * [startTemporalIdCache]) or the 60 s window rolls over, so a device paired mid-window resolves
+     * immediately instead of at the next minute boundary, and a GATT packet never triggers a
+     * device-list reload.
+     */
+    private val temporalIdIndex =
+        BleTemporalIdIndex(devices = { deviceRepository.getAllPairedDevicesSync() })
+
+    /** Registered in [onCreate], removed in [onDestroy], so the service holds no observer. */
+    private val deviceChangeObserver: () -> Unit = { temporalIdIndex.invalidate() }
 
     private var scanPendingIntent: PendingIntent? = null
 
@@ -148,24 +302,39 @@ class BleGattService : Service() {
     private val gattCallback =
         object : BluetoothGattCallback() {
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+                if (
+                    status != BluetoothGatt.GATT_SUCCESS ||
+                        newState == BluetoothProfile.STATE_DISCONNECTED
+                ) {
+                    Log.d(
+                        TAG,
+                        "Connection state change on ${gatt.device.address}: status=$status newState=$newState",
+                    )
+                    // A dead link never delivers the outstanding callback, so release every
+                    // waiter or the serialized queue would stay wedged on this connection.
+                    cancelPendingGattOperations(gatt, "connection state status=$status")
+                }
+
                 when (newState) {
                     BluetoothProfile.STATE_CONNECTED -> {
                         Log.i(TAG, "Connected to client GATT server: ${gatt.device.address}")
-                        if (
-                            ActivityCompat.checkSelfPermission(
-                                this@BleGattService,
-                                Manifest.permission.BLUETOOTH_CONNECT,
-                            ) == PackageManager.PERMISSION_GRANTED
-                        ) {
-                            gatt.discoverServices()
-                        }
+                        // MTU negotiation -> discovery -> CCCD subscriptions: each step is a
+                        // queued op awaiting its own callback, so it cannot run on this thread.
+                        serviceScope.launch { runConnectedSequence(gatt) }
                     }
                     BluetoothProfile.STATE_DISCONNECTED -> {
                         val deviceAddress = gatt.device.address
                         Log.i(TAG, "Disconnected from client GATT server: $deviceAddress")
 
                         connectingOrConnectedDevices.remove(deviceAddress)
-                        confirmationValues.remove(deviceAddress)
+                        // The peer's in-flight challenges are NOT released here: a Client still
+                        // waiting for its answer retransmits the same request and reconnects, and
+                        // the reconnect presents that same challenge from the same peer. With the
+                        // claim held it is a duplicate in flight and the prompt survives; released,
+                        // the arrival would reach the replay cache, be called a replay and tear the
+                        // new link down. The grace coroutine below asks BleDisconnectGrace what to
+                        // do once the grace has passed.
+                        val disconnectedAtMillis = android.os.SystemClock.elapsedRealtime()
 
                         // Drop any challenge-tracked connections that pointed at this (now dead)
                         // GATT handle so a stale response can never be written through it.
@@ -174,67 +343,100 @@ class BleGattService : Service() {
                         // Authentication prompts are user-driven and must survive transient GATT
                         // reconnections, so requests are NOT cancelled immediately here. But a
                         // link that stays down must not leave an orphaned prompt (and its BLE
-                        // connection intent) alive until the daemon timeout: after a short grace
-                        // period, if the device has not reconnected, cancel its pending requests.
+                        // connection intent) alive until the daemon timeout: once the grace has
+                        // passed, a peer that has not reconnected has its prompt cancelled and its
+                        // claim released for a retry. The grace bounds that prompt, not the
+                        // reconnect — the reconnect is scan-driven and can outlast it — so the
+                        // released claim keeps the challenge away from the replay cache.
                         serviceScope.launch {
                             delay(BLE_DISCONNECT_CANCEL_GRACE_MS)
-                            if (!connectingOrConnectedDevices.contains(deviceAddress)) {
-                                if (
-                                    dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()
-                                        .cancelRequestsByBleDisconnection(deviceAddress)
-                                ) {
-                                    Log.d(
-                                        TAG,
-                                        "Cancelled pending requests after prolonged BLE disconnect of $deviceAddress",
-                                    )
+                            // The handle is dead whether or not the device came back on another
+                            // one: the stack reports nothing more on it, and the operations it had
+                            // in flight were failed above, so their coroutines have already
+                            // returned. Dropping its state here is what keeps a tombstone per
+                            // reconnection from accumulating; the registry still knows the handle
+                            // as torn down, so nothing can take it for a live connection again.
+                            gattConnections.forget(gatt)
+                            when (
+                                disconnectGrace.onGraceExpired(
+                                    BleDisconnectGrace.LinkFacts(
+                                        claimHeld = authRequestGate.holdsClaimFor(deviceAddress),
+                                        disconnectedAtMillis = disconnectedAtMillis,
+                                        reconnected =
+                                            connectingOrConnectedDevices.contains(deviceAddress),
+                                    ),
+                                )
+                            ) {
+                                BleDisconnectGrace.Outcome.ReleaseAndCancel -> {
+                                    // The held answer has nobody left to reach and the prompt is
+                                    // over. Both run BEFORE the release mark: a retransmission
+                                    // landing in between is answered as a retry, and the cancel
+                                    // below would claim and cancel the fresh prompt it raised —
+                                    // leaving the challenge with no prompt, no mark and no
+                                    // disconnect, a silent hang.
+                                    pendingResponses.abandonPeer(deviceAddress)
+                                    if (
+                                        dev.rourunisen.tapauth.service.AuthRequestManager
+                                            .getInstance()
+                                            .cancelRequestsByBleDisconnection(deviceAddress)
+                                    ) {
+                                        Log.d(
+                                            TAG,
+                                            "Cancelled pending requests after prolonged BLE disconnect of $deviceAddress",
+                                        )
+                                    }
+                                    // Last, so the retry it enables cannot be swallowed: the claim
+                                    // stays held (the release concludes nothing), so a later
+                                    // retransmission of this challenge is a retry and not a replay.
+                                    authRequestGate.releaseForRetry(deviceAddress)
                                 }
+                                else -> Unit
                             }
                         }
 
+                        // The handle is closed below, so nothing may wait on it any more, and no
+                        // state may be re-created for it afterwards (a coroutine that resumes late
+                        // would otherwise install a fresh entry for a closed handle that is never
+                        // removed). The entry stays as that tombstone until the grace coroutine
+                        // above drops it, from when on the registry remembers the handle alone.
+                        gattConnections.markTornDown(gatt).closed = true
+                        connectionDevices.remove(gatt)
                         gatt.close()
                     }
                 }
             }
 
+            override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                Log.d(TAG, "MTU changed to $mtu (status=$status) on ${gatt.device.address}")
+                completeGattOperation(
+                    gatt,
+                    GattOperationKind.MTU,
+                    GattOperationResult(success = status == BluetoothGatt.GATT_SUCCESS),
+                )
+            }
+
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    Log.d(TAG, "Services discovered on client GATT server")
+                // Post-discovery work runs in runConnectedSequence, after the queue is released:
+                // queueing a second op from inside this callback would deadlock on the mutex the
+                // discovery op still holds.
+                completeGattOperation(
+                    gatt,
+                    GattOperationKind.DISCOVER_SERVICES,
+                    GattOperationResult(success = status == BluetoothGatt.GATT_SUCCESS),
+                )
+            }
 
-                    // Find the TapAuth service
-                    val service = gatt.getService(SERVICE_UUID)
-                    if (service != null) {
-                        val clientCommandChar = service.getCharacteristic(CLIENT_COMMAND_CHAR_UUID)
-                        val serverResponseChar =
-                            service.getCharacteristic(SERVER_RESPONSE_CHAR_UUID)
-
-                        if (clientCommandChar != null && serverResponseChar != null) {
-                            Log.i(
-                                TAG,
-                                "Found TapAuth characteristics, reading authentication request",
-                            )
-
-                            // Read the authentication request from the client command
-                            // characteristic
-                            if (
-                                ActivityCompat.checkSelfPermission(
-                                    this@BleGattService,
-                                    Manifest.permission.BLUETOOTH_CONNECT,
-                                ) == PackageManager.PERMISSION_GRANTED
-                            ) {
-                                gatt.readCharacteristic(clientCommandChar)
-                            }
-                        } else {
-                            Log.e(TAG, "TapAuth characteristics not found")
-                            gatt.disconnect()
-                        }
-                    } else {
-                        Log.e(TAG, "TapAuth service not found")
-                        gatt.disconnect()
-                    }
-                } else {
-                    Log.e(TAG, "Service discovery failed with status: $status")
-                    gatt.disconnect()
-                }
+            override fun onDescriptorWrite(
+                gatt: BluetoothGatt,
+                descriptor: BluetoothGattDescriptor,
+                status: Int,
+            ) {
+                completeGattOperation(
+                    gatt,
+                    GattOperationKind.DESCRIPTOR_WRITE,
+                    GattOperationResult(success = status == BluetoothGatt.GATT_SUCCESS),
+                    descriptor.characteristic.uuid,
+                )
             }
 
             override fun onCharacteristicRead(
@@ -243,20 +445,15 @@ class BleGattService : Service() {
                 value: ByteArray,
                 status: Int,
             ) {
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    when (characteristic.uuid) {
-                        CLIENT_COMMAND_CHAR_UUID -> {
-                            Log.d(
-                                TAG,
-                                "Read authentication request from client: ${value.size} bytes",
-                            )
-                            serviceScope.launch { handleIncomingBleMessage(gatt, value) }
-                        }
-                        CLIENT_CONFIRMATION_CHAR_UUID -> {
-                            confirmationValues[gatt.device.address] = value
-                        }
-                    }
-                }
+                completeGattOperation(
+                    gatt,
+                    GattOperationKind.READ,
+                    GattOperationResult(
+                        success = status == BluetoothGatt.GATT_SUCCESS,
+                        value = value,
+                    ),
+                    characteristic.uuid,
+                )
             }
 
             @Deprecated("Deprecated in Java")
@@ -265,10 +462,8 @@ class BleGattService : Service() {
                 characteristic: BluetoothGattCharacteristic,
                 status: Int,
             ) {
-                if (status == BluetoothGatt.GATT_SUCCESS) {
-                    @Suppress("DEPRECATION") val value = characteristic.value ?: ByteArray(0)
-                    onCharacteristicRead(gatt, characteristic, value, status)
-                }
+                @Suppress("DEPRECATION") val value = characteristic.value ?: ByteArray(0)
+                onCharacteristicRead(gatt, characteristic, value, status)
             }
 
             override fun onCharacteristicWrite(
@@ -281,6 +476,41 @@ class BleGattService : Service() {
                 } else {
                     Log.e(TAG, "Failed to write response to client, status: $status")
                 }
+                completeGattOperation(
+                    gatt,
+                    GattOperationKind.WRITE,
+                    GattOperationResult(success = status == BluetoothGatt.GATT_SUCCESS),
+                    characteristic.uuid,
+                )
+            }
+
+            override fun onCharacteristicChanged(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                value: ByteArray,
+            ) {
+                when (characteristic.uuid) {
+                    CLIENT_CONFIRMATION_CHAR_UUID -> onConfirmationNotification(gatt, value)
+                    CLIENT_COMMAND_CHAR_UUID -> {
+                        Log.d(
+                            TAG,
+                            "Client command notification: ${value.size} bytes from ${gatt.device.address}",
+                        )
+                        // handleIncomingBleMessage verifies the WrapperMessage signature before
+                        // acting, so an unverified AuthenticationCancel is ignored there.
+                        serviceScope.launch { handleIncomingBleMessage(gatt, value) }
+                    }
+                    else -> Log.d(TAG, "Ignoring notification for ${characteristic.uuid}")
+                }
+            }
+
+            @Deprecated("Deprecated in Java")
+            override fun onCharacteristicChanged(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+            ) {
+                @Suppress("DEPRECATION") val value = characteristic.value ?: ByteArray(0)
+                onCharacteristicChanged(gatt, characteristic, value)
             }
         }
 
@@ -436,88 +666,9 @@ class BleGattService : Service() {
     }
 
     private fun startTemporalIdCache() {
-        cacheUpdateJob?.cancel()
-        cacheUpdateJob = serviceScope.launch { updateTemporalIdCache() }
-    }
-
-    private suspend fun updateTemporalIdCache() {
-        temporalIdCache.clear()
-
-        val pairedDevices = deviceRepository.getAllPairedDevices()
-        val currentTimestampSeconds = System.currentTimeMillis() / 1000
-        val previousTimestampSeconds = currentTimestampSeconds - 60
-
-        for (device in pairedDevices) {
-            try {
-                val currentId =
-                    dev.rourunisen.tapauth.crypto.generateTemporalIdBle(
-                        device.csk,
-                        currentTimestampSeconds,
-                    )
-                val previousId =
-                    dev.rourunisen.tapauth.crypto.generateTemporalIdBle(
-                        device.csk,
-                        previousTimestampSeconds,
-                    )
-
-                val cskHex = device.csk.toHex()
-                temporalIdCache[currentId.toHex()] = cskHex
-                temporalIdCache[previousId.toHex()] = cskHex
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to generate temporal ID for device ${device.deviceId}", e)
-            }
-        }
-
-        bleLastComputedWindow = System.currentTimeMillis() / 60_000L
-        Log.i(
-            TAG,
-            "Updated temporal ID cache with ${temporalIdCache.size} entries for ${pairedDevices.size} devices",
-        )
-    }
-
-    private suspend fun matchTemporalIdOnDemand(temporalIdHex: String): String? {
-        val now = System.currentTimeMillis()
-        val currentWindow = now / 60_000L
-
-        if (currentWindow != bleLastComputedWindow) {
-            cacheMutex.withLock {
-                if (currentWindow != bleLastComputedWindow) {
-                    val newCache = java.util.concurrent.ConcurrentHashMap<String, String>()
-                    val pairedDevices = deviceRepository.getAllPairedDevices()
-                    val currentTimestampSeconds = (currentWindow * 60_000L) / 1000
-                    val previousTimestampSeconds = currentTimestampSeconds - 60
-
-                    for (device in pairedDevices) {
-                        try {
-                            val currentId =
-                                dev.rourunisen.tapauth.crypto.generateTemporalIdBle(
-                                    device.csk,
-                                    currentTimestampSeconds,
-                                )
-                            val previousId =
-                                dev.rourunisen.tapauth.crypto.generateTemporalIdBle(
-                                    device.csk,
-                                    previousTimestampSeconds,
-                                )
-
-                            val cskHex = device.csk.toHex()
-                            newCache[currentId.toHex()] = cskHex
-                            newCache[previousId.toHex()] = cskHex
-                        } catch (e: Exception) {
-                            Log.e(
-                                TAG,
-                                "Failed to generate temporal ID for device ${device.deviceId}",
-                                e,
-                            )
-                        }
-                    }
-                    temporalIdCache = newCache
-                    bleLastComputedWindow = currentWindow
-                }
-            }
-        }
-
-        return temporalIdCache[temporalIdHex]
+        DeviceRepository.addOnDevicesChangedListener(deviceChangeObserver)
+        // Warm the index so the first advertisement does not pay for the rebuild.
+        serviceScope.launch { temporalIdIndex.refresh() }
     }
 
     private fun startScanning() {
@@ -580,10 +731,9 @@ class BleGattService : Service() {
             Log.i(TAG, "BLE scanning stopped")
         }
         scanPendingIntent = null
-        cacheUpdateJob?.cancel()
     }
 
-    private fun connectToClient(device: BluetoothDevice, csk: String) {
+    private fun connectToClient(device: BluetoothDevice) {
         if (
             ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) !=
                 PackageManager.PERMISSION_GRANTED
@@ -642,14 +792,275 @@ class BleGattService : Service() {
         }
     }
 
+    // ===== Serialized GATT operation queue =====
+
+    /**
+     * State for [gatt], or null when that handle has been torn down.
+     *
+     * The registry refuses to create an entry for a handle it has already seen torn down, so a
+     * coroutine that resumes after the teardown fails here instead of installing a live-looking
+     * entry for a closed handle — the state it would have got is marked closed anyway.
+     */
+    private fun connectionState(gatt: BluetoothGatt): GattConnectionState? =
+        gattConnections.liveOrCreate(gatt)?.takeUnless { it.closed }
+
+    /**
+     * Run one asynchronous [BluetoothGatt] operation and await its callback.
+     *
+     * The connection's mutex is held across the park, so at most one op is ever in flight on a
+     * connection. Callbacks only complete the deferred: they must never queue another op here or
+     * they would wait for the mutex held by the op that is waiting for them.
+     *
+     * @param kind the op kind whose callback completes this operation
+     * @param characteristicUuid the characteristic the op targets, required to match in the
+     *   callback so a late callback for another characteristic cannot satisfy it
+     * @param start issues the stack call; returning false means no callback will follow.
+     */
+    private suspend fun runGattOperation(
+        gatt: BluetoothGatt,
+        kind: GattOperationKind,
+        characteristicUuid: UUID? = null,
+        start: () -> Boolean,
+    ): GattOperationResult {
+        val connection =
+            connectionState(gatt)
+                ?: run {
+                    Log.d(TAG, "GATT ${kind.name.lowercase()} skipped: connection is closed")
+                    return GattOperationResult(false)
+                }
+        return connection.lock.withLock {
+            if (connection.closed) {
+                Log.d(TAG, "GATT ${kind.name.lowercase()} skipped: connection was torn down")
+                return@withLock GattOperationResult(false)
+            }
+            val pending = PendingGattOperation(kind, characteristicUuid)
+            connection.pending = pending
+            try {
+                if (!start()) {
+                    Log.w(TAG, "GATT ${kind.name.lowercase()} was rejected by the stack")
+                    return@withLock GattOperationResult(false)
+                }
+                withTimeoutOrNull(GATT_OPERATION_TIMEOUT_MS) { pending.result.await() }
+                    ?: run {
+                        Log.w(
+                            TAG,
+                            "GATT ${kind.name.lowercase()} timed out after ${GATT_OPERATION_TIMEOUT_MS}ms",
+                        )
+                        GattOperationResult(false)
+                    }
+            } catch (e: CancellationException) {
+                // Coroutine cancellation is not a GATT failure; let it unwind the caller.
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "GATT ${kind.name.lowercase()} failed: ${e.message}")
+                GattOperationResult(false)
+            } finally {
+                connection.pending = null
+            }
+        }
+    }
+
+    /**
+     * Complete the in-flight op of [kind] on [characteristicUuid], if the connection is still
+     * waiting on exactly that op.
+     *
+     * Matching on the kind alone would let a timed-out read of one characteristic satisfy the
+     * callback of another (for example a stale `CLIENT_COMMAND` read completing the confirmation
+     * `READ`), so the characteristic has to match too.
+     */
+    private fun completeGattOperation(
+        gatt: BluetoothGatt,
+        kind: GattOperationKind,
+        result: GattOperationResult,
+        characteristicUuid: UUID? = null,
+    ) {
+        val pending = gattConnections.stateFor(gatt)?.pending
+        if (
+            pending != null &&
+                pending.kind == kind &&
+                pending.characteristicUuid == characteristicUuid
+        ) {
+            pending.result.complete(result)
+        } else {
+            Log.d(TAG, "Ignoring stray GATT callback for ${kind.name.lowercase()}")
+        }
+    }
+
+    /**
+     * Fail every waiter on a connection that can no longer answer, and let the queue drain. The
+     * waiting ops then return a failure instead of parking until their timeout.
+     */
+    private fun cancelPendingGattOperations(gatt: BluetoothGatt, reason: String) {
+        val connection = gattConnections.stateFor(gatt) ?: return
+        connection.pending?.let { pending ->
+            Log.d(TAG, "Cancelling pending GATT ${pending.kind.name.lowercase()}: $reason")
+            pending.result.complete(GattOperationResult(false))
+        }
+        connection.confirmationNotification?.let { waiter ->
+            waiter.cancel(CancellationException("GATT operation cancelled: $reason"))
+        }
+    }
+
+    private suspend fun requestMtuQueued(gatt: BluetoothGatt, mtu: Int): Boolean =
+        runGattOperation(gatt, GattOperationKind.MTU) { gatt.requestMtu(mtu) }.success
+
+    private suspend fun discoverServicesQueued(gatt: BluetoothGatt): Boolean =
+        runGattOperation(gatt, GattOperationKind.DISCOVER_SERVICES) { gatt.discoverServices() }
+            .success
+
+    private suspend fun writeDescriptorQueued(
+        gatt: BluetoothGatt,
+        descriptor: BluetoothGattDescriptor,
+        value: ByteArray,
+    ): Boolean =
+        runGattOperation(
+                gatt,
+                GattOperationKind.DESCRIPTOR_WRITE,
+                descriptor.characteristic.uuid,
+            ) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    gatt.writeDescriptor(descriptor, value) == BluetoothStatusCodes.SUCCESS
+                } else {
+                    @Suppress("DEPRECATION")
+                    descriptor.value = value
+                    @Suppress("DEPRECATION") gatt.writeDescriptor(descriptor)
+                }
+            }
+            .success
+
+    private suspend fun writeCharacteristicQueued(
+        gatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+        value: ByteArray,
+    ): Boolean =
+        runGattOperation(gatt, GattOperationKind.WRITE, characteristic.uuid) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    gatt.writeCharacteristic(
+                        characteristic,
+                        value,
+                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+                    ) == BluetoothStatusCodes.SUCCESS
+                } else {
+                    @Suppress("DEPRECATION")
+                    characteristic.value = value
+                    @Suppress("DEPRECATION") gatt.writeCharacteristic(characteristic)
+                }
+            }
+            .success
+
+    private suspend fun readCharacteristicQueued(
+        gatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+    ): ByteArray? =
+        runGattOperation(gatt, GattOperationKind.READ, characteristic.uuid) {
+                gatt.readCharacteristic(characteristic)
+            }
+            .let { if (it.success) it.value else null }
+
+    /**
+     * Connect sequence: MTU, service discovery, CCCD subscriptions, then the initial read of the
+     * client command characteristic (all of it previously done directly from the callbacks).
+     */
+    private suspend fun runConnectedSequence(gatt: BluetoothGatt) {
+        if (
+            ActivityCompat.checkSelfPermission(
+                this@BleGattService,
+                Manifest.permission.BLUETOOTH_CONNECT,
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.e(TAG, "BLUETOOTH_CONNECT permission not granted")
+            return
+        }
+
+        // A refused or failed MTU negotiation only costs us long writes; discovery still runs.
+        if (!requestMtuQueued(gatt, GATT_REQUESTED_MTU)) {
+            Log.w(TAG, "MTU negotiation failed, continuing with the default ATT MTU")
+        }
+
+        if (!discoverServicesQueued(gatt)) {
+            Log.e(TAG, "Service discovery failed on ${gatt.device.address}")
+            disconnectGatt(gatt)
+            return
+        }
+        Log.d(TAG, "Services discovered on client GATT server")
+
+        val service = gatt.getService(SERVICE_UUID)
+        if (service == null) {
+            Log.e(TAG, "TapAuth service not found")
+            gatt.disconnect()
+            return
+        }
+
+        // Subscribe before reading, so a request the client has already queued still reaches us.
+        // Only the two authentication characteristics are subscribed: nothing on this connection
+        // reads or writes the pairing characteristic (pairing runs its own GATT connection in
+        // BlePairingClient), so subscribing to it would cost a round-trip for a notification no
+        // handler consumes.
+        val notifyingCharacteristics =
+            listOf(CLIENT_COMMAND_CHAR_UUID, CLIENT_CONFIRMATION_CHAR_UUID)
+        for (uuid in notifyingCharacteristics) {
+            enableCharacteristicNotifications(gatt, service, uuid)
+        }
+
+        val clientCommandChar = service.getCharacteristic(CLIENT_COMMAND_CHAR_UUID)
+        val serverResponseChar = service.getCharacteristic(SERVER_RESPONSE_CHAR_UUID)
+        if (clientCommandChar == null || serverResponseChar == null) {
+            Log.e(TAG, "TapAuth characteristics not found")
+            gatt.disconnect()
+            return
+        }
+
+        Log.i(TAG, "Found TapAuth characteristics, reading authentication request")
+        val requestBytes = readCharacteristicQueued(gatt, clientCommandChar)
+        if (requestBytes != null && requestBytes.isNotEmpty()) {
+            Log.d(TAG, "Read authentication request from client: ${requestBytes.size} bytes")
+            handleIncomingBleMessage(gatt, requestBytes)
+        } else {
+            Log.d(TAG, "No authentication request readable yet; waiting for a notification")
+        }
+    }
+
+    /** Enable CCCD notifications on one characteristic, skipping it when it is not present. */
+    private suspend fun enableCharacteristicNotifications(
+        gatt: BluetoothGatt,
+        service: BluetoothGattService,
+        characteristicUuid: UUID,
+    ) {
+        val characteristic = service.getCharacteristic(characteristicUuid)
+        if (characteristic == null) {
+            Log.d(TAG, "Characteristic $characteristicUuid absent, skipping notifications")
+            return
+        }
+        if (!gatt.setCharacteristicNotification(characteristic, true)) {
+            Log.w(TAG, "Unable to enable notifications for $characteristicUuid")
+            return
+        }
+        val descriptor = characteristic.getDescriptor(CCCD_UUID)
+        if (descriptor == null) {
+            Log.w(TAG, "CCCD missing on $characteristicUuid")
+            return
+        }
+        if (
+            writeDescriptorQueued(
+                gatt,
+                descriptor,
+                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE,
+            )
+        ) {
+            Log.d(TAG, "Subscribed to notifications on $characteristicUuid")
+        } else {
+            Log.w(TAG, "Failed to write CCCD for $characteristicUuid")
+        }
+    }
+
     private suspend fun handleIncomingBleMessage(gatt: BluetoothGatt, data: ByteArray) {
         try {
             Log.d(TAG, "Handling BLE message: ${data.size} bytes from ${gatt.device.address}")
 
-            // Step 1: Parse the EncryptedPacket
-            val encryptedPacket =
+            // Step 1: Extract the temporal identifier (16 bytes, same as UDP) before any crypto.
+            val temporalIdBytes =
                 try {
-                    dev.rourunisen.tapauth.protocol.ProtobufParser.parseEncryptedPacket(data)
+                    extractTemporalIdentifier(data)
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to parse BLE EncryptedPacket", e)
                     // Silently disconnect on parse error - don't send invalid response
@@ -666,62 +1077,18 @@ class BleGattService : Service() {
 
             Log.d(
                 TAG,
-                "Parsed EncryptedPacket: temporal_id=${encryptedPacket.temporalIdentifier.take(20)}..., ciphertext=${encryptedPacket.ciphertext.take(20)}...",
+                "Parsed EncryptedPacket: temporal_id=${temporalIdBytes.toHexPreview()}..., ciphertext=${data.size} bytes",
             )
 
-            // Decode Base64 fields to ByteArrays
-            val temporalIdBytes =
-                android.util.Base64.decode(
-                    encryptedPacket.temporalIdentifier,
-                    android.util.Base64.NO_WRAP,
-                )
-            val ciphertextBytes =
-                android.util.Base64.decode(encryptedPacket.ciphertext, android.util.Base64.NO_WRAP)
-
-            // Step 2: Find the CSK by matching temporal ID
-            val pairedDevices = deviceRepository.getAllPairedDevices()
-
-            if (pairedDevices.isEmpty()) {
-                Log.w(TAG, "No paired devices found, rejecting BLE request")
-                // Silently disconnect - no valid response possible without CSK
-                if (
-                    ActivityCompat.checkSelfPermission(
-                        this@BleGattService,
-                        Manifest.permission.BLUETOOTH_CONNECT,
-                    ) == PackageManager.PERMISSION_GRANTED
-                ) {
-                    gatt.disconnect()
-                }
-                return
-            }
-
-            Log.d(TAG, "Found ${pairedDevices.size} paired device(s)")
-
-            // Try to match temporal ID with paired devices
-            // Note: EncryptedPacket contains 16-byte temporal ID (same as UDP)
-            var matchedDevice: dev.rourunisen.tapauth.data.PairedDevice? = null
-            for (device in pairedDevices) {
-                val temporalIdHex = temporalIdBytes.toHex()
-                // Check if this temporal ID matches (current or previous window)
-                // Use standard generateTemporalId (16 bytes) for EncryptedPacket
-                val currentTimestamp = System.currentTimeMillis() / 1000
-                val currentId =
-                    dev.rourunisen.tapauth.crypto.generateTemporalId(device.csk, currentTimestamp)
-                val previousId =
-                    dev.rourunisen.tapauth.crypto.generateTemporalId(
-                        device.csk,
-                        currentTimestamp - 60,
-                    )
-
-                if (temporalIdHex == currentId.toHex() || temporalIdHex == previousId.toHex()) {
-                    matchedDevice = device
-                    Log.d(TAG, "Temporal ID matched device: ${device.displayName}")
-                    break
-                }
-            }
+            // Step 2: Resolve the paired device by its temporal ID: one map read, with no
+            // device-list reload and no re-derivation per packet.
+            // Note: EncryptedPacket contains the 16-byte temporal ID (same as UDP), hashed with the
+            // algorithm this pairing negotiated.
+            val temporalIdHex = temporalIdBytes.toHex()
+            val matchedDevice = temporalIdIndex.lookupPacket(temporalIdHex)
 
             if (matchedDevice == null) {
-                Log.w(TAG, "No device matched the temporal ID")
+                Log.w(TAG, "No paired device matched the temporal ID")
                 // Silently disconnect - no valid response possible without CSK
                 if (
                     ActivityCompat.checkSelfPermission(
@@ -733,11 +1100,17 @@ class BleGattService : Service() {
                 }
                 return
             }
+
+            Log.d(TAG, "Temporal ID matched device: ${matchedDevice.displayName}")
 
             // Step 3: Decrypt the EncryptedPacket to get the WrapperMessage
             val wrapperMessageBytes =
                 try {
-                    dev.rourunisen.tapauth.crypto.decryptEncryptedPacket(matchedDevice.csk, data)
+                    decryptEncryptedPacket(
+                        data,
+                        matchedDevice.csk,
+                        matchedDevice.symmetricAlgorithm,
+                    )
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to decrypt EncryptedPacket", e)
                     // Silently disconnect on decryption error
@@ -752,10 +1125,13 @@ class BleGattService : Service() {
                     return
                 }
 
+            // Remember which pairing owns this link so notifications can be verified against it.
+            connectionDevices[gatt] = matchedDevice
+
             // Step 4: Determine message type and route accordingly
             val messageType =
                 try {
-                    TapAuthCrypto.determineMessageType(wrapperMessageBytes)
+                    determineMessageType(wrapperMessageBytes) ?: "UNKNOWN"
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to determine BLE message type", e)
                     gatt.disconnect()
@@ -765,7 +1141,7 @@ class BleGattService : Service() {
             Log.d(TAG, "BLE message type: $messageType")
 
             when (messageType) {
-                "AUTH_REQUEST" -> handleAuthRequest(gatt, wrapperMessageBytes, matchedDevice, data)
+                "AUTH_REQUEST" -> handleAuthRequest(gatt, wrapperMessageBytes, matchedDevice)
                 "AUTH_CANCEL" -> handleAuthCancelBle(gatt, wrapperMessageBytes, matchedDevice)
                 else -> {
                     Log.w(TAG, "Unknown BLE message type: $messageType, disconnecting")
@@ -793,27 +1169,39 @@ class BleGattService : Service() {
         try {
             Log.d(TAG, "Handling AuthenticationCancel via BLE from device: ${device.displayName}")
 
-            // Parse the cancel message
-            val cancel =
+            // Verify the WrapperMessage signature before acting on the cancel: the request is
+            // signed by the Client, so anything else is unauthenticated and must be ignored.
+            val challengeBytes =
                 try {
-                    dev.rourunisen.tapauth.protocol.ProtobufParser.parseAuthenticationCancel(
+                    parseAndVerifyAuthCancel(
                         wrapperMessageBytes,
+                        device.publicKey,
+                        device.protocolVersion,
+                        device.signatureAlgorithm,
                     )
+                } catch (e: TapauthException.Security) {
+                    Log.w(
+                        TAG,
+                        "BLE AuthenticationCancel failed verification for device ${device.deviceId}: ${e.rawMessage()}",
+                    )
+                    // An unverified cancel is ignored: no dismissal, no retransmission stop, no
+                    // response, and the BLE link is left alone.
+                    return
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to parse AuthenticationCancel via BLE", e)
                     gatt.disconnect()
                     return
                 }
 
-            Log.d(TAG, "BLE AuthenticationCancel received")
+            Log.d(TAG, "Verified BLE AuthenticationCancel received")
 
-            // Decode Base64 challenge to ByteArray
-            val challengeBytes =
-                android.util.Base64.decode(cancel.challenge, android.util.Base64.NO_WRAP)
             val challengeKey = challengeBytes.toHex()
 
             // Remove from active connections
             activeConnectionsByChallenge.remove(challengeKey)
+            // The Client abandoned this authentication, so a later request carrying the same
+            // challenge is a replay again, not a duplicate in flight.
+            authRequestGate.conclude(challengeBytes)
 
             // Cancel pending auth requests
             val authRequestManager = dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()
@@ -848,15 +1236,33 @@ class BleGattService : Service() {
         gatt: BluetoothGatt,
         wrapperMessageBytes: ByteArray,
         matchedDevice: dev.rourunisen.tapauth.data.PairedDevice,
-        data: ByteArray,
     ) {
         try {
-            // Parse the AuthenticationRequest from the WrapperMessage
+            // Rust verifies the WrapperMessage signature under the paired Client key before it
+            // parses anything, so a returned request is always authentic for this pairing.
             val authRequest =
                 try {
-                    dev.rourunisen.tapauth.protocol.ProtobufParser.parseAuthRequest(
+                    parseAndVerifyAuthRequest(
                         wrapperMessageBytes,
+                        matchedDevice.publicKey,
+                        matchedDevice.protocolVersion,
+                        matchedDevice.signatureAlgorithm,
                     )
+                } catch (e: TapauthException.Security) {
+                    Log.w(
+                        TAG,
+                        "BLE auth request failed signature verification for device ${matchedDevice.deviceId}: ${e.rawMessage()}",
+                    )
+                    // Silently disconnect - an unverified request must not reach the user
+                    if (
+                        ActivityCompat.checkSelfPermission(
+                            this@BleGattService,
+                            Manifest.permission.BLUETOOTH_CONNECT,
+                        ) == PackageManager.PERMISSION_GRANTED
+                    ) {
+                        gatt.disconnect()
+                    }
+                    return
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to parse BLE auth request from WrapperMessage", e)
                     // Silently disconnect on parse error
@@ -871,16 +1277,31 @@ class BleGattService : Service() {
                     return
                 }
 
+            // The caller context the desktop sent is logged — scrubbed — by
+            // AuthRequestManager.submitRequest, the one place both transports funnel through, so
+            // `pam_service` and `process_name` are not repeated here. What this line adds is who
+            // the request was for: `username` and `hostname` are the caller's own strings (Rust
+            // caps the username's length but does not sanitize either), so they go through
+            // [scrubLogValue] — a newline in them would otherwise forge an extra logcat line.
             Log.d(
                 TAG,
-                "Parsed BLE request: username=${authRequest.username}, hostname=${authRequest.hostname}",
+                "Parsed and verified BLE request: username=${scrubLogValue(authRequest.username)}, hostname=${scrubLogValue(authRequest.hostname)}, ttyPresent=${authRequest.ttyPresent}",
             )
 
             // CHECK: Verify this pairing is allowed to authenticate this user
             if (!matchedDevice.isUserAllowed(authRequest.username)) {
-                Log.w(TAG, "BLE pairing not authorized for user: ${authRequest.username}")
+                // The same two strings as the receipt line above — the request's `username` and
+                // the entries `allowedUsers` took from a pairing provisioning's `username` — so
+                // they are scrubbed here for the same reason.
+                Log.w(
+                    TAG,
+                    "BLE pairing not authorized for user: ${scrubLogValue(authRequest.username)}",
+                )
                 Log.w(TAG, "  Device: ${matchedDevice.displayName}")
-                Log.w(TAG, "  Allowed users: ${matchedDevice.allowedUsers}")
+                Log.w(
+                    TAG,
+                    "  Allowed users: ${scrubLogValue(matchedDevice.allowedUsers.joinToString())}",
+                )
                 // Silently disconnect - this device shouldn't handle this user
                 if (
                     ActivityCompat.checkSelfPermission(
@@ -893,66 +1314,108 @@ class BleGattService : Service() {
                 return
             }
 
-            Log.d(TAG, "BLE pairing authorized for user: ${authRequest.username}")
+            Log.d(TAG, "BLE pairing authorized for user: ${scrubLogValue(authRequest.username)}")
 
-            // Decode Base64 strings to ByteArrays
-            val challengeBytes =
-                android.util.Base64.decode(authRequest.challenge, android.util.Base64.NO_WRAP)
-            val signatureBytes =
-                android.util.Base64.decode(authRequest.signature, android.util.Base64.NO_WRAP)
-
-            // Step 5: Transport lock - ensure only one channel handles this request
-            if (
-                !transportLockManager.tryClaimTransport(
-                    challengeBytes,
-                    dev.rourunisen.tapauth.data.TransportType.BLE,
-                )
-            ) {
-                Log.i(
-                    TAG,
-                    "BLE request ignored - challenge already claimed by another transport (likely UDP)",
-                )
-                // IMPORTANT: Disconnect immediately to free resources - UDP is handling this
-                disconnectGatt(gatt)
-                return
-            }
-
-            // Track this connection by challenge for potential cancellation
+            // The verified request carries the raw challenge bytes.
+            val challengeBytes = authRequest.challenge
             val challengeKey = challengeBytes.toHex()
-            activeConnectionsByChallenge[challengeKey] = gatt
-            Log.d(TAG, "Tracking BLE connection for challenge: $challengeKey")
 
-            // Step 6: Replay attack mitigation
-            if (replayMitigationCache.isReplay(challengeBytes, authRequest.timestampUnixSeconds)) {
-                Log.w(TAG, "BLE replay attack detected, rejecting request")
-                // Silently disconnect - don't help attacker with denial message
-                if (
-                    ActivityCompat.checkSelfPermission(
-                        this@BleGattService,
-                        Manifest.permission.BLUETOOTH_CONNECT,
-                    ) == PackageManager.PERMISSION_GRANTED
-                ) {
-                    gatt.disconnect()
-                }
-                return
+            // One call for the whole ladder — transport lock, duplicate in flight, replay cache,
+            // fresh — so its order is a property of [BleAuthRequestGate] and cannot be edited
+            // here. This method only performs the effect of the outcome it got.
+            val decision =
+                authRequestGate.decide(
+                    challengeBytes,
+                    authRequest.timestampUnixSeconds,
+                    gatt.device.address,
+                    claimTransport = {
+                        transportLockManager.tryClaimTransport(
+                            challengeBytes,
+                            dev.rourunisen.tapauth.data.TransportType.BLE,
+                        )
+                    },
+                )
+
+            // A challenge another transport owns is not this link's to track; every other outcome
+            // is. Registering it before the duplicate's answer is re-delivered is what makes the
+            // reconnected handle the live one when the user answers.
+            if (decision != BleAuthRequestGate.Decision.Claimed) {
+                activeConnectionsByChallenge[challengeKey] = gatt
+                Log.d(TAG, "Tracking BLE connection for challenge: $challengeKey")
             }
 
-            // Step 7: Verify signature
-            Log.d(TAG, "Verifying signature for matched device: ${matchedDevice.displayName}")
-
-            // Reconstruct message for verification
-            val messageForVerification =
-                try {
-                    dev.rourunisen.tapauth.crypto.serializeAuthRequestForVerification(
-                        challengeBytes,
-                        authRequest.username,
-                        authRequest.hostname,
-                        authRequest.timestampUnixSeconds,
-                        authRequest.signatureAlgorithm,
+            // Step 6: one effect per outcome.
+            //
+            // A duplicate is a same-peer repeat of the challenge the user is approving on — a
+            // notification racing the initial read, or a re-notification of the same request — and
+            // must not reach the replay cache, which would report it as a replay and disconnect a
+            // link whose prompt is still open. What it means for the prompt is BleDisconnectGrace's
+            // question: an answer already built is written again on the handle the Client
+            // reconnected
+            // on, an open prompt swallows it, and a claim the grace released raises a fresh prompt
+            // below. A different peer replaying the same captured bytes is decided as Replay and
+            // disconnected exactly as before.
+            var retryingReleasedChallenge = false
+            when (decision) {
+                BleAuthRequestGate.Decision.Claimed -> {
+                    Log.i(
+                        TAG,
+                        "BLE request ignored - challenge already claimed by another transport (likely UDP)",
                     )
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to serialize BLE request for verification", e)
-                    // Disconnect on serialization error
+                    // IMPORTANT: Disconnect immediately to free resources - UDP is handling this
+                    disconnectGatt(gatt)
+                    return
+                }
+                BleAuthRequestGate.Decision.Duplicate -> {
+                    Log.d(
+                        TAG,
+                        "BLE duplicate of in-flight challenge from ${gatt.device.address}, ignoring",
+                    )
+                    // What this copy means is decided by BleDisconnectGrace: a claim the grace
+                    // released for a retry has no prompt left to answer (a fresh one is raised
+                    // below, exactly like a first arrival), and an answer already built is written
+                    // again — on the handle the Client reconnected on, when the link it was raised
+                    // on is gone. Anything else is a copy of the prompt the user is still
+                    // answering and is ignored, never disconnected.
+                    when (
+                        disconnectGrace.onDuplicate(
+                            BleDisconnectGrace.ArrivalFacts(
+                                claimHeld = true,
+                                promptAnswered =
+                                    pendingResponses.holdsAnswerFor(
+                                        challengeKey,
+                                        gatt.device.address,
+                                    ),
+                                releasedForRetry =
+                                    authRequestGate.wasReleasedForRetry(challengeBytes),
+                            ),
+                        )
+                    ) {
+                        BleDisconnectGrace.Outcome.AnswerOnLiveHandle -> {
+                            redeliverPendingResponse(
+                                challengeKey,
+                                challengeBytes,
+                                gatt,
+                                matchedDevice,
+                            )
+                            return
+                        }
+                        BleDisconnectGrace.Outcome.Retry -> {
+                            retryingReleasedChallenge = true
+                            Log.i(
+                                TAG,
+                                "BLE challenge was released for a retry after a disconnect; re-offering it to the user",
+                            )
+                            // Falls through to the shared rate limiter and the prompt below,
+                            // exactly like the Process outcome. The release mark is consumed there,
+                            // once the retry is really being raised.
+                        }
+                        else -> return
+                    }
+                }
+                BleAuthRequestGate.Decision.Replay -> {
+                    Log.w(TAG, "BLE replay attack detected, rejecting request")
+                    // Silently disconnect - don't help attacker with denial message
                     if (
                         ActivityCompat.checkSelfPermission(
                             this@BleGattService,
@@ -963,45 +1426,47 @@ class BleGattService : Service() {
                     }
                     return
                 }
+                BleAuthRequestGate.Decision.Process -> Unit
+            }
 
-            // Verify signature with the matched device
-            val isValid =
-                try {
-                    dev.rourunisen.tapauth.crypto.verifySignature(
-                        matchedDevice.publicKey,
-                        messageForVerification,
-                        signatureBytes,
-                    )
-                } catch (e: Exception) {
-                    Log.w(
-                        TAG,
-                        "Failed to verify BLE signature for device ${matchedDevice.deviceId}",
-                        e,
-                    )
-                    false
-                }
-
-            if (!isValid) {
+            // Post-authentication rate limiting, on the one limiter and the one schedule the UDP
+            // path uses (RequestRateLimiter.getInstance(), keyed on the paired Client's public
+            // key): without it this path is a bypass of that limiter, and a Client that keeps
+            // sending fresh requests is throttled on one transport and not on the other. It runs
+            // here for both outcomes that raise a prompt — Process, and a Retry of a claim the
+            // grace released (a retry arrives long after the limiter's 2 s de-duplication window,
+            // so it really spends a burst slot) — while Claimed, Duplicate and Replay return above
+            // it and never spend the allowance.
+            if (
+                !requestRateLimiter.shouldAcceptAuthenticatedRequest(
+                    matchedDevice.publicKey,
+                    wrapperMessageBytes,
+                )
+            ) {
                 Log.w(
                     TAG,
-                    "BLE signature verification failed for device ${matchedDevice.displayName}, rejecting request",
+                    "Rate limiting BLE auth request from device: ${matchedDevice.displayName}",
                 )
-                // Silently disconnect - likely attack or corrupted data
-                if (
-                    ActivityCompat.checkSelfPermission(
-                        this@BleGattService,
-                        Manifest.permission.BLUETOOTH_CONNECT,
-                    ) == PackageManager.PERMISSION_GRANTED
-                ) {
-                    gatt.disconnect()
-                }
+                // No prompt, so nothing on this link has an answer coming: drop it rather than let
+                // the Client wait on a request that will never be answered.
+                disconnectGatt(gatt)
                 return
             }
 
+            // The signature was already verified by parseAndVerifyAuthRequest above, which also
+            // covers the v2 signed WrapperMessage (no reconstruction of the signed bytes here).
             Log.d(
                 TAG,
                 "BLE signature verified for device: ${matchedDevice.displayName} (${matchedDevice.deviceId})",
             )
+
+            // A retry consumes its release only here, where the limiter has admitted it and the
+            // prompt is about to be registered: consumed up in the arm, a rate-limited or throwing
+            // retry would leave the challenge with no prompt, no mark and no disconnect, and every
+            // later copy of it would be a silent duplicate.
+            if (retryingReleasedChallenge) {
+                authRequestGate.retryStarted(challengeBytes)
+            }
 
             // Step 8: Request biometric authentication via AuthRequestManager
             val authRequestManager = dev.rourunisen.tapauth.service.AuthRequestManager.getInstance()
@@ -1012,36 +1477,45 @@ class BleGattService : Service() {
                 username = authRequest.username,
                 hostname = authRequest.hostname,
                 challenge = challengeBytes,
-                timestamp = authRequest.timestampUnixSeconds,
+                // AuthRequestManager measures elapsed time against System.currentTimeMillis(),
+                // so the wire value (epoch seconds) has to be converted to millis here exactly as
+                // the UDP call site does; passing seconds made the prompt timeout evaluate to 0.
+                timestamp = authRequest.timestampUnixSeconds * 1000,
                 transportType = dev.rourunisen.tapauth.data.TransportType.BLE,
                 bleDeviceAddress = gatt.device.address,
-            ) { approved, signedChallenge, explicitDenial ->
+                pamService = authRequest.pamService,
+                processName = authRequest.processName,
+                commandPreview = authRequest.commandPreview,
+                ttyPresent = authRequest.ttyPresent,
+            ) { approved, challenge, explicitDenial ->
                 // Create and send encrypted grant/denial
-                if (approved && signedChallenge != null) {
+                if (approved && challenge != null) {
                     Log.d(TAG, "BLE auth request approved, creating encrypted grant")
                     try {
                         // Get server private key for signing
                         val privateKey = keypairRepository.getPrivateKey()
 
-                        // Create WrapperMessage containing AuthenticationGrant
-                        val wrapperMessage =
-                            dev.rourunisen.tapauth.crypto.createGrantWrapperMessage(
-                                signedChallenge,
-                                privateKey,
-                            )
-
-                        // Create proper EncryptedPacket per specification
+                        // Rust signs the grant's WrapperMessage and encrypts it into the finished
+                        // EncryptedPacket, using the algorithms this pairing negotiated (the AAD
+                        // binds the algorithm and the temporal identifier).
                         val encryptedPacket =
-                            dev.rourunisen.tapauth.crypto.createEncryptedPacket(
+                            createGrantWrapperMessage(
+                                challenge,
+                                privateKey,
                                 matchedDevice.csk,
-                                wrapperMessage,
+                                matchedDevice.symmetricAlgorithm,
+                                matchedDevice.hashAlgorithm,
                             )
 
-                        sendResponseToClient(gatt, encryptedPacket, challengeBytes)
+                        sendResponseToClient(gatt, encryptedPacket, challengeBytes, matchedDevice)
                         Log.d(TAG, "Sent encrypted grant via BLE (${encryptedPacket.size} bytes)")
 
                         // Release transport lock after successful grant
                         transportLockManager.releaseLock(challengeBytes)
+                        // The gate's claim is deliberately kept here: the Client retransmits
+                        // this request until it has the grant, and a released claim would send
+                        // those retransmissions to the replay cache, which answers "replay" and
+                        // disconnects. BleAuthRequestGate documents the full reasoning.
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to create or send BLE grant", e)
                         // Ensure disconnection on error
@@ -1054,25 +1528,26 @@ class BleGattService : Service() {
                         // Get server private key for signing
                         val privateKey = keypairRepository.getPrivateKey()
 
-                        // Create WrapperMessage containing AuthenticationDenial
-                        val wrapperMessage =
-                            dev.rourunisen.tapauth.crypto.createDenialWrapperMessage(
-                                challengeBytes,
-                                privateKey,
-                            )
-
-                        // Create proper EncryptedPacket per specification
+                        // Rust signs the denial's WrapperMessage and encrypts it into the finished
+                        // EncryptedPacket, bound to the challenge and the negotiated algorithms.
                         val encryptedPacket =
-                            dev.rourunisen.tapauth.crypto.createEncryptedPacket(
+                            createDenialWrapperMessage(
+                                challengeBytes,
+                                DENIAL_REASON_USER_DENIED,
+                                privateKey,
                                 matchedDevice.csk,
-                                wrapperMessage,
+                                matchedDevice.symmetricAlgorithm,
+                                matchedDevice.hashAlgorithm,
                             )
 
-                        sendResponseToClient(gatt, encryptedPacket, challengeBytes)
+                        sendResponseToClient(gatt, encryptedPacket, challengeBytes, matchedDevice)
                         Log.d(TAG, "Sent encrypted denial via BLE (${encryptedPacket.size} bytes)")
 
                         // Release transport lock after denial
                         transportLockManager.releaseLock(challengeBytes)
+                        // Gate claim intentionally retained, as on the grant path above: the
+                        // Client keeps retransmitting until it has the denial, and those copies
+                        // arrive while the link is still up.
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to create or send BLE denial", e)
                         // Ensure disconnection on error
@@ -1084,6 +1559,9 @@ class BleGattService : Service() {
                     disconnectGatt(gatt)
                     // Release transport lock even on timeout
                     transportLockManager.releaseLock(challengeBytes)
+                    // The gate's claim is not released here: this path disconnects the link, and
+                    // the peer is released only once the reconnection grace has passed without a
+                    // reconnect.
                 }
             }
         } catch (e: Exception) {
@@ -1104,14 +1582,93 @@ class BleGattService : Service() {
         gatt: BluetoothGatt,
         response: ByteArray,
         challenge: ByteArray?,
+        device: dev.rourunisen.tapauth.data.PairedDevice,
     ) {
-        // Remove from active connections tracking since we're responding
-        if (challenge != null) {
-            val challengeKey = challenge.toHex()
-            activeConnectionsByChallenge.remove(challengeKey)
-            Log.d(TAG, "Removed BLE connection from tracking for challenge: $challengeKey")
+        // The answer is recorded before the first write and stays recorded until the Client
+        // confirms it: a Client that loses this link retransmits the same request on the next one,
+        // and those bytes then have to be written there instead of on the dead handle
+        // ([redeliverPendingResponse]).
+        //
+        // [gatt] is the handle this request arrived on, but the prompt can outlive it: the user may
+        // answer after the Client dropped that link and reconnected on another handle. The handle
+        // the challenge is tracked on now is therefore passed as the live one, so the answer is
+        // aimed at the link that exists; the captured handle is only the fallback for an answer
+        // built while no live handle is known, where the reconnect's duplicate re-delivers the
+        // bytes.
+        val delivery = challenge?.let {
+            val challengeKey = it.toHex()
+            pendingResponses.record(
+                challengeKey,
+                gatt.device.address,
+                gatt,
+                liveHandleFor(challengeKey, gatt.device.address),
+                response,
+            )
+        }
+        deliverResponse(delivery?.handle ?: gatt, response, challenge, device, delivery)
+    }
+
+    /**
+     * The handle [challengeKey] may still be written on for [peerAddress], or null when there is
+     * none.
+     *
+     * The challenge-tracked handle survives a drop only until the `STATE_DISCONNECTED` handler
+     * removes it, and the Client's reconnect re-registers its own handle as the duplicate arrives:
+     * so this is exactly the live side of a reconnection — null while the link is down, the new
+     * handle afterwards. A closed handle is the tombstone of a torn-down link and is never
+     * returned, and a handle another device registered for the same challenge is not this peer's
+     * link to write an answer to.
+     */
+    private fun liveHandleFor(challengeKey: String, peerAddress: String): BluetoothGatt? =
+        activeConnectionsByChallenge[challengeKey]?.takeIf { handle ->
+            handle.device.address == peerAddress && !gattConnections.isTornDown(handle)
         }
 
+    /**
+     * Hand the answer already built for [challengeKey] to the handle the Client reconnected on.
+     *
+     * A duplicate of an in-flight challenge on a different handle means the Client lost the link
+     * before the answer reached it. The bytes are still held by [pendingResponses], so they are
+     * written again on the live handle; the loop that was writing the dead one is stopped first so
+     * the two never both retire the same challenge. Nothing happens when no answer has been built
+     * yet (the prompt is still open) or when the bytes are already going to this very handle.
+     */
+    private fun redeliverPendingResponse(
+        challengeKey: String,
+        challenge: ByteArray,
+        gatt: BluetoothGatt,
+        device: dev.rourunisen.tapauth.data.PairedDevice,
+    ) {
+        val redelivery =
+            pendingResponses.redeliverOn(challengeKey, gatt.device.address, gatt) ?: return
+        Log.i(
+            TAG,
+            "Re-delivering in-flight BLE response on the reconnected link to ${gatt.device.address}",
+        )
+        redelivery.cancelPrevious?.invoke()
+        deliverResponse(
+            gatt,
+            redelivery.delivery.response,
+            challenge,
+            device,
+            redelivery.delivery,
+        )
+    }
+
+    /**
+     * Write [response] on [gatt] and retransmit it until the Client confirms it or the window
+     * closes.
+     *
+     * [delivery] is the [BleResponseHandoff] record holding these bytes; a re-delivery on a
+     * reconnected handle calls this again with the same bytes and its own record.
+     */
+    private fun deliverResponse(
+        gatt: BluetoothGatt,
+        response: ByteArray,
+        challenge: ByteArray?,
+        device: dev.rourunisen.tapauth.data.PairedDevice,
+        delivery: BleResponseHandoff.Delivery<BluetoothGatt>?,
+    ) {
         if (
             ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) !=
                 PackageManager.PERMISSION_GRANTED
@@ -1127,143 +1684,266 @@ class BleGattService : Service() {
         val responseChar = service?.getCharacteristic(SERVER_RESPONSE_CHAR_UUID)
         val confirmationChar = service?.getCharacteristic(CLIENT_CONFIRMATION_CHAR_UUID)
 
-        if (responseChar != null) {
-            // Use new API for Android 13+ (API 33+), fallback to deprecated API for older versions
-            val writeSuccess =
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    gatt.writeCharacteristic(
-                        responseChar,
-                        response,
-                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
-                    ) == BluetoothStatusCodes.SUCCESS
-                } else {
-                    @Suppress("DEPRECATION")
-                    responseChar.value = response
-                    @Suppress("DEPRECATION") gatt.writeCharacteristic(responseChar)
-                }
-
-            if (writeSuccess) {
-                Log.d(TAG, "Wrote response: ${response.size} bytes to ${gatt.device.address}")
-            } else {
-                Log.w(TAG, "Failed to write response to ${gatt.device.address}")
-                // Disconnect immediately on write failure
-                disconnectGatt(gatt)
-                return
-            }
-
-            // If challenge provided, start retransmission with confirmation checking
-            // The retransmission coroutine will ensure disconnection when done
-            if (challenge != null && confirmationChar != null) {
-                serviceScope.launch {
-                    try {
-                        retransmitWithConfirmationCheck(
-                            gatt,
-                            responseChar,
-                            confirmationChar,
-                            response,
-                            challenge,
-                        )
-                    } finally {
-                        // ALWAYS disconnect after retransmission completes (success or failure)
-                        Log.d(TAG, "Retransmission complete, disconnecting GATT")
-                        disconnectGatt(gatt)
-                    }
-                }
-            } else {
-                // No retransmission needed, disconnect immediately after write
-                Log.d(TAG, "No retransmission needed, disconnecting GATT")
-                disconnectGatt(gatt)
-            }
-        } else {
+        if (responseChar == null) {
             Log.e(TAG, "Server response characteristic not found on client")
             disconnectGatt(gatt)
+            return
         }
+
+        // The write is a queued GATT op, so it must run in a coroutine rather than on the caller.
+        // It starts lazily so the stop handle is registered before the loop can take a step: a
+        // re-delivery that races the start cancels it instead of letting it write a dead handle.
+        val job =
+            serviceScope.launch(start = CoroutineStart.LAZY) {
+                if (delivery != null && delivery.superseded) {
+                    return@launch
+                }
+
+                val connection = connectionState(gatt)
+                val awaitingConfirmation = challenge != null && confirmationChar != null
+                var confirmed = false
+
+                // Arm the confirmation waiter BEFORE the response write: the Client notifies its
+                // GrantConfirmation as soon as the write is acknowledged, so a waiter armed
+                // afterwards would drop that first notification and the phone would retransmit for
+                // the full 10 s. The retransmission loop below clears it in its `finally`.
+                if (awaitingConfirmation) {
+                    connection?.confirmationNotification = CompletableDeferred()
+                }
+
+                try {
+                    if (!writeCharacteristicQueued(gatt, responseChar, response)) {
+                        Log.w(TAG, "Failed to write response to ${gatt.device.address}")
+                        // Disconnect immediately on write failure
+                        connection?.confirmationNotification = null
+                        disconnectGatt(gatt)
+                        return@launch
+                    }
+                    Log.d(TAG, "Wrote response: ${response.size} bytes to ${gatt.device.address}")
+
+                    // If challenge provided, start retransmission with confirmation checking
+                    // The retransmission coroutine will ensure disconnection when done
+                    if (challenge != null && confirmationChar != null) {
+                        try {
+                            confirmed =
+                                retransmitWithConfirmationCheck(
+                                    gatt,
+                                    responseChar,
+                                    confirmationChar,
+                                    response,
+                                    challenge,
+                                    device,
+                                )
+                        } finally {
+                            // ALWAYS disconnect after retransmission completes (success or failure)
+                            Log.d(TAG, "Retransmission complete, disconnecting GATT")
+                            connection?.confirmationNotification = null
+                            disconnectGatt(gatt)
+                        }
+                    } else {
+                        // No retransmission needed, disconnect immediately after write
+                        Log.d(TAG, "No retransmission needed, disconnecting GATT")
+                        disconnectGatt(gatt)
+                    }
+                } finally {
+                    // Only a confirmed delivery retires the answer, and [BleResponseHandoff.finish]
+                    // is what enforces it. A loop that ended because the link died (or was replaced
+                    // by a re-delivery) leaves the bytes held, so the Client's reconnect can still
+                    // be answered; the grace-expiry release is what drops an answer nobody is left
+                    // to receive.
+                    if (delivery != null) {
+                        pendingResponses.finish(delivery, confirmed)
+                    }
+                }
+            }
+        delivery?.onRetransmission { job.cancel() }
+        job.start()
     }
 
-    /** Retransmit response every 500ms until confirmation received or timeout */
+    /**
+     * Retransmit response every 500ms until a verified GrantConfirmation arrives or the bound
+     * expires.
+     *
+     * The Client notifies its confirmation over the CCCD; the read below is only the fallback for a
+     * missed notification. Neither path may stop retransmission until the confirmation has been
+     * signature-verified against the paired Client key.
+     *
+     * @return true when the loop stopped because that verified confirmation arrived, false when it
+     *   merely ran out of time, lost the link or was cancelled. Only true retires the answer.
+     */
     private suspend fun retransmitWithConfirmationCheck(
         gatt: BluetoothGatt,
         responseChar: BluetoothGattCharacteristic,
         confirmationChar: BluetoothGattCharacteristic,
         response: ByteArray,
         challenge: ByteArray,
-    ) {
+        device: dev.rourunisen.tapauth.data.PairedDevice,
+    ): Boolean {
         val startTime = android.os.SystemClock.elapsedRealtime()
         val maxDuration = 10_000L // 10 seconds max retransmission
         var attempt = 0
+        var delivered = false
 
-        withContext(Dispatchers.IO) {
-            while (android.os.SystemClock.elapsedRealtime() - startTime < maxDuration && isActive) {
-                delay(500) // 500ms interval per spec
-                attempt++
+        // The waiter was armed by [deliverResponse] before the first response write; this loop
+        // re-arms it per round and clears it when retransmission ends.
+        val connection = connectionState(gatt)
 
-                if (
-                    ActivityCompat.checkSelfPermission(
-                        this@BleGattService,
-                        Manifest.permission.BLUETOOTH_CONNECT,
-                    ) != PackageManager.PERMISSION_GRANTED
+        try {
+            withContext(Dispatchers.IO) {
+                while (
+                    android.os.SystemClock.elapsedRealtime() - startTime < maxDuration && isActive
                 ) {
-                    break
-                }
-
-                try {
-                    val address = gatt.device.address
-                    if (attempt == 1) {
-                        confirmationValues.remove(address)
+                    // Re-arm per round: a completed waiter keeps returning its value, so a
+                    // confirmation for another challenge would shadow the read fallback for the
+                    // rest of the window. The awaited value is still checked against the in-flight
+                    // challenge below, so a stale answer is never accepted.
+                    val waiter = connection?.confirmationNotification
+                    if (connection != null && (waiter == null || waiter.isCompleted)) {
+                        connection.confirmationNotification = CompletableDeferred()
                     }
-                    val earlyConfirmation = confirmationValues[address]
-                    if (earlyConfirmation != null && earlyConfirmation.isNotEmpty()) {
-                        Log.d(TAG, "Received confirmation (early check), stopping retransmission")
+
+                    delay(500) // 500ms interval per spec
+                    attempt++
+
+                    if (
+                        ActivityCompat.checkSelfPermission(
+                            this@BleGattService,
+                            Manifest.permission.BLUETOOTH_CONNECT,
+                        ) != PackageManager.PERMISSION_GRANTED
+                    ) {
                         break
                     }
 
-                    confirmationValues.remove(address)
-
-                    if (gatt.readCharacteristic(confirmationChar)) {
-                        var confirmationBytes: ByteArray? = null
-                        val pollStart = android.os.SystemClock.elapsedRealtime()
-                        while (android.os.SystemClock.elapsedRealtime() - pollStart < 300) {
-                            confirmationBytes = confirmationValues[address]
-                            if (confirmationBytes != null) break
-                            delay(20)
+                    try {
+                        val notified = awaitConfirmationNotification(gatt)
+                        if (notified != null) {
+                            if (notified.contentEquals(challenge)) {
+                                Log.d(
+                                    TAG,
+                                    "Received verified confirmation notification, stopping retransmission",
+                                )
+                                delivered = true
+                                break
+                            }
+                            Log.w(
+                                TAG,
+                                "Confirmation notification is for another challenge, ignoring",
+                            )
+                        } else {
+                            // Fallback: one read through the serialized queue.
+                            val confirmationBytes = readCharacteristicQueued(gatt, confirmationChar)
+                            if (confirmationBytes != null && confirmationBytes.isNotEmpty()) {
+                                val confirmed = verifyConfirmationPacket(confirmationBytes, device)
+                                if (confirmed != null && confirmed.contentEquals(challenge)) {
+                                    Log.d(
+                                        TAG,
+                                        "Received verified confirmation (read), stopping retransmission",
+                                    )
+                                    delivered = true
+                                    break
+                                }
+                                Log.w(
+                                    TAG,
+                                    "Confirmation read failed verification, continuing retransmission",
+                                )
+                            }
                         }
-                        if (confirmationBytes == null) {
-                            confirmationBytes = @Suppress("DEPRECATION") confirmationChar.value
-                        }
 
-                        if (confirmationBytes != null && confirmationBytes.isNotEmpty()) {
-                            Log.d(TAG, "Received confirmation, stopping retransmission")
+                        if (!writeCharacteristicQueued(gatt, responseChar, response)) {
+                            Log.w(TAG, "Failed to retransmit BLE response - channel may be closing")
                             break
                         }
-                    }
-
-                    val retransmitSuccess =
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            gatt.writeCharacteristic(
-                                responseChar,
-                                response,
-                                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
-                            ) == BluetoothStatusCodes.SUCCESS
-                        } else {
-                            @Suppress("DEPRECATION")
-                            responseChar.value = response
-                            @Suppress("DEPRECATION") gatt.writeCharacteristic(responseChar)
-                        }
-
-                    if (retransmitSuccess) {
                         Log.d(TAG, "Retransmitted BLE response (attempt $attempt)")
-                    } else {
-                        Log.w(TAG, "Failed to retransmit BLE response - channel may be closing")
+                    } catch (e: Exception) {
+                        Log.w(TAG, "BLE retransmission interrupted: ${e.message}")
                         break
                     }
-                } catch (e: Exception) {
-                    Log.w(TAG, "BLE retransmission interrupted: ${e.message}")
-                    break
                 }
-            }
 
-            Log.d(TAG, "BLE retransmission ended after $attempt attempts")
-            confirmationValues.remove(gatt.device.address)
+                Log.d(TAG, "BLE retransmission ended after $attempt attempts")
+            }
+        } finally {
+            connection?.confirmationNotification = null
+        }
+        return delivered
+    }
+
+    /**
+     * Wait briefly for the CCCD notification carrying the in-flight challenge's confirmation.
+     *
+     * The deferred is completed only after [onConfirmationNotification] has verified the packet, so
+     * a returned value is always a signature-valid confirmation.
+     */
+    private suspend fun awaitConfirmationNotification(gatt: BluetoothGatt): ByteArray? {
+        val waiter = gattConnections.stateFor(gatt)?.confirmationNotification ?: return null
+        return withTimeoutOrNull(CONFIRMATION_NOTIFICATION_WAIT_MS) { waiter.await() }
+    }
+
+    /**
+     * Verify a GrantConfirmation packet from the Client and return the challenge it confirms.
+     *
+     * Returns null when the packet does not decrypt, is not a GrantConfirmation, or its
+     * WrapperMessage signature does not verify under the paired Client's Ed25519 key. Callers must
+     * not act on a null result.
+     */
+    private fun verifyConfirmationPacket(
+        packetBytes: ByteArray,
+        device: dev.rourunisen.tapauth.data.PairedDevice,
+    ): ByteArray? {
+        return try {
+            val wrapperMessageBytes =
+                decryptEncryptedPacket(
+                    packetBytes,
+                    device.csk,
+                    device.symmetricAlgorithm,
+                )
+            parseAndVerifyGrantConfirmation(
+                wrapperMessageBytes,
+                device.publicKey,
+                device.protocolVersion,
+                device.signatureAlgorithm,
+            )
+        } catch (e: TapauthException.Security) {
+            Log.w(
+                TAG,
+                "GrantConfirmation failed verification for device ${device.deviceId}: ${e.rawMessage()}",
+            )
+            null
+        } catch (e: Exception) {
+            Log.w(
+                TAG,
+                "Failed to parse GrantConfirmation for device ${device.deviceId}: ${(e as? TapauthException)?.rawMessage() ?: e.message}",
+            )
+            null
+        }
+    }
+
+    /**
+     * Handle a notification on the confirmation characteristic: verify it and only then release the
+     * retransmission waiter. An unverified confirmation is dropped and retransmission continues.
+     */
+    private fun onConfirmationNotification(gatt: BluetoothGatt, value: ByteArray) {
+        Log.d(
+            TAG,
+            "Confirmation notification: ${value.size} bytes from ${gatt.device.address}",
+        )
+        serviceScope.launch {
+            val device = connectionDevices[gatt]
+            if (device == null) {
+                Log.w(TAG, "No paired device for ${gatt.device.address}, ignoring confirmation")
+                return@launch
+            }
+            val confirmedChallenge = verifyConfirmationPacket(value, device)
+            if (confirmedChallenge == null) {
+                Log.w(TAG, "Ignoring unverified GrantConfirmation notification")
+                return@launch
+            }
+            val waiter = gattConnections.stateFor(gatt)?.confirmationNotification
+            if (waiter != null && !waiter.isCompleted) {
+                waiter.complete(confirmedChallenge)
+            } else {
+                Log.d(TAG, "No confirmation waiter for ${gatt.device.address}, dropping")
+            }
         }
     }
 
@@ -1308,10 +1988,11 @@ class BleGattService : Service() {
         Log.i(TAG, "Scan result: temporal ID ${temporalIdHex.take(20)}... (RSSI: ${rssi}dBm)")
 
         serviceScope.launch {
-            val matchedCsk = matchTemporalIdOnDemand(temporalIdHex)
-            if (matchedCsk != null) {
+            // One map read: the index already holds the current and previous window's identifiers.
+            val matchedDevice = temporalIdIndex.lookupAdvertisement(temporalIdHex)
+            if (matchedDevice != null) {
                 Log.i(TAG, "Temporal ID matches paired device, connecting...")
-                withContext(Dispatchers.Main) { connectToClient(device, matchedCsk) }
+                withContext(Dispatchers.Main) { connectToClient(device) }
             } else {
                 Log.d(TAG, "Temporal ID does not match any paired device")
             }
@@ -1350,6 +2031,14 @@ class BleGattService : Service() {
         }
         activeConnectionsByChallenge.clear()
         connectingOrConnectedDevices.clear()
+        // Closed-handle tombstones live here too; the service is going away, so drop them.
+        gattConnections.clear()
+        connectionDevices.clear()
+        authRequestGate.clear()
+        pendingResponses.clear()
+        // The registry is process-wide: leaving this observer behind would keep a dead service's
+        // index alive for every later device change.
+        DeviceRepository.removeOnDevicesChangedListener(deviceChangeObserver)
 
         try {
             dev.rourunisen.tapauth.service.ServiceStatusManager.setBleRunning({ this }, false)
@@ -1363,6 +2052,8 @@ class BleGattService : Service() {
     private fun handleCancelConnection(challengeBytes: ByteArray) {
         val challengeKey = challengeBytes.toHex()
         val gatt = activeConnectionsByChallenge.remove(challengeKey)
+        // The request is no longer in flight, so its challenge must reach the replay cache again.
+        authRequestGate.conclude(challengeBytes)
 
         if (gatt != null) {
             Log.d(TAG, "Disconnecting BLE connection for cancelled challenge: $challengeKey")
@@ -1398,5 +2089,62 @@ class BleGattService : Service() {
         val take = kotlin.math.min(this.size, maxBytes)
         return this.take(take).joinToString("") { "%02x".format(it) } +
             if (this.size > take) "…" else ""
+    }
+}
+
+/**
+ * Per-handle GATT state, plus the tombstones of the handles that have been torn down.
+ *
+ * The service keeps one state per `BluetoothGatt` because the stack allows only one asynchronous
+ * operation in flight per connection, and it must never hand a state to a caller for a handle it
+ * has already seen torn down: that caller would park on a lock nothing releases any more.
+ *
+ * [forget] drops the entry of a handle whose disconnect grace has passed. The handle is dead by
+ * then and the stack reports nothing more on it, so holding its state would leave one entry behind
+ * per reconnection for the life of the service. The handle still has to be recognised as torn down
+ * afterwards — nothing else stops a late coroutine from creating a live-looking entry for it —
+ * which is what [markTornDown] is for: those keys are held weakly, so the record flies away with
+ * the last reference to the handle that could ask, instead of accumulating.
+ */
+internal class BleGattConnectionRegistry<K : Any, V : Any>(private val createState: () -> V) {
+
+    private val states = java.util.concurrent.ConcurrentHashMap<K, V>()
+
+    private val tornDownHandles: MutableSet<K> =
+        java.util.Collections.synchronizedSet(
+            java.util.Collections.newSetFromMap(java.util.WeakHashMap<K, Boolean>()),
+        )
+
+    /** The state [key] was given, or null when it has none right now. Never creates one. */
+    fun stateFor(key: K): V? = states[key]
+
+    /**
+     * The state for [key], created on first use, or null once [key] has been torn down.
+     *
+     * `computeIfAbsent` is atomic per key, so a state created here is always the one teardown marks
+     * closed: a caller racing the teardown can never hand the service a fresh entry the teardown
+     * will not reach.
+     */
+    fun liveOrCreate(key: K): V? =
+        if (isTornDown(key)) null else states.computeIfAbsent(key) { createState() }
+
+    /** Record that [key] is torn down, and hand back its state so the caller can mark it closed. */
+    fun markTornDown(key: K): V {
+        tornDownHandles.add(key)
+        return states.computeIfAbsent(key) { createState() }
+    }
+
+    /** Whether [key] has been torn down, whether its state is still held or already forgotten. */
+    fun isTornDown(key: K): Boolean = tornDownHandles.contains(key)
+
+    /** Drop the state of [key]; a key that has none is a no-op, and it stays torn down. */
+    fun forget(key: K) {
+        states.remove(key)
+    }
+
+    /** Drop every state and every tombstone: the service that owned them is going away. */
+    fun clear() {
+        states.clear()
+        tornDownHandles.clear()
     }
 }

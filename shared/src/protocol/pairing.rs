@@ -1,550 +1,156 @@
-//! Two-phase pairing protocol for TapAuth.
+//! Unified UDP + BLE pairing state machines for protocol v2.
 //!
-//! Establishes trust between client and server through ephemeral X25519 key exchange
-//! and out-of-band SAS (Short Authentication String) verification.
+//! Pairing provisions the desktop's long-term `CSK` onto a phone and binds both
+//! devices' static Ed25519 identity keys together, over the same two transports
+//! used for authentication (UDP and BLE). This module is the transport-agnostic
+//! protocol half only: it encodes and decodes
+//! [`PairingPacket`](crate::protocol::pb::PairingPacket) frames and runs
+//! the handshake state machine. It owns no sockets, no threads, no timers and no
+//! I/O — the caller (daemon) does the sending, retransmission and timeouts.
 //!
-//! ## Protocol Flow
+//! ## Roles
 //!
-//! ### Phase 1: Key Exchange and SAS Generation
+//! TapAuth's terminology comes from authentication: the Linux desktop is the
+//! protocol **Client** and the Android phone is the protocol **Server**. Pairing
+//! keeps that framing, so `PairingInit` carries the *server*'s keys and
+//! `PairingResponse` the *client*'s.
 //!
-//! **Client:**
-//! 1. Connect to server TCP socket
-//! 2. Receive `PairingHello` (server's X25519/Ed25519 public keys, device name)
-//! 3. Perform X25519 Diffie-Hellman → derive PSK via HKDF
-//! 4. Derive 6-digit SAS from PSK + public keys
-//! 5. Send `PairingResponse` (client's X25519/Ed25519 public keys)
+//! The two state machines are named after the role each one plays:
 //!
-//! **Server:**
-//! 1. Send `PairingHello`
-//! 2. Receive `PairingResponse`
-//! 3. Perform X25519 Diffie-Hellman → derive PSK via HKDF
-//! 4. Derive 6-digit SAS from PSK + public keys
+//! * [`ClientPairingState`] — the **desktop**. Owns the ephemeral `x_C`/`X_C`
+//!   advertised in the QR code, the static `Ed_C`, the session id, the cached
+//!   `PairingResponse` and the negotiated keys. It answers `PairingInit`, builds
+//!   the `PairingConfirmClient` provisioning payload and verifies the
+//!   `PairingConfirmServer` completion proof against `Ed_S`.
+//! * [`ServerPairingSession`] — the **phone**. Owns the ephemeral `x_S`/`X_S`
+//!   and the static `Ed_S` (`PairingInit`). It verifies the QR commitment and the
+//!   desktop's transcript signature, decrypts the provisioning payload, signs the
+//!   completion proof with `Ed_S`, and shows the SAS.
 //!
-//! Both sides now have identical SAS values to compare out-of-band.
+//! ## Flow
 //!
-//! ### Phase 2: CSK Transfer (after SAS confirmation)
+//! 1. Desktop [`ClientPairingState::start`] → `sid` (16 B), `X_C`, `pairing_adv_id`
+//!    for the BLE advertisement and the `tapauth://pair?v=2&...` QR URL.
+//! 2. Phone [`ServerPairingSession::new`] + [`ServerPairingSession::create_init`]
+//!    → `PairingInit` (`X_S`, `Ed_S`, name, supported algorithm lists).
+//! 3. Desktop [`ClientPairingState::handle_init`] → negotiates, computes the
+//!    transcript hash `H`, derives `K_c2s`/`K_s2c`/SAS and returns `PairingResponse`
+//!    signed with `Ed_C` over `"tapauth-pair-client-sig-v2" || H`.
+//! 4. Phone [`ServerPairingSession::verify_response`] → constant-time QR key
+//!    comparison, algorithm check, `Ed_C` signature check, key derivation. Both
+//!    users now compare the SAS out of band.
+//! 5. Desktop [`ClientPairingState::create_confirm_client`] encrypts the
+//!    provisioned `{csk, username, client_hostname}` under `K_c2s`; the phone
+//!    decrypts it with [`ServerPairingSession::process_confirm_client`].
+//! 6. Phone [`ServerPairingSession::create_confirm_server`] signs the completion
+//!    proof with `Ed_S` and encrypts it under `K_s2c`; the desktop verifies it
+//!    with [`ClientPairingState::verify_confirm_server`].
 //!
-//! **Client:**
-//! 1. Generate CSK (Client Symmetric Key)
-//! 2. Encrypt CSK with PSK
-//! 3. Send `PairingCskMessage` (encrypted CSK + username)
-//! 4. Receive `PairingComplete` acknowledgment
+//! Every handshake field (both ephemeral keys, both identity keys, both device
+//! names, the advertised algorithm lists and the selected algorithms) enters `H`,
+//! which salts the HKDF that derives the directional keys and the SAS. Tampering
+//! with any of them changes the SAS visibly or breaks a signature.
 //!
-//! **Server:**
-//! 1. Receive `PairingCskMessage`
-//! 2. Decrypt CSK with PSK
-//! 3. Store CSK + client Ed25519 public key + username
-//! 4. Send `PairingComplete`
+//! ## Client-wide algorithms (pinning)
 //!
-//! ## Security
+//! The symmetric and hash algorithms are properties of the **client-wide `CSK`**,
+//! not of an individual pairing: one multicast broadcast must stay decryptable by
+//! every already-paired server (cryptography-specification.md §1.3). When a `CSK`
+//! already exists, the caller must therefore pass its persisted algorithms — read
+//! from `ClientConfigManager::load_csk_metadata` — as [`PinnedAlgorithms`] to
+//! [`ClientPairingState::start`]. A pinned algorithm is then *required* in the
+//! peer's `supported_*` list: a peer that does not offer it is refused with
+//! [`ProtocolError::UnsupportedAlgorithm`](crate::protocol::messages::ProtocolError::UnsupportedAlgorithm)
+//! instead of silently negotiating a pair
+//! that would make the existing broadcast undecryptable for its servers.
 //!
-//! - SAS verification prevents MitM attacks during key exchange
-//! - Ephemeral X25519 keys provide forward secrecy for the pairing session
-//! - PSK is discarded after CSK transfer; only CSK and Ed25519 keys are persisted
-//! - All messages after SAS are authenticated via PSK encryption
-
-use prost::Message as ProstMessage;
-use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-
-use crate::crypto::{
-    decrypt_with_psk, derive_psk_from_x25519, derive_sas, encrypt_with_psk, ClientSymmetricKey,
-    CryptoError, Ed25519KeyPair, PairingSymmetricKey, X25519KeyPair,
-};
-use crate::protocol::pb::*;
-use crate::protocol::ProtocolError;
-
-fn sha256_hex(data: &[u8]) -> String {
-    #[cfg(debug_assertions)]
-    {
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        hex::encode(hasher.finalize())
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = data;
-        "<stripped>".to_string()
-    }
-}
-
-const MAX_MESSAGE_SIZE: usize = 16 * 1024; // 16KB max message size
-
-/// Pairing protocol version
-pub const PAIRING_VERSION: u32 = 1;
-
-/// Client-side pairing state machine
-pub struct ClientPairingSession {
-    x25519_keypair: X25519KeyPair,
-    ed25519_keypair: Ed25519KeyPair,
-    server_x25519_public: Option<[u8; 32]>,
-    psk: Option<PairingSymmetricKey>,
-    sas: Option<String>,
-    /// Algorithms the server supports (from PairingHello)
-    server_supported_symmetric: Vec<i32>,
-    server_supported_hash: Vec<i32>,
-    server_supported_signature: Vec<i32>,
-}
-
-/// Server-side pairing state machine  
-pub struct ServerPairingSession {
-    x25519_keypair: X25519KeyPair,
-    ed25519_public_key: [u8; 32],
-    client_x25519_public: Option<[u8; 32]>,
-    psk: Option<PairingSymmetricKey>,
-    sas: Option<String>,
-}
-
-impl ClientPairingSession {
-    /// Create a new client pairing session with ephemeral keypair
-    pub fn new(ed25519_keypair: Ed25519KeyPair) -> Result<Self, CryptoError> {
-        Ok(Self {
-            x25519_keypair: X25519KeyPair::generate()?,
-            ed25519_keypair,
-            server_x25519_public: None,
-            psk: None,
-            sas: None,
-            server_supported_symmetric: Vec::new(),
-            server_supported_hash: Vec::new(),
-            server_supported_signature: Vec::new(),
-        })
-    }
-
-    /// Get the X25519 public key to display in QR code
-    pub fn x25519_public_key(&self) -> [u8; 32] {
-        self.x25519_keypair.public_key_bytes()
-    }
-
-    /// Get Ed25519 public key
-    pub fn ed25519_public_key(&self) -> [u8; 32] {
-        self.ed25519_keypair.verifying_key_bytes()
-    }
-
-    /// Initiate client-side pairing and perform key exchange
-    /// Returns: (stream, server_ed25519_public_key, server_device_name, SAS)
-    pub async fn initiate_pairing(
-        &mut self,
-        mut stream: TcpStream,
-        client_device_name: &str,
-    ) -> Result<(TcpStream, [u8; 32], String, String), ProtocolError> {
-        let hello = self.receive_pairing_hello(&mut stream).await?;
-        let server_device_name = hello.device_name;
-        self.server_x25519_public = Some(
-            hello
-                .x25519_public_key
-                .as_slice()
-                .try_into()
-                .map_err(|_| ProtocolError::InvalidMessageFormat)?,
-        );
-
-        // Store server's supported algorithms
-        self.server_supported_symmetric = hello.supported_symmetric_algorithms.clone();
-        self.server_supported_hash = hello.supported_hash_algorithms.clone();
-        self.server_supported_signature = hello.supported_signature_algorithms.clone();
-
-        let _client_x25519_priv = self.x25519_keypair.secret_key_bytes();
-        let client_x25519_pub = self.x25519_keypair.public_key_bytes();
-        let server_x25519_pub = self
-            .server_x25519_public
-            .ok_or(ProtocolError::MissingField("server_x25519_public"))?;
-
-        tracing::debug!(
-            "Client X25519 public key (trunc): {}…",
-            &hex::encode(client_x25519_pub)
-                [..std::cmp::min(16, hex::encode(client_x25519_pub).len())]
-        );
-        tracing::debug!(
-            "Server X25519 public key (trunc): {}…",
-            &hex::encode(server_x25519_pub)
-                [..std::cmp::min(16, hex::encode(server_x25519_pub).len())]
-        );
-
-        let shared_secret = self.x25519_keypair.diffie_hellman(&server_x25519_pub)?;
-
-        tracing::debug!(
-            "Shared secret (sha256): {}",
-            crate::protocol::messages::sha256_hex(&shared_secret)
-        );
-
-        let psk = derive_psk_from_x25519(&shared_secret)?;
-
-        tracing::debug!(
-            "Derived PSK (sha256): {}",
-            crate::protocol::messages::sha256_hex(psk.as_bytes())
-        );
-
-        self.psk = Some(psk);
-
-        let client_x25519_pub = self.x25519_keypair.public_key_bytes();
-        let psk = self
-            .psk
-            .as_ref()
-            .ok_or(ProtocolError::MissingField("psk"))?;
-        let sas = derive_sas(psk, &client_x25519_pub, &server_x25519_pub)?;
-        self.sas = Some(sas.clone());
-
-        self.send_pairing_response(&mut stream, client_device_name)
-            .await?;
-
-        let server_ed25519_public: [u8; 32] = hello
-            .ed25519_public_key
-            .as_slice()
-            .try_into()
-            .map_err(|_| ProtocolError::InvalidMessageFormat)?;
-
-        // Return stream and SAS for user verification
-        // User must confirm SAS, then call finish_pairing()
-        Ok((stream, server_ed25519_public, server_device_name, sas))
-    }
-
-    /// Phase 2: Complete pairing after user confirms SAS
-    /// Sends CSK to server with username and receives confirmation
-    /// Takes the stream from initiate_pairing()
-    pub async fn finish_pairing(
-        &mut self,
-        mut stream: TcpStream,
-        csk: &ClientSymmetricKey,
-        username: &str,
-    ) -> Result<(), ProtocolError> {
-        self.send_csk_message(&mut stream, csk, username).await?;
-        self.receive_pairing_complete(&mut stream, csk).await?;
-
-        Ok(())
-    }
-
-    async fn receive_pairing_hello(
-        &self,
-        stream: &mut TcpStream,
-    ) -> Result<PairingHello, ProtocolError> {
-        let len = stream.read_u32().await?;
-        if len > MAX_MESSAGE_SIZE as u32 {
-            return Err(ProtocolError::InvalidMessageFormat);
-        }
-
-        let mut buf = vec![0u8; len as usize];
-        stream.read_exact(&mut buf).await?;
-
-        let hello = PairingHello::decode(&buf[..])?;
-
-        if hello.version != PAIRING_VERSION {
-            return Err(ProtocolError::InvalidMessageFormat);
-        }
-
-        Ok(hello)
-    }
-
-    async fn send_pairing_response(
-        &self,
-        stream: &mut TcpStream,
-        client_device_name: &str,
-    ) -> Result<(), ProtocolError> {
-        // Select algorithms from server's supported list (use defaults if server sent none)
-        let selected_symmetric = self
-            .server_supported_symmetric
-            .first()
-            .copied()
-            .unwrap_or(SymmetricAlgorithm::Aes256Gcm as i32);
-        let selected_hash = self
-            .server_supported_hash
-            .first()
-            .copied()
-            .unwrap_or(HashAlgorithm::Sha256 as i32);
-        let selected_signature = self
-            .server_supported_signature
-            .first()
-            .copied()
-            .unwrap_or(SignatureAlgorithm::Ed25519 as i32);
-
-        let response = PairingResponse {
-            version: PAIRING_VERSION,
-            x25519_public_key: self.x25519_keypair.public_key_bytes().to_vec(),
-            ed25519_public_key: self.ed25519_keypair.verifying_key_bytes().to_vec(),
-            device_name: client_device_name.to_string(),
-            selected_symmetric_algorithm: selected_symmetric,
-            selected_hash_algorithm: selected_hash,
-            selected_signature_algorithm: selected_signature,
-        };
-
-        let buf = response.encode_to_vec();
-        stream.write_u32(buf.len() as u32).await?;
-        stream.write_all(&buf).await?;
-        stream.flush().await?;
-
-        Ok(())
-    }
-
-    async fn send_csk_message(
-        &self,
-        stream: &mut TcpStream,
-        csk: &ClientSymmetricKey,
-        username: &str,
-    ) -> Result<(), ProtocolError> {
-        // Encrypt CSK with PSK
-        let psk = self
-            .psk
-            .as_ref()
-            .ok_or(ProtocolError::MissingField("psk"))?;
-        tracing::debug!(
-            "PSK for encryption (sha256): {}",
-            crate::protocol::messages::sha256_hex(psk.as_bytes())
-        );
-        tracing::debug!(
-            "CSK to encrypt (sha256): {}",
-            crate::protocol::messages::sha256_hex(csk.as_bytes())
-        );
-
-        let encrypted_csk = encrypt_with_psk(psk, csk.as_bytes())?;
-
-        tracing::debug!(
-            "Encrypted CSK (sha256): {}",
-            crate::protocol::messages::sha256_hex(&encrypted_csk)
-        );
-
-        let message = PairingCskMessage {
-            encrypted_csk,
-            username: username.to_string(),
-        };
-
-        let buf = message.encode_to_vec();
-        stream.write_u32(buf.len() as u32).await?;
-        stream.write_all(&buf).await?;
-        stream.flush().await?;
-
-        Ok(())
-    }
-
-    async fn receive_pairing_complete(
-        &self,
-        stream: &mut TcpStream,
-        csk: &ClientSymmetricKey,
-    ) -> Result<(), ProtocolError> {
-        let len = stream.read_u32().await?;
-        if len > MAX_MESSAGE_SIZE as u32 {
-            return Err(ProtocolError::InvalidMessageFormat);
-        }
-
-        let mut buf = vec![0u8; len as usize];
-        stream.read_exact(&mut buf).await?;
-
-        let complete = PairingComplete::decode(&buf[..])?;
-
-        if !complete.success {
-            return Err(ProtocolError::InvalidMessageFormat);
-        }
-
-        // Verify CSK hash for integrity
-        let psk = self
-            .psk
-            .as_ref()
-            .ok_or(ProtocolError::MissingField("psk"))?;
-        let decrypted_hash = decrypt_with_psk(psk, &complete.csk_hash)?;
-
-        // Compute expected hash
-        let mut expected_hash = [0u8; 32];
-        let mut hasher = Sha256::new();
-        hasher.update(csk.as_bytes());
-        expected_hash.copy_from_slice(&hasher.finalize());
-
-        if decrypted_hash != expected_hash {
-            tracing::error!("CSK hash mismatch: server received a different CSK");
-            return Err(ProtocolError::InvalidMessageFormat);
-        }
-
-        Ok(())
-    }
-
-    /// Get the current SAS for display
-    pub fn sas(&self) -> Option<&str> {
-        self.sas.as_deref()
-    }
-}
-
-impl ServerPairingSession {
-    /// Create a new server pairing session
-    pub fn new(ed25519_public_key: [u8; 32]) -> Result<Self, CryptoError> {
-        Ok(Self {
-            x25519_keypair: X25519KeyPair::generate()?,
-            ed25519_public_key,
-            client_x25519_public: None,
-            psk: None,
-            sas: None,
-        })
-    }
-
-    /// Complete the pairing handshake as server
-    /// Returns (CSK received from client, client_ed25519_public_key, client_device_name, SAS)
-    pub async fn complete_pairing(
-        &mut self,
-        mut stream: TcpStream,
-        server_device_name: &str,
-    ) -> Result<(ClientSymmetricKey, [u8; 32], String, String), ProtocolError> {
-        self.send_pairing_hello(&mut stream, server_device_name)
-            .await?;
-
-        let response = self.receive_pairing_response(&mut stream).await?;
-
-        let client_device_name = response.device_name.clone();
-
-        self.client_x25519_public = Some(
-            response
-                .x25519_public_key
-                .as_slice()
-                .try_into()
-                .map_err(|_| ProtocolError::InvalidMessageFormat)?,
-        );
-
-        let client_x25519_pub = self
-            .client_x25519_public
-            .ok_or(ProtocolError::MissingField("client_x25519_public"))?;
-        let shared_secret = self.x25519_keypair.diffie_hellman(&client_x25519_pub)?;
-        let psk = derive_psk_from_x25519(&shared_secret)?;
-        self.psk = Some(psk);
-
-        let server_x25519_pub = self.x25519_keypair.public_key_bytes();
-        let psk = self
-            .psk
-            .as_ref()
-            .ok_or(ProtocolError::MissingField("psk"))?;
-        let sas = derive_sas(psk, &client_x25519_pub, &server_x25519_pub)?;
-        self.sas = Some(sas.clone());
-
-        let (csk, csk_hash) = self.receive_csk_message(&mut stream).await?;
-        self.send_pairing_complete(&mut stream, &csk_hash).await?;
-
-        let client_ed25519_public: [u8; 32] = response
-            .ed25519_public_key
-            .as_slice()
-            .try_into()
-            .map_err(|_| ProtocolError::InvalidMessageFormat)?;
-
-        Ok((csk, client_ed25519_public, client_device_name, sas))
-    }
-
-    async fn send_pairing_hello(
-        &self,
-        stream: &mut TcpStream,
-        server_device_name: &str,
-    ) -> Result<(), ProtocolError> {
-        let hello = PairingHello {
-            version: PAIRING_VERSION,
-            x25519_public_key: self.x25519_keypair.public_key_bytes().to_vec(),
-            ed25519_public_key: self.ed25519_public_key.to_vec(),
-            device_name: server_device_name.to_string(),
-            supported_symmetric_algorithms: vec![SymmetricAlgorithm::Aes256Gcm as i32],
-            supported_hash_algorithms: vec![HashAlgorithm::Sha256 as i32],
-            supported_signature_algorithms: vec![SignatureAlgorithm::Ed25519 as i32],
-        };
-
-        let buf = hello.encode_to_vec();
-        stream.write_u32(buf.len() as u32).await?;
-        stream.write_all(&buf).await?;
-        stream.flush().await?;
-
-        Ok(())
-    }
-
-    async fn receive_pairing_response(
-        &self,
-        stream: &mut TcpStream,
-    ) -> Result<PairingResponse, ProtocolError> {
-        let len = stream.read_u32().await?;
-        if len > MAX_MESSAGE_SIZE as u32 {
-            return Err(ProtocolError::InvalidMessageFormat);
-        }
-
-        let mut buf = vec![0u8; len as usize];
-        stream.read_exact(&mut buf).await?;
-
-        let response = PairingResponse::decode(&buf[..])?;
-
-        if response.version != PAIRING_VERSION {
-            return Err(ProtocolError::InvalidMessageFormat);
-        }
-
-        Ok(response)
-    }
-
-    async fn receive_csk_message(
-        &self,
-        stream: &mut TcpStream,
-    ) -> Result<(ClientSymmetricKey, [u8; 32]), ProtocolError> {
-        let len = stream.read_u32().await?;
-        if len > MAX_MESSAGE_SIZE as u32 {
-            return Err(ProtocolError::InvalidMessageFormat);
-        }
-
-        let mut buf = vec![0u8; len as usize];
-        stream.read_exact(&mut buf).await?;
-
-        let encrypted_msg = PairingCskMessage::decode(&buf[..])?;
-
-        tracing::debug!(
-            "Received encrypted CSK (sha256): {}",
-            sha256_hex(&encrypted_msg.encrypted_csk)
-        );
-
-        // Decrypt CSK with PSK
-        let psk = self
-            .psk
-            .as_ref()
-            .ok_or(ProtocolError::MissingField("psk"))?;
-        tracing::debug!(
-            "PSK for decryption (sha256): {}",
-            sha256_hex(psk.as_bytes())
-        );
-
-        let plaintext = decrypt_with_psk(psk, &encrypted_msg.encrypted_csk)?;
-
-        tracing::debug!("Decrypted CSK (sha256): {}", sha256_hex(&plaintext));
-
-        if plaintext.len() != 32 {
-            return Err(ProtocolError::InvalidMessageFormat);
-        }
-
-        let mut csk_bytes = [0u8; 32];
-        csk_bytes.copy_from_slice(&plaintext);
-
-        // Compute SHA-256 hash of the CSK for integrity verification
-        let mut csk_hash = [0u8; 32];
-        let mut hasher = Sha256::new();
-        hasher.update(csk_bytes);
-        csk_hash.copy_from_slice(&hasher.finalize());
-
-        Ok((ClientSymmetricKey::from_bytes(csk_bytes), csk_hash))
-    }
-
-    async fn send_pairing_complete(
-        &self,
-        stream: &mut TcpStream,
-        csk_hash: &[u8; 32],
-    ) -> Result<(), ProtocolError> {
-        // Encrypt the CSK hash with PSK
-        let psk = self
-            .psk
-            .as_ref()
-            .ok_or(ProtocolError::MissingField("psk"))?;
-        let encrypted_hash = encrypt_with_psk(psk, csk_hash)?;
-
-        let complete = PairingComplete {
-            success: true,
-            hash_algorithm: HashAlgorithm::Sha256 as i32,
-            csk_hash: encrypted_hash,
-        };
-
-        let buf = complete.encode_to_vec();
-        stream.write_u32(buf.len() as u32).await?;
-        stream.write_all(&buf).await?;
-        stream.flush().await?;
-
-        Ok(())
-    }
-
-    /// Get the current SAS for display
-    pub fn sas(&self) -> Option<&str> {
-        self.sas.as_deref()
-    }
-}
+//! Pass `None` for the first pairing (no `CSK` yet) and after `RotateCsk`, which
+//! invalidates every pairing and is the only way to change the client-wide
+//! algorithms. The signature algorithm is per-server, so it is always negotiated
+//! and can never be pinned.
+//!
+//! ## Key lifetime
+//!
+//! [`ClientPairingState::conclude`] and [`ServerPairingSession::conclude`] drop
+//! the derived keys, the transcript hash and the ephemeral X25519 secret, per
+//! cryptography-specification.md §4. Each side also takes its ephemeral secret as
+//! soon as it derives the keys, so it exists only for the one Diffie-Hellman call
+//! that needs it. `conclude` is terminal: afterwards
+//! [`ClientPairingState::negotiated`] still answers, [`ClientPairingState::sas`]
+//! and the transcript-hash accessors return `None`, and every protocol operation
+//! (`handle_init`, `create_init`, `verify_response`, `process_confirm_client`,
+//! `verify_confirm_server`, `create_keepalive`, the create/verify confirm and abort
+//! methods) fails with
+//! [`ProtocolError::SessionConcluded`](crate::protocol::messages::ProtocolError::SessionConcluded)
+//! instead of running on a
+//! session whose keys are gone. The keepalive is the one that carries no key
+//! material, and it is guarded all the same: a path kept open after `conclude` could
+//! only deliver a retransmission nothing would answer.
+//!
+//! ## Where the handshake ends
+//!
+//! [`ServerPairingSession::create_confirm_server`] builds the last message of the
+//! handshake but does **not** end the session: it records that the confirmation
+//! has been sent, which refuses a second proof
+//! ([`ProtocolError::ConfirmationAlreadySent`](crate::protocol::messages::ProtocolError::ConfirmationAlreadySent))
+//! and a late [`ServerPairingSession::create_init`] (same error), while
+//! [`ServerPairingSession::process_confirm_client`] stays valid and idempotent, so
+//! the responder keeps answering retransmissions of the provisioning frame. Without
+//! that, a lost confirmation burst leaves the desktop timing out against a phone
+//! that has already paired. Only `conclude()` ends a session; the FFI layer calls it
+//! explicitly, or on drop of the last reference.
+//!
+//! ## Who signs what
+//!
+//! * `PairingResponse.client_signature` — `Ed_C`, the **desktop's static key**,
+//!   verified by the phone.
+//! * `PairingCompletePayload.server_signature` — `Ed_S`, the **phone's static
+//!   key**, verified by the desktop. The signature proves possession of `Ed_S`
+//!   and receipt of the exact `CSK`.
+//!
+//! ## Caller responsibilities
+//!
+//! * Session filtering: drop any frame whose `session_id` differs from
+//!   [`ClientPairingState::session_id`] / [`ServerPairingSession::session_id`]
+//!   before calling into this module ([`pairing_session_id`] extracts it).
+//! * Retries: `PairingInit` retries must be answered from
+//!   [`ClientPairingState::response`] without calling [`ClientPairingState::handle_init`]
+//!   again; `handle_init` is idempotent for an identical `init` and errors on a
+//!   conflicting one.
+//! * Re-encryption: `PairingConfirmClient`/`PairingConfirmServer` carry a fresh
+//!   random nonce per encryption, so a retransmission must reuse the previously
+//!   created message rather than re-encrypt (see the "Each call draws a fresh
+//!   nonce" note on [`ClientPairingState::create_confirm_client`] and
+//!   [`ServerPairingSession::create_confirm_server`]).
+//!
+//! ## Module layout
+//!
+//! The module is one file per protocol role, plus the vocabulary both roles
+//! share:
+//!
+//! * `negotiation.rs` — the `SUPPORTED_*` slices, [`NegotiatedAlgorithms`],
+//!   [`PinnedAlgorithms`] and the intersection that picks a suite.
+//! * `wire.rs` — the envelope (`validate_envelope`) and the codec over it
+//!   ([`encode_pairing_packet`] / [`decode_pairing_packet`] /
+//!   [`pairing_session_id`]), plus [`PairingEndpoint`] and [`StartedPairing`].
+//! * `client.rs` — [`ClientPairingState`], the desktop half.
+//! * `server.rs` — [`ServerPairingSession`], the phone half.
+//! * `transcript.rs` — the handshake's signature payloads (`context_with_hash`,
+//!   `complete_signature_message`), the session values both roles hand out
+//!   together (`session_material`) and the abort's direction tag
+//!   (`verify_abort_tag`).
+//! * `fields.rs` — the per-field helpers both roles apply before a value enters
+//!   the transcript: the device-name truncation and the 32-byte key parse.
+//!
+//! The constants below are the wire vocabulary every one of them names, so they
+//! stay here.
+
+mod client;
+mod fields;
+mod negotiation;
+mod server;
+mod transcript;
+mod wire;
 
 #[cfg(test)]
 #[allow(
@@ -553,165 +159,34 @@ impl ServerPairingSession {
     clippy::panic,
     clippy::indexing_slicing
 )]
-mod tests {
-    use super::*;
-    use tokio::net::TcpListener;
+mod tests;
 
-    #[tokio::test]
-    async fn test_pairing_handshake() {
-        // Start a TCP listener
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+pub use client::ClientPairingState;
+pub use negotiation::{
+    NegotiatedAlgorithms, PinnedAlgorithms, SUPPORTED_HASH_ALGORITHMS,
+    SUPPORTED_SIGNATURE_ALGORITHMS, SUPPORTED_SYMMETRIC_ALGORITHMS,
+};
+pub use server::ServerPairingSession;
+pub use wire::{
+    decode_pairing_packet, encode_pairing_packet, pairing_session_id, PairingEndpoint,
+    StartedPairing,
+};
 
-        // Server task (Android - receives CSK)
-        let server_task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let server_keypair = Ed25519KeyPair::generate().unwrap();
-            let mut session =
-                ServerPairingSession::new(server_keypair.verifying_key_bytes()).unwrap();
+/// Length in bytes of the random pairing `session_id` (`sid` in the QR code).
+pub const PAIRING_SESSION_ID_LEN: usize = 16;
 
-            let (csk, _client_pub, _client_device_name, sas) = session
-                .complete_pairing(stream, "TestServer")
-                .await
-                .unwrap();
-            (csk, sas)
-        });
+/// Maximum length in UTF-8 bytes of a device display name inside the transcript.
+pub const PAIRING_DEVICE_NAME_MAX_BYTES: usize = 64;
 
-        // Client task (Desktop - sends CSK)
-        let client_task = tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            let stream = TcpStream::connect(addr).await.unwrap();
-            let client_keypair = Ed25519KeyPair::generate().unwrap();
-            let csk = ClientSymmetricKey::generate().unwrap();
-            let mut session = ClientPairingSession::new(client_keypair).unwrap();
+/// Signature context prefix of `PairingResponse.client_signature` (signed by the desktop's `Ed_C`).
+pub const PAIRING_CLIENT_SIG_CONTEXT: &[u8] = b"tapauth-pair-client-sig-v2";
 
-            // Phase 1: Initiate pairing
-            let (stream, _server_pub, _server_name, sas) = session
-                .initiate_pairing(stream, "TestClient")
-                .await
-                .unwrap();
+/// Signature context prefix of `PairingCompletePayload.server_signature`
+/// (signed by the phone's static `Ed_S`).
+pub const PAIRING_SERVER_SIG_CONTEXT: &[u8] = b"tapauth-pair-server-sig-v2";
 
-            // Phase 2: Finish pairing
-            session
-                .finish_pairing(stream, &csk, "testuser")
-                .await
-                .unwrap();
+/// AEAD associated-data prefix of `PairingConfirmClient.encrypted_payload` (key `K_c2s`).
+pub const PAIRING_PROVISION_AAD_CONTEXT: &[u8] = b"tapauth-pair-v2-provision";
 
-            (csk, sas)
-        });
-
-        let (server_result, client_result) = tokio::join!(server_task, client_task);
-        let (server_csk, server_sas) = server_result.unwrap();
-        let (client_csk, client_sas) = client_result.unwrap();
-
-        // Verify SAS matches
-        assert_eq!(server_sas, client_sas);
-
-        // Verify CSK matches
-        assert_eq!(server_csk.as_bytes(), client_csk.as_bytes());
-    }
-
-    #[tokio::test]
-    async fn test_pairing_device_names() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server_task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let server_keypair = Ed25519KeyPair::generate().unwrap();
-            let mut session =
-                ServerPairingSession::new(server_keypair.verifying_key_bytes()).unwrap();
-
-            let (_, _, client_device_name, _) = session
-                .complete_pairing(stream, "MyAndroidPhone")
-                .await
-                .unwrap();
-            client_device_name
-        });
-
-        let client_task = tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            let stream = TcpStream::connect(addr).await.unwrap();
-            let client_keypair = Ed25519KeyPair::generate().unwrap();
-            let csk = ClientSymmetricKey::generate().unwrap();
-            let mut session = ClientPairingSession::new(client_keypair).unwrap();
-
-            let (stream, _, server_device_name, _) = session
-                .initiate_pairing(stream, "LinuxDesktop")
-                .await
-                .unwrap();
-
-            session
-                .finish_pairing(stream, &csk, "testuser")
-                .await
-                .unwrap();
-
-            server_device_name
-        });
-
-        let (server_result, client_result) = tokio::join!(server_task, client_task);
-        let client_device_name = server_result.unwrap();
-        let server_device_name = client_result.unwrap();
-
-        // Verify device names were exchanged correctly
-        assert_eq!(client_device_name, "LinuxDesktop");
-        assert_eq!(server_device_name, "MyAndroidPhone");
-    }
-
-    #[tokio::test]
-    async fn test_pairing_with_empty_device_names() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server_task = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let server_keypair = Ed25519KeyPair::generate().unwrap();
-            let mut session =
-                ServerPairingSession::new(server_keypair.verifying_key_bytes()).unwrap();
-
-            session.complete_pairing(stream, "").await
-        });
-
-        let client_task = tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            let stream = TcpStream::connect(addr).await.unwrap();
-            let client_keypair = Ed25519KeyPair::generate().unwrap();
-            let csk = ClientSymmetricKey::generate().unwrap();
-            let mut session = ClientPairingSession::new(client_keypair).unwrap();
-
-            let result = session.initiate_pairing(stream, "").await;
-            if let Ok((stream, _, _, _)) = result {
-                session.finish_pairing(stream, &csk, "testuser").await
-            } else {
-                result.map(|_| ())
-            }
-        });
-
-        let (server_result, client_result) = tokio::join!(server_task, client_task);
-
-        // Empty device names should still work (they're just display names)
-        assert!(server_result.is_ok());
-        assert!(client_result.is_ok());
-    }
-
-    #[test]
-    fn test_client_session_public_keys() {
-        let keypair = Ed25519KeyPair::generate().unwrap();
-        let session = ClientPairingSession::new(keypair.clone()).unwrap();
-
-        // X25519 public key should be 32 bytes
-        assert_eq!(session.x25519_public_key().len(), 32);
-
-        // Ed25519 public key should match the input keypair
-        assert_eq!(session.ed25519_public_key(), keypair.verifying_key_bytes());
-    }
-
-    #[test]
-    fn test_server_session_creation() {
-        let ed25519_public = [42u8; 32];
-        let session = ServerPairingSession::new(ed25519_public).unwrap();
-
-        // Should store the provided public key
-        assert_eq!(session.ed25519_public_key, ed25519_public);
-    }
-}
+/// AEAD associated-data prefix of `PairingConfirmServer.encrypted_complete` (key `K_s2c`).
+pub const PAIRING_COMPLETE_AAD_CONTEXT: &[u8] = b"tapauth-pair-v2-complete";

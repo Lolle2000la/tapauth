@@ -20,6 +20,10 @@ pub enum CryptoError {
     RandomGenerationFailed,
     #[error("System time error")]
     SystemTimeError,
+    #[error("Unsupported algorithm")]
+    UnsupportedAlgorithm,
+    #[error("Invalid associated data")]
+    InvalidAad,
 }
 
 pub use encryption::*;

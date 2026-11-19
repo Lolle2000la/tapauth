@@ -3,14 +3,18 @@ package dev.rourunisen.tapauth.service
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.util.Base64
+import android.os.SystemClock
 import android.util.Log
+import android.view.View
+import android.widget.RemoteViews
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.lifecycleScope
 import dev.rourunisen.tapauth.TapAuthApplication
+import dev.rourunisen.tapauth.data.AuthContextDisplay
 import dev.rourunisen.tapauth.data.AuthRequest
+import dev.rourunisen.tapauth.data.ContextSanitizer
 import dev.rourunisen.tapauth.data.KeypairRepository
 import dev.rourunisen.tapauth.data.TransportType
 import java.util.UUID
@@ -21,55 +25,77 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
-/** Manages pending authentication requests and coordinates between services and UI */
+/**
+ * Manages pending authentication requests and coordinates between services and UI.
+ *
+ * This is the Android shell: it builds and posts the notification, broadcasts the request, and owns
+ * the callback's coroutine scope. All the state lives in a [PendingRequestRegistry] of
+ * [AndroidPrompt]; the registry holds no framework type and arms its own deadline sweep, so its
+ * release properties can be unit-tested.
+ */
 class AuthRequestManager private constructor() {
 
-    private val pendingRequests = ConcurrentHashMap<String, PendingAuthRequest>()
     private val scope = CoroutineScope(Dispatchers.IO)
 
-    // Index challenges (Base64) to request IDs for fast cancel-by-challenge
-    private val challengeIndex = ConcurrentHashMap<String, MutableSet<String>>()
+    /**
+     * The prompt as this shell needs it: identity and deadline plus the two Android things the
+     * release has to do something with, the callback and the context the banner was posted from.
+     */
+    private class AndroidPrompt(
+        val authRequest: AuthRequest,
+        val callback: (approved: Boolean, challenge: ByteArray?, explicitDenial: Boolean) -> Unit,
+        val appContext: Context,
+        override val bleDeviceAddress: String?,
+        override val deadlineMs: Long,
+    ) : PendingPrompt {
+        override val requestId: String
+            get() = authRequest.requestId
 
-    // Track BLE device addresses to request IDs so pending prompts can be
-    // cleaned up when the GATT link to a device is gone (with a grace period,
-    // see BleGattService). Only used for BLE-transport requests.
-    private val bleDeviceRequests = ConcurrentHashMap<String, MutableSet<String>>()
+        override val challenge: ByteArray
+            get() = authRequest.challenge
+    }
 
-    // Track recently cancelled challenges to handle out-of-order cancel vs request arrival
-    private val cancelledChallenges = ConcurrentHashMap<String, Long>()
-    private val CANCEL_TTL_MS = 10_000L // Keep cancellation intent for 10 seconds
+    private val pending: PendingRequestRegistry<AndroidPrompt> =
+        PendingRequestRegistry(
+            clock = { SystemClock.elapsedRealtime() },
+            // The deadline sweep. Registration arms it, so an entry cannot exist without one; the
+            // sweep releases whatever is due, and a prompt another path already released costs it
+            // nothing (it is not handed back twice).
+            scheduleExpiry = { delayMs -> armExpiry(delayMs) },
+        )
 
-    private fun pruneCancelledChallenges(now: Long = android.os.SystemClock.elapsedRealtime()) {
-        cancelledChallenges.entries.removeIf { (_, ts) -> now - ts > CANCEL_TTL_MS }
+    /** The registry's scheduler: release every due prompt once [delayMs] has passed. */
+    private fun armExpiry(delayMs: Long) {
+        try {
+            scope.launch {
+                try {
+                    delay(delayMs)
+                    pending.releaseExpired().forEach { expired ->
+                        Log.d(
+                            TAG,
+                            "Timeout reached; cancelling pending request ${expired.requestId}",
+                        )
+                        finish(expired, approved = false, challenge = null, explicitDenial = false)
+                    }
+                } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
     }
 
     fun markCancelledChallenge(challenge: ByteArray) {
-        val key = Base64.encodeToString(challenge, Base64.NO_WRAP)
-        cancelledChallenges[key] = android.os.SystemClock.elapsedRealtime()
-        pruneCancelledChallenges()
-        Log.d(TAG, "Marked challenge as cancelled (ttl=${CANCEL_TTL_MS}ms)")
+        pending.markCancelled(challenge)
+        Log.d(TAG, "Marked challenge as cancelled (ttl=${PendingRequestRegistry.CANCEL_TTL_MS}ms)")
     }
 
-    fun isChallengeCancelled(challenge: ByteArray): Boolean {
-        pruneCancelledChallenges()
-        val key = Base64.encodeToString(challenge, Base64.NO_WRAP)
-        val ts = cancelledChallenges[key] ?: return false
-        val stillValid = (android.os.SystemClock.elapsedRealtime() - ts) <= CANCEL_TTL_MS
-        if (!stillValid) {
-            cancelledChallenges.remove(key)
-        }
-        return stillValid
-    }
+    fun isChallengeCancelled(challenge: ByteArray): Boolean = pending.isCancelled(challenge)
 
-    data class PendingAuthRequest(
-        val authRequest: AuthRequest,
-        val callback:
-            (Boolean, ByteArray?, Boolean) -> Unit, // (approved, signedChallenge, explicitDenial)
-        val appContext: android.content.Context,
-        val bleDeviceAddress: String? = null, // BLE MAC address if this is a BLE request
-    )
-
-    /** Submit an authentication request for user approval Returns a request ID */
+    /**
+     * Submit an authentication request for user approval Returns a request ID
+     *
+     * The four context parameters carry the Client's signed caller context (§3.3); they are
+     * defaults so BLE/older call sites keep compiling, and they appear before [callback] because a
+     * trailing lambda always binds to the last parameter.
+     */
     fun submitRequest(
         context: Context,
         deviceId: String,
@@ -80,21 +106,14 @@ class AuthRequestManager private constructor() {
         timestamp: Long,
         transportType: TransportType,
         bleDeviceAddress: String? = null, // Optional: BLE MAC address for disconnect cleanup
-        callback: (approved: Boolean, signedChallenge: ByteArray?, explicitDenial: Boolean) -> Unit,
+        pamService: String = "",
+        processName: String = "",
+        commandPreview: String = "",
+        ttyPresent: Boolean = false,
+        callback: (approved: Boolean, challenge: ByteArray?, explicitDenial: Boolean) -> Unit,
     ): String {
         // Derive stable notification ID from challenge bytes (SHA-256 -> first 4 bytes -> int)
         val notificationId = notificationIdFor(challenge)
-        // If this challenge was already cancelled (cancel may arrive before request), drop it
-        if (isChallengeCancelled(challenge)) {
-            val droppedId = UUID.randomUUID().toString()
-            Log.d(
-                TAG,
-                "Dropping submitRequest for already-cancelled challenge; no notification will be posted",
-            )
-            // Invoke callback as cancelled (not explicit denial)
-            scope.launch { callback(false, null, false) }
-            return droppedId
-        }
 
         val requestId = UUID.randomUUID().toString()
 
@@ -108,25 +127,104 @@ class AuthRequestManager private constructor() {
                 challenge = challenge,
                 timestamp = timestamp,
                 transportType = transportType,
+                pamService = pamService,
+                processName = processName,
+                commandPreview = commandPreview,
+                ttyPresent = ttyPresent,
             )
 
-        // Store the pending request
-        pendingRequests[requestId] =
-            PendingAuthRequest(authRequest, callback, context.applicationContext, bleDeviceAddress)
+        // The protocol-v2 caller context, as the desktop sent it: the renderers
+        // (AuthContextDisplay) sanitize separately, and this line is what
+        // scripts/test-e2e.sh asserts on. It lives here because submitRequest is the one
+        // place both transports funnel through (AuthenticationService for UDP,
+        // BleGattService for BLE), and because nothing else on the phone carries all three
+        // values: the prompt shows the command preview *instead of* service/process, and the
+        // BLE receipt line logs none of the three (only username/hostname/ttyPresent).
+        //
+        // The preview's *content* is logged only by the `e2e` build variant, via
+        // BuildConfig.E2E_TESTING (app/build.gradle.kts decides it: false for release and
+        // debug, true only for e2e). It is the desktop process's own argv, which routinely
+        // carries `-p <password>`, `--token` or an `Authorization` header, and `Log.d` is not
+        // stripped from release builds: emitting it would hand the credential to any
+        // `adb logcat` capture or bug report. Every other build logs its length instead, so
+        // the fact that a preview arrived survives without the argv. The E2E suite is the one
+        // consumer that needs the content, and it installs the e2e variant.
+        //
+        // Each value is scrubbed first (see `scrubLogValue`): it derives from the caller's own
+        // argv, so an unprivileged local user could otherwise embed a newline and forge extra
+        // logcat lines, and a secret on that command line would be persisted here after the
+        // prompt is gone. The tokens the E2E suite greps are plain ASCII and pass unchanged.
+        // That formatting is still needed for the E2E form; the production form logs no value
+        // to format.
+        //
+        // The `BuildConfig.E2E_TESTING` literal below is the one point in this path no automated
+        // check covers: every JVM unit test runs against the e2e variant (`testBuildType = "e2e"`),
+        // where the flag is true, so `callerContextLogLine`'s false branch is only ever exercised
+        // by passing the flag as a parameter — never through this call. Nothing under `scripts/ci/`
+        // looks at an APK or greps for `commandPreview` (it builds the Rust crates and scans the
+        // distro payloads), so flipping this literal to `true` would ship the preview's content in
+        // a `Log.d` that survives release with no check failing. A shipped-artifact check that the
+        // release dex cannot contain the E2E-only marker string is what would close that gap.
+        Log.d(
+            TAG,
+            callerContextLogLine(
+                authRequest.pamService,
+                authRequest.processName,
+                authRequest.commandPreview,
+                dev.rourunisen.tapauth.BuildConfig.E2E_TESTING,
+            ),
+        )
 
-        // Index by challenge for fast cancellation
-        runCatching {
-            val key = Base64.encodeToString(challenge, Base64.NO_WRAP)
-            challengeIndex.getOrPut(key) { mutableSetOf() }.add(requestId)
+        // The prompt's deadline, decided once. The notification's `setTimeoutAfter` and the state
+        // sweep below are the same number, so the banner and the entry cannot disagree about when
+        // the prompt is over. `setTimeoutAfter(0)` means "no timeout", and a request already past
+        // its session deadline therefore gets the shortest real timeout instead of a permanent
+        // ongoing notification; a config read that fails falls back to that same minimum rather
+        // than to "never expires".
+        val remainingTimeout = runCatching {
+            val sessionTimeoutMs =
+                dev.rourunisen.tapauth.data.AppConfiguration.getInstance(context)
+                    .sessionTimeoutSeconds * 1000
+            (sessionTimeoutMs - (System.currentTimeMillis() - timestamp)).coerceAtLeast(1L)
         }
-            .onFailure { e ->
-                Log.w(TAG, "Failed to index challenge for request $requestId: ${e.message}")
+            .getOrElse { e ->
+                Log.w(TAG, "Failed to read the session timeout; using the minimum: ${e.message}")
+                1L
             }
 
-        // If this is a BLE request, track it by device address so a lingering
-        // GATT disconnect can clean up the prompt (with a grace period)
-        if (bleDeviceAddress != null) {
-            bleDeviceRequests.getOrPut(bleDeviceAddress) { mutableSetOf() }.add(requestId)
+        val request =
+            AndroidPrompt(
+                authRequest = authRequest,
+                callback = callback,
+                appContext = context.applicationContext,
+                bleDeviceAddress = bleDeviceAddress,
+                deadlineMs = pending.now() + remainingTimeout + EXPIRY_SLACK_MS,
+            )
+        // Registration is the one gate a promise to the client passes through: it refuses a
+        // challenge whose cancel got in first, and arming the deadline sweep is part of storing the
+        // entry, so a prompt cannot exist without one. Only a refusal is ours to answer - as
+        // cancelled, never as an explicit denial, because nobody denied anything - and it posts
+        // neither the broadcast nor the notification.
+        when (pending.register(request)) {
+            PendingRequestRegistry.Registration.Registered -> Unit
+            PendingRequestRegistry.Registration.RefusedCancelled -> {
+                Log.d(
+                    TAG,
+                    "Dropping submitRequest for already-cancelled challenge; no notification will be posted",
+                )
+                scope.launch { callback(false, null, false) }
+                return UUID.randomUUID().toString()
+            }
+            PendingRequestRegistry.Registration.AlreadyClaimed -> {
+                // The canceller claimed this request between the insert and the cancelled-challenge
+                // check, so it has already delivered the client's one answer (and on BLE already
+                // disconnected the link). Answering again would be a second denial for one request.
+                Log.d(
+                    TAG,
+                    "Auth request $requestId was claimed by a concurrent cancel; not answering it again",
+                )
+                return requestId
+            }
         }
 
         // Broadcast to MainActivity
@@ -212,18 +310,49 @@ class AuthRequestManager private constructor() {
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
                 )
 
-            // Calculate timeout: session timeout minus time already elapsed since request timestamp
-            val config = dev.rourunisen.tapauth.data.AppConfiguration.getInstance(context)
-            val sessionTimeoutMs = config.sessionTimeoutSeconds * 1000
-            val currentTime = System.currentTimeMillis()
-            val timeElapsed = currentTime - timestamp
-            val remainingTimeout = (sessionTimeoutMs - timeElapsed).coerceAtLeast(0)
+            // §3.3: the primary header stays `username@hostname`; the secondary line below it is
+            // the re-sanitized caller context, capped at two lines with an end ellipsis.
+            val secondaryLine = AuthContextDisplay.contextLine(authRequest)
+            // The identity strings are peer-chosen (`client_hostname` comes from the provision
+            // payload), so the header is sanitized too rather than rendered verbatim.
+            val displayUsername =
+                ContextSanitizer.sanitize(username, AuthContextDisplay.IDENTITY_MAX_BYTES)
+            val displayHostname =
+                ContextSanitizer.sanitize(hostname, AuthContextDisplay.IDENTITY_MAX_BYTES)
+            val displayDeviceName =
+                ContextSanitizer.sanitize(deviceName, AuthContextDisplay.IDENTITY_MAX_BYTES)
+            val contentViews =
+                RemoteViews(
+                        context.packageName,
+                        dev.rourunisen.tapauth.R.layout.notification_auth_request,
+                    )
+                    .apply {
+                        val titleId = dev.rourunisen.tapauth.R.id.notification_title
+                        val contextId = dev.rourunisen.tapauth.R.id.notification_context
+                        setTextViewText(titleId, "$displayUsername@$displayHostname")
+                        if (secondaryLine.isEmpty()) {
+                            setViewVisibility(contextId, View.GONE)
+                        } else {
+                            setTextViewText(contextId, secondaryLine)
+                            setViewVisibility(contextId, View.VISIBLE)
+                        }
+                        // A custom content view does not inherit `setContentIntent`; wire the tap
+                        // target explicitly so tapping the body still opens the prompt.
+                        setOnClickPendingIntent(
+                            dev.rourunisen.tapauth.R.id.notification_root,
+                            pendingIntent,
+                        )
+                    }
 
             val notificationBuilder =
                 NotificationCompat.Builder(context, TapAuthApplication.AUTH_CHANNEL_ID)
                     .setSmallIcon(dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground)
                     .setContentTitle("Authentication request")
-                    .setContentText("${deviceName}: ${username}@${hostname}")
+                    .setContentText("$displayDeviceName: $displayUsername@$displayHostname")
+                    .setCustomContentView(contentViews)
+                    // Clone so the collapsed and expanded views are distinct instances; both are
+                    // this same two-row layout, so the summary never loses the context line.
+                    .setCustomBigContentView(contentViews.clone())
                     .setContentIntent(pendingIntent)
                     .addAction(
                         dev.rourunisen.tapauth.R.drawable.ic_launcher_foreground,
@@ -269,9 +398,14 @@ class AuthRequestManager private constructor() {
             }
 
             val challengeHex = challenge.joinToString("") { "%02x".format(it) }
+            // `username`/`hostname` are the caller's own strings and `deviceName` the peer-supplied
+            // hostname a pairing persisted, so each goes through [scrubLogValue] before it lands in
+            // logcat — see the rationale on the caller-context line above.
             Log.d(
                 TAG,
-                "Posting auth notification (id=$notificationId) for $deviceName @ $username@$hostname, challenge=${challengeHex.take(16)}...",
+                "Posting auth notification (id=$notificationId) for ${scrubLogValue(deviceName)} @ " +
+                    "${scrubLogValue(username)}@${scrubLogValue(hostname)}, " +
+                    "challenge=${challengeHex.take(16)}...",
             )
 
             val nm = NotificationManagerCompat.from(context)
@@ -288,26 +422,14 @@ class AuthRequestManager private constructor() {
                 )
             }
             Log.d(TAG, "Posted auth notification (id=$notificationId)")
-
-            // Schedule state cleanup on timeout to mirror setTimeoutAfter
-            try {
-                if (remainingTimeout > 0) {
-                    scope.launch {
-                        try {
-                            delay(remainingTimeout + 250)
-                            if (pendingRequests.containsKey(requestId)) {
-                                Log.d(TAG, "Timeout reached; cancelling pending request $requestId")
-                                cancelRequest(requestId)
-                            }
-                        } catch (_: Exception) {}
-                    }
-                }
-            } catch (_: Exception) {}
         } catch (e: Exception) {
             Log.w(TAG, "Failed to post auth request notification: ${e.message}")
         }
 
-        Log.d(TAG, "Submitted auth request $requestId for ${username}@${hostname}")
+        Log.d(
+            TAG,
+            "Submitted auth request $requestId for ${scrubLogValue(username)}@${scrubLogValue(hostname)}",
+        )
 
         return requestId
     }
@@ -320,92 +442,40 @@ class AuthRequestManager private constructor() {
     fun handleResponse(
         requestId: String,
         approved: Boolean,
-        signedChallenge: ByteArray?,
+        challenge: ByteArray?,
         explicitDenial: Boolean = false,
     ) {
-        val pending = pendingRequests.remove(requestId)
-        if (pending != null) {
+        val request = pending.release(requestId)
+        if (request != null) {
             Log.d(
                 TAG,
                 "Auth request $requestId ${if (approved) "approved" else if (explicitDenial) "explicitly denied" else "timed out/cancelled"}",
             )
-
-            // Remove from challenge index
-            runCatching {
-                val key = Base64.encodeToString(pending.authRequest.challenge, Base64.NO_WRAP)
-                challengeIndex[key]?.remove(requestId)
-                if (challengeIndex[key]?.isEmpty() == true) {
-                    challengeIndex.remove(key)
-                }
-            }
-
-            // Remove from BLE tracking if applicable
-            pending.bleDeviceAddress?.let { address ->
-                bleDeviceRequests[address]?.remove(requestId)
-                if (bleDeviceRequests[address]?.isEmpty() == true) {
-                    bleDeviceRequests.remove(address)
-                }
-            }
-
-            // Launch callback on IO dispatcher to avoid NetworkOnMainThreadException
-            scope.launch { pending.callback(approved, signedChallenge, explicitDenial) }
-            // Cancel the persistent notification
-            try {
-                val notificationId = notificationIdFor(pending.authRequest.challenge)
-                Log.d(TAG, "Cancelling notification for request $requestId (id=$notificationId)")
-                NotificationManagerCompat.from(pending.appContext).cancel(notificationId)
-            } catch (_: Exception) {}
+            finish(request, approved, challenge, explicitDenial)
         } else {
             Log.w(TAG, "Received response for unknown request ID: $requestId")
         }
     }
 
     /**
-     * Cancel a pending request (e.g., on timeout) This is NOT an explicit user denial - just
-     * silently cancel
+     * Cancel one pending request by id, if it is still pending.
+     *
+     * This is NOT an explicit user denial: the client is answered as cancelled (`approved = false`,
+     * `explicitDenial = false`). The deadline sweep releases expired entries itself, from the
+     * scheduler [pending] was built with, so this is the API for cancelling a single request from
+     * outside the manager rather than the timeout path.
      */
     fun cancelRequest(requestId: String) {
-        val pending = pendingRequests.remove(requestId)
-        if (pending != null) {
-            Log.d(TAG, "Cancelled auth request $requestId (timeout)")
-
-            // Remove from challenge index
-            runCatching {
-                val key = Base64.encodeToString(pending.authRequest.challenge, Base64.NO_WRAP)
-                challengeIndex[key]?.remove(requestId)
-                if (challengeIndex[key]?.isEmpty() == true) {
-                    challengeIndex.remove(key)
-                }
-            }
-
-            // Remove from BLE tracking if applicable
-            pending.bleDeviceAddress?.let { address ->
-                bleDeviceRequests[address]?.remove(requestId)
-                if (bleDeviceRequests[address]?.isEmpty() == true) {
-                    bleDeviceRequests.remove(address)
-                }
-            }
-
-            // Cancel the notification and remove from registry
-            try {
-                val notificationId = notificationIdFor(pending.authRequest.challenge)
-                Log.d(
-                    TAG,
-                    "Cancelling notification for timed-out request $requestId (id=$notificationId)",
-                )
-                NotificationManagerCompat.from(pending.appContext).cancel(notificationId)
-            } catch (_: Exception) {}
-
-            // Launch callback on IO dispatcher - explicitDenial = false
-            scope.launch { pending.callback(false, null, false) }
-        }
+        val request = pending.release(requestId) ?: return
+        Log.d(TAG, "Cancelled auth request $requestId (timeout)")
+        finish(request, approved = false, challenge = null, explicitDenial = false)
     }
 
     /** Check if a pending request exists by ID */
-    fun hasPendingRequest(requestId: String): Boolean = pendingRequests.containsKey(requestId)
+    fun hasPendingRequest(requestId: String): Boolean = pending.has(requestId)
 
     /** Get all active request IDs */
-    fun getActiveRequestIds(): Set<String> = pendingRequests.keys.toSet()
+    fun getActiveRequestIds(): Set<String> = pending.activeIds()
 
     /**
      * Cancel all pending requests that match the given challenge This is used when an
@@ -415,67 +485,25 @@ class AuthRequestManager private constructor() {
      * @return true if any requests were cancelled
      */
     fun cancelRequestsByChallenge(challenge: ByteArray): Boolean {
-        var cancelledAny = false
-
         val challengeHex = challenge.joinToString("") { "%02x".format(it) }
         Log.d(TAG, "cancelRequestsByChallenge: challenge=${challengeHex.take(16)}...")
 
-        // Look up request IDs by challenge index first
-        val key = Base64.encodeToString(challenge, Base64.NO_WRAP)
-        val requestIds = challengeIndex.remove(key)?.toList().orEmpty()
-        if (requestIds.isNotEmpty()) {
-            Log.d(TAG, "Cancelling ${requestIds.size} request(s) by challenge index")
-        }
-
-        val idsToCancel: List<String> =
-            if (requestIds.isNotEmpty()) {
-                requestIds
-            } else {
-                // Fallback: scan map (in case index missed older entries)
-                pendingRequests
-                    .filter { (_, pending) ->
-                        pending.authRequest.challenge.contentEquals(challenge)
-                    }
-                    .keys
-                    .toList()
-            }
-
-        idsToCancel.forEach { requestId ->
-            val pending = pendingRequests.remove(requestId)
-            if (pending != null) {
-                Log.d(TAG, "Cancelled auth request $requestId due to AuthenticationCancel")
-
-                // Remove from BLE tracking if applicable
-                pending.bleDeviceAddress?.let { address ->
-                    bleDeviceRequests[address]?.remove(requestId)
-                    if (bleDeviceRequests[address]?.isEmpty() == true) {
-                        bleDeviceRequests.remove(address)
-                    }
-                }
-
-                // Invoke callback with cancelled status (not explicit denial)
-                scope.launch { pending.callback(false, null, false) }
-
-                // Dismiss the notification
-                try {
-                    val notificationId = notificationIdFor(pending.authRequest.challenge)
-                    Log.d(
-                        TAG,
-                        "Dismissing notification for cancelled request $requestId (id=$notificationId)",
-                    )
-                    NotificationManagerCompat.from(pending.appContext).cancel(notificationId)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to dismiss notification for $requestId: ${e.message}")
-                }
-
-                cancelledAny = true
-            }
-        }
-
-        // Remember this cancellation briefly in case the request arrives slightly after cancel
+        // Record the cancellation before the scan: a submit that lands between the scan and the
+        // record would otherwise be neither released by this call nor dropped by its own
+        // cancel check. The record outlives the call either way, so a cancel that matches nothing
+        // still suppresses the request it was meant for.
         markCancelledChallenge(challenge)
 
-        return cancelledAny
+        val released = pending.releaseByChallenge(challenge)
+        if (released.isNotEmpty()) {
+            Log.d(TAG, "Cancelling ${released.size} request(s) by challenge")
+        }
+        released.forEach { request ->
+            Log.d(TAG, "Cancelled auth request ${request.requestId} due to AuthenticationCancel")
+            finish(request, approved = false, challenge = null, explicitDenial = false)
+        }
+
+        return released.isNotEmpty()
     }
 
     /**
@@ -490,52 +518,69 @@ class AuthRequestManager private constructor() {
      * @return true if any requests were cancelled
      */
     fun cancelRequestsByBleDisconnection(bleDeviceAddress: String): Boolean {
-        val requestIds = bleDeviceRequests.remove(bleDeviceAddress) ?: return false
-
-        if (requestIds.isEmpty()) return false
+        val released = pending.releaseByBleDevice(bleDeviceAddress)
+        if (released.isEmpty()) return false
 
         Log.d(
             TAG,
-            "BLE device $bleDeviceAddress stayed disconnected, cancelling ${requestIds.size} pending request(s)",
+            "BLE device $bleDeviceAddress stayed disconnected, cancelling ${released.size} pending request(s)",
         )
 
-        requestIds.forEach { requestId ->
-            val pending = pendingRequests.remove(requestId)
-            if (pending != null) {
-                // Invoke callback with cancelled status (not explicit denial)
-                scope.launch { pending.callback(false, null, false) }
-
-                // Dismiss the notification
-                try {
-                    val notificationId = notificationIdFor(pending.authRequest.challenge)
-                    Log.d(
-                        TAG,
-                        "Dismissing notification for BLE-disconnected request $requestId (id=$notificationId)",
-                    )
-                    NotificationManagerCompat.from(pending.appContext).cancel(notificationId)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to dismiss notification for $requestId: ${e.message}")
-                }
-
-                // Remove from challenge index
-                runCatching {
-                    val key = Base64.encodeToString(pending.authRequest.challenge, Base64.NO_WRAP)
-                    challengeIndex[key]?.remove(requestId)
-                    if (challengeIndex[key]?.isEmpty() == true) {
-                        challengeIndex.remove(key)
-                    }
-                }
-            }
+        released.forEach { request ->
+            Log.d(TAG, "Cancelled auth request ${request.requestId} due to BLE disconnection")
+            finish(request, approved = false, challenge = null, explicitDenial = false)
         }
 
         return true
     }
 
+    /**
+     * The side effects of a release: deliver the callback and dismiss the notification.
+     *
+     * Only reachable with an entry [PendingRequestRegistry] handed back, i.e. with the one claim
+     * that won the release, so a second removal path for the same request cannot deliver a second
+     * callback or leave a banner behind.
+     */
+    private fun finish(
+        request: AndroidPrompt,
+        approved: Boolean,
+        challenge: ByteArray?,
+        explicitDenial: Boolean,
+    ) {
+        // Launch callback on IO dispatcher to avoid NetworkOnMainThreadException: both transports'
+        // callbacks write to a socket or a GATT link, and the callers include a receiver and
+        // activities, so delivering inline would run that I/O on the main thread.
+        scope.launch { request.callback(approved, challenge, explicitDenial) }
+
+        try {
+            val notificationId = notificationIdFor(request.challenge)
+            Log.d(
+                TAG,
+                "Cancelling notification for request ${request.requestId} (id=$notificationId)",
+            )
+            NotificationManagerCompat.from(request.appContext).cancel(notificationId)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to dismiss notification for ${request.requestId}: ${e.message}")
+        }
+    }
+
     companion object {
         private const val TAG = "AuthRequestManager"
 
-        // Notification IDs derived from challenge so multiple requests can coexist and be
-        // individually dismissed.
+        /**
+         * The only amount by which the entry can outlive the banner.
+         *
+         * The entry's deadline is `registration + remainingTimeout + EXPIRY_SLACK_MS`, while
+         * `setTimeoutAfter(remainingTimeout)` counts from when the notification is posted, so the
+         * overshoot is `EXPIRY_SLACK_MS - postingLatency`: the slack is the bound and the latency
+         * only shrinks it. A notification whose construction takes longer than this gap releases
+         * the entry first, which costs nothing but a tap landing on [handleResponse]'s unknown-id
+         * path.
+         */
+        private const val EXPIRY_SLACK_MS = 250L
+
+        // Notification IDs are derived from the challenge bytes (see [notificationIdFor]) so
+        // several prompts can coexist and be dismissed individually.
 
         const val ACTION_AUTH_REQUEST = "dev.rourunisen.tapauth.AUTH_REQUEST"
         const val EXTRA_AUTH_REQUEST = "auth_request"
@@ -605,40 +650,215 @@ class AuthRequestManager private constructor() {
         }
 
         /**
-         * Signs the auth challenge using the device's private key and submits an approved response
-         * through AuthRequestManager.
+         * Submits an approved response for [authRequest] through AuthRequestManager.
+         *
+         * v2 signs only the WrapperMessage: Rust computes the single Ed25519 signature over the
+         * grant (via `createGrantWrapperMessage`), so the raw 32-byte challenge is what the
+         * callback must carry. Signing it here as well would replace the challenge with a 64-byte
+         * signature and every approval would fail verification.
          */
         fun approveRequest(context: Context, authRequest: AuthRequest) {
             try {
-                val keypairRepo = KeypairRepository(context)
-                val privateKey = keypairRepo.getPrivateKey()
                 Log.d(
                     TAG,
-                    "Signing challenge (trunc): ${authRequest.challenge.take(8).joinToString("") { "%02x".format(it) }}…",
+                    "Approving challenge (trunc): ${authRequest.challenge.take(8).joinToString("") { "%02x".format(it) }}…",
                 )
-                val signedChallenge =
-                    dev.rourunisen.tapauth.crypto.signData(
-                        privateKey,
-                        authRequest.challenge,
-                    )
-                Log.d(TAG, "Successfully signed challenge (${signedChallenge.size} bytes)")
                 getInstance()
                     .handleResponse(
                         authRequest.requestId,
                         approved = true,
-                        signedChallenge = signedChallenge,
+                        challenge = authRequest.challenge,
                     )
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to sign challenge", e)
+                Log.e(TAG, "Failed to submit approval", e)
                 getInstance()
                     .handleResponse(
                         authRequest.requestId,
                         approved = false,
-                        signedChallenge = null,
+                        challenge = null,
                         explicitDenial = false,
                     )
             }
         }
+    }
+}
+
+/**
+ * What the owning structure needs to know about a prompt: its identity, the two keys the views
+ * match on, and its own deadline. Nothing here is an Android type, and the payload a caller needs
+ * back at release time (a `Context`, a callback) stays in the caller's own record - the registry is
+ * parameterised over it ([T]) rather than storing it as a nullable field the registry can never
+ * reach for.
+ */
+internal interface PendingPrompt {
+    val requestId: String
+    val challenge: ByteArray
+    val bleDeviceAddress: String?
+    val deadlineMs: Long
+}
+
+/**
+ * The one owning structure for pending prompts, with no Android framework type in its state.
+ *
+ * A prompt used to be spread over four co-equal maps (by id, by Base64 challenge, by BLE address,
+ * plus the cancel records), each of which every removal path had to clean by hand, so one missed
+ * clean silently broke a *different* feature: a missed id leaked a prompt no timeout would ever
+ * collect, a missed index entry made the phone's Cancel stop working for that prompt. Here the
+ * entry is the state, [release] is the only way out of the map, and the challenge/device views are
+ * computed by scanning it — so the views cannot disagree with the map, and there is nothing to
+ * forget.
+ *
+ * [clock] is injected and [scheduleExpiry] is the only way anything later than this call happens:
+ * registration arms it, so "every entry is released by its deadline" is a property of [register]
+ * rather than something each call site has to remember. Cancellation compares challenge bytes with
+ * `contentEquals` rather than a Base64 key: under `unitTests.isReturnDefaultValues = true`
+ * (app/build.gradle.kts) `android.util.Base64.encodeToString` returns null and
+ * `SystemClock.elapsedRealtime` returns 0, so either would make this class untestable off-device.
+ *
+ * The realistic population is 1–3 prompts (`sessionTimeoutSeconds` defaults to 120 s and a UDP
+ * burst is at most 3 per 2 s), which is what makes the scan cheaper than the bookkeeping — the old
+ * code's own "in case index missed older entries" fallback scan said the same.
+ */
+internal class PendingRequestRegistry<T : PendingPrompt>(
+    private val clock: () -> Long,
+    private val scheduleExpiry: (delayMs: Long) -> Unit,
+) {
+
+    private val pending = ConcurrentHashMap<String, T>()
+
+    /** Recently cancelled challenges (by content) and when the cancel was seen, in [clock]. */
+    private val cancelledChallenges = ConcurrentHashMap<List<Byte>, Long>()
+
+    /** What [register] did with the prompt it was handed. */
+    enum class Registration {
+        /** Stored and swept: the prompt is answerable until its deadline. */
+        Registered,
+
+        /**
+         * Its challenge had been cancelled: nothing is stored, nothing is armed, the entry is the
+         * caller's to answer as cancelled.
+         */
+        RefusedCancelled,
+
+        /**
+         * A canceller claimed the entry between the insert and the cancelled-challenge check and
+         * has already answered it: nothing is stored and nothing is armed, and the caller must
+         * **not** answer it again - the client has its one response for this request.
+         */
+        AlreadyClaimed,
+    }
+
+    /** The clock the deadlines and the cancel window are measured on. */
+    fun now(): Long = clock()
+
+    /**
+     * Stores [request] as answerable, arming its deadline sweep; or reports why it did not.
+     *
+     * The cancelled-challenge check runs *after* the insert, which is what closes the window
+     * between a submit and a cancel that raced it. The canceller marks before it scans, so a cancel
+     * whose scan missed this entry marked before the insert, and this re-check sees that mark;
+     * survival would need the scan to precede the insert and this check to precede the mark, i.e.
+     * scan < insert < re-check < mark, which contradicts the canceller's mark < scan.
+     *
+     * The re-check also has to tell apart the two ways the insert can fail to stand: nobody had the
+     * entry ([Registration.RefusedCancelled], so the caller owes the client an answer) and the
+     * canceller already claimed and answered it ([Registration.AlreadyClaimed], so nothing is owed
+     * and a second answer would be a duplicate denial on the wire).
+     */
+    fun register(request: T): Registration {
+        pending[request.requestId] = request
+        if (!isCancelled(request.challenge)) {
+            // `delay(0)` returns immediately and a negative delay would be no wait at all, i.e. a
+            // prompt nothing ever collects, so a deadline already behind the clock still gets a
+            // real wait. Armed last: a registration that did not stand leaves no sweep behind.
+            scheduleExpiry((request.deadlineMs - clock()).coerceAtLeast(1L))
+            return Registration.Registered
+        }
+        // The identity check is the claim itself: if the rollback removes the very entry that was
+        // inserted, this call is the one that took it back; if it removes nothing, another path
+        // (the canceller's scan) claimed it and now owns this request's single answer.
+        return if (pending.remove(request.requestId) === request) {
+            Registration.RefusedCancelled
+        } else {
+            Registration.AlreadyClaimed
+        }
+    }
+
+    fun find(requestId: String): T? = pending[requestId]
+
+    fun has(requestId: String): Boolean = pending.containsKey(requestId)
+
+    /** An immutable snapshot: the caller can neither mutate nor outlive the registry's state. */
+    fun activeIds(): Set<String> = pending.keys.toSet()
+
+    /**
+     * Atomically claims [requestId] out of the registry and hands it back.
+     *
+     * This is the only way a prompt stops being pending, and [ConcurrentHashMap.remove] gives the
+     * entry to exactly one caller: a second release of the same id - a duplicate response, a sweep
+     * racing a dismissal - returns null and runs no side effect.
+     */
+    fun release(requestId: String): T? = pending.remove(requestId)
+
+    /** Claims and returns every prompt carrying [challenge]; empty when none does. */
+    fun releaseByChallenge(challenge: ByteArray): List<T> = claimAll {
+        it.challenge.contentEquals(challenge)
+    }
+
+    /** Claims and returns every prompt registered on [bleDeviceAddress]. */
+    fun releaseByBleDevice(bleDeviceAddress: String): List<T> = claimAll {
+        it.bleDeviceAddress == bleDeviceAddress
+    }
+
+    /** Claims and returns every prompt whose deadline has passed at [now]; idempotent. */
+    fun releaseExpired(now: Long = clock()): List<T> = claimAll {
+        now >= it.deadlineMs
+    }
+
+    /**
+     * Claims every entry matching [predicate].
+     *
+     * The claim is per entry and atomic, so a concurrently released entry is simply not returned
+     * here, and an entry that another thread claims between the scan and this call is not returned
+     * twice.
+     */
+    private fun claimAll(predicate: (T) -> Boolean): List<T> {
+        val claimed = mutableListOf<T>()
+        for (request in pending.values) {
+            if (predicate(request) && claim(request)) claimed += request
+        }
+        return claimed
+    }
+
+    /**
+     * Removes [request] and reports whether this call was the one that removed it: `remove` hands
+     * the value to exactly one caller, and the identity check keeps the release honest if the same
+     * id were ever reused for a later prompt.
+     */
+    private fun claim(request: T): Boolean = pending.remove(request.requestId) === request
+
+    /** Remembers [challenge] as cancelled for [CANCEL_TTL_MS] from [now]. */
+    fun markCancelled(challenge: ByteArray) {
+        val now = clock()
+        cancelledChallenges[challenge.toList()] = now
+        pruneCancelledChallenges(now)
+    }
+
+    /** Whether [challenge] was cancelled within the last [CANCEL_TTL_MS]. */
+    fun isCancelled(challenge: ByteArray): Boolean {
+        val now = clock()
+        pruneCancelledChallenges(now)
+        return cancelledChallenges.containsKey(challenge.toList())
+    }
+
+    /** Drops cancel records older than [CANCEL_TTL_MS], so the map cannot grow without bound. */
+    fun pruneCancelledChallenges(now: Long = clock()) {
+        cancelledChallenges.entries.removeIf { (_, ts) -> now - ts > CANCEL_TTL_MS }
+    }
+
+    companion object {
+        /** How long a cancellation intent outlives the message that carried it, in ms. */
+        const val CANCEL_TTL_MS = 10_000L
     }
 }
 
@@ -647,3 +867,36 @@ private fun ByteArray.toHexPreview(maxBytes: Int = 8): String {
     return this.take(take).joinToString("") { "%02x".format(it) } +
         if (this.size > take) "…" else ""
 }
+
+/** The `commandPreview=` value every non-E2E build logs: the size, and never the argv. */
+private fun previewFact(commandPreview: String): String =
+    "<${commandPreview.length} chars, E2E build only>"
+
+/**
+ * Build the `Auth request caller context:` line [AuthRequestManager.submitRequest] logs.
+ *
+ * [includeCommandPreview] is `BuildConfig.E2E_TESTING` at the call site, and it gates the preview
+ * *content* only: the preview is the desktop process's own argv, which carries `-p <password>`,
+ * `--token` and `Authorization` headers in ordinary use, and `Log.d` survives into release builds,
+ * so logging it would leak the credential into any `adb logcat` capture or bug report. The `e2e`
+ * build variant — which `scripts/test-e2e.sh` installs — gets the content so the suite can prove
+ * `command_preview` was derived by the daemon and delivered to the phone; release and debug log
+ * [previewFact] instead.
+ *
+ * The flag is a parameter rather than a `BuildConfig` read because `testBuildType = "e2e"`
+ * (app/build.gradle.kts) makes `BuildConfig.E2E_TESTING` true in every JVM unit test, so a test
+ * that read it directly could only ever exercise the E2E branch.
+ *
+ * Values are scrubbed by [scrubLogValue] before interpolation (newlines, control characters, the
+ * 200-character cap) — see the rationale there; the E2E form needs that formatting because it still
+ * logs the value.
+ */
+internal fun callerContextLogLine(
+    pamService: String,
+    processName: String,
+    commandPreview: String,
+    includeCommandPreview: Boolean,
+): String =
+    "Auth request caller context: pamService=${scrubLogValue(pamService)}, " +
+        "processName=${scrubLogValue(processName)}, commandPreview=" +
+        if (includeCommandPreview) scrubLogValue(commandPreview) else previewFact(commandPreview)

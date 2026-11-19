@@ -24,7 +24,9 @@ class AppConfiguration private constructor(context: Context) {
         private const val KEY_BLE_RUNNING = "ble_running"
 
         // Default values per specification
-        private const val DEFAULT_UDP_PORT = 36692
+        // Internal, not private: `SharedProtocolLiteralsTest` pins it against
+        // `config.toml.example` and the daemon's own default.
+        internal const val DEFAULT_UDP_PORT = 36692
         private const val DEFAULT_SESSION_TIMEOUT = 120L // 120 seconds per spec
         private const val DEFAULT_BLE_ENABLED = true
         private const val DEFAULT_UDP_ENABLED = true

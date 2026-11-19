@@ -20,11 +20,11 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci.yml'
-  # No `paths:` here: these jobs are required status checks, and a required
-  # check cannot be path-filtered — GitHub leaves a check whose run was skipped
-  # `Pending` forever, so the PR could be neither merged nor queued.
+  # No `paths:` and no `branches:` here: these jobs are required status checks,
+  # and a required check cannot be filtered — GitHub leaves a check whose run was
+  # skipped `Pending` forever. `branches:` filters on the base branch, so a
+  # stacked PR onto an integration branch must still report every context.
   pull_request:
-    branches: [main]
   # No `paths:` here either: GitHub supports no path filters on merge_group.
   merge_group:
     types: [checks_requested]
@@ -82,6 +82,14 @@ jobs:
 
       - name: "Run clippy (state-dir override only)"
         run: cargo clippy -p tapauthd --no-default-features --features dev-state-override --all-targets -- -D warnings
+
+      # `tpm` is a pure cfg gate (`shared/Cargo.toml`: `tpm = []`), so compiling it
+      # needs no TPM device and no `tpm2-tools` (that is a runtime shell-out only).
+      # Nothing else in CI enabled the feature — only `install.sh --tpm` builds it —
+      # so a regression inside it would have shipped unseen. `--features` is
+      # ambiguous on a virtual workspace, hence the explicit package list.
+      - name: "Run clippy (TPM feature)"
+        run: cargo clippy -p shared -p tapauthd -p client-pam -p client-config-gui --all-targets --features tpm -- -D warnings
 
   production-guard:
     name: Production Build Override Scan
@@ -169,6 +177,17 @@ jobs:
 
       - name: Run tests for shared library (with jni feature)
         run: cargo test --manifest-path shared/Cargo.toml --features jni --verbose
+
+      # The wire-level half of the spoofed-source pair
+      # (`transport::udp::tests::a_spoofed_source_on_the_wire_is_not_recorded`)
+      # is compiled only for `dev-udp-loopback`, because the receive-filter
+      # bypass it exercises lives behind that feature in `shared`; the
+      # default-feature workspace run further down never executed it — clippy
+      # only compiled it. This is the one step that runs it. The feature set is
+      # exactly what that test needs: no `ble`, no `firewall`, and no other dev
+      # knob (a shipped build must never carry one).
+      - name: "Run tapauthd tests (UDP loopback: a spoofed on-wire source is not recorded)"
+        run: cargo test -p tapauthd --no-default-features --features dev-udp-loopback --verbose
 
       - name: Run tests for client PAM module
         run: cargo test --manifest-path client-pam/Cargo.toml --verbose

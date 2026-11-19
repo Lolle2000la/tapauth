@@ -23,10 +23,13 @@
     <string name="pairing_finalizing">Finalizing pairing…</string>
     <string name="pairing_success">Pairing Successful!</string>
     <string name="pairing_success_message">Your device is now paired and ready for authentication</string>
+    <string name="pairing_proof_undelivered">This phone saved the pairing, but it could not confirm that your computer received it, so your computer may not be paired. If it is not paired, remove the device here and pair again.</string>
     <string name="pairing_failed">Pairing Failed</string>
     <string name="pairing_user_cancelled">User cancelled</string>
     <string name="pairing_no_ip">No IP address available</string>
     <string name="pairing_cancelled_message">Pairing cancelled</string>
+    <string name="pairing_via_bluetooth">via Bluetooth</string>
+    <string name="pairing_via_network">via network</string>
 
     <!-- QR Scanner Screen -->
     <string name="scanner_title">Scan QR Code</string>
@@ -109,9 +112,6 @@
     <string name="settings_allow_background_dialog_message">To ensure TapAuth can respond to authentication requests while the app is closed, please allow the app to be excluded from battery optimizations. You will be taken to the system settings screen to do this.</string>
     <string name="settings_footer">TapAuth - Secure biometric authentication</string>
     <string name="settings_app_version">App Version</string>
-    <string name="settings_protocol_version">Protocol Version</string>
-    <string name="settings_encryption">Encryption</string>
     <string name="settings_key_exchange">Key Exchange</string>
-    <string name="settings_signing">Signing</string>
     <string name="settings_never">never</string>
 </resources>

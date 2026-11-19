@@ -1,0 +1,785 @@
+{
+  "about": "Canonical vectors for the context-string sanitizer. Read by the Rust test `test_context_sanitizer_vectors_are_honoured` in shared/src/protocol/messages/context.rs (via include_str!) and by ContextSanitizerTest.kt in server-android (same path, resolved from the Gradle test working directory server-android/app). Both implementations must reproduce every expected value: add a case here, never in one suite only.",
+  "cases": [
+    {
+      "name": "tab and newline collapse to one space",
+      "input": "sudo\tapt\nupdate",
+      "max_bytes": 128,
+      "expected": "sudo apt update"
+    },
+    {
+      "name": "whitespace runs collapse and both ends trim",
+      "input": "  a \t\n  b  ",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "CSI colour codes are removed as a unit",
+      "input": "\u001b[31mroot\u001b[0m",
+      "max_bytes": 128,
+      "expected": "root"
+    },
+    {
+      "name": "non-breaking space collapses",
+      "input": "a\u00a0b",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "unterminated CSI is removed to end of input",
+      "input": "x\u001b[31",
+      "max_bytes": 128,
+      "expected": "x"
+    },
+    {
+      "name": "OSC terminated by BEL is removed",
+      "input": "a\u001b]0;evil\u0007b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "OSC terminated by ESC backslash is removed",
+      "input": "a\u001b]8;;http://evil.example\u001b\\b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "unterminated OSC is removed to end of input",
+      "input": "a\u001b]0;evil",
+      "max_bytes": 128,
+      "expected": "a"
+    },
+    {
+      "name": "lone ESC is dropped and the next byte filtered normally",
+      "input": "a\u001bb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "lone ESC at end of input is dropped",
+      "input": "ab\u001b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "CSI with parameters is removed",
+      "input": "\u001b[1;31;48;5;196mred",
+      "max_bytes": 128,
+      "expected": "red"
+    },
+    {
+      "name": "CSI with an intermediate byte is removed",
+      "input": "x\u001b[1 qb",
+      "max_bytes": 128,
+      "expected": "xb"
+    },
+    {
+      "name": "right-to-left override cannot reorder the prompt",
+      "input": "safe\u202eevil\u202e.exe",
+      "max_bytes": 128,
+      "expected": "safeevil.exe"
+    },
+    {
+      "name": "C1 NEL is whitespace, not a control to delete",
+      "input": "a\u0085b",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace-only input becomes empty",
+      "input": " \t\n\u00a0\u3000 ",
+      "max_bytes": 128,
+      "expected": ""
+    },
+    {
+      "name": "empty input",
+      "input": "",
+      "max_bytes": 128,
+      "expected": ""
+    },
+    {
+      "name": "nothing to truncate",
+      "input": "sudo",
+      "max_bytes": 128,
+      "expected": "sudo"
+    },
+    {
+      "name": "whitespace U+0009 collapses",
+      "input": "a\tb",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+000A collapses",
+      "input": "a\nb",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+000B collapses",
+      "input": "a\u000bb",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+000C collapses",
+      "input": "a\fb",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+000D collapses",
+      "input": "a\rb",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+0020 collapses",
+      "input": "a b",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+0085 collapses",
+      "input": "a\u0085b",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+00A0 collapses",
+      "input": "a\u00a0b",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+1680 collapses",
+      "input": "a\u1680b",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+2000 collapses",
+      "input": "a\u2000b",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+2001 collapses",
+      "input": "a\u2001b",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+2002 collapses",
+      "input": "a\u2002b",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+2003 collapses",
+      "input": "a\u2003b",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+2004 collapses",
+      "input": "a\u2004b",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+2005 collapses",
+      "input": "a\u2005b",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+2006 collapses",
+      "input": "a\u2006b",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+2007 collapses",
+      "input": "a\u2007b",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+2008 collapses",
+      "input": "a\u2008b",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+2009 collapses",
+      "input": "a\u2009b",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+200A collapses",
+      "input": "a\u200ab",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+2028 collapses",
+      "input": "a\u2028b",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+2029 collapses",
+      "input": "a\u2029b",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+202F collapses",
+      "input": "a\u202fb",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+205F collapses",
+      "input": "a\u205fb",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "whitespace U+3000 collapses",
+      "input": "a\u3000b",
+      "max_bytes": 128,
+      "expected": "a b"
+    },
+    {
+      "name": "forbidden U+0000 is dropped",
+      "input": "a\u0000b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0001 is dropped",
+      "input": "a\u0001b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0002 is dropped",
+      "input": "a\u0002b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0003 is dropped",
+      "input": "a\u0003b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0004 is dropped",
+      "input": "a\u0004b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0005 is dropped",
+      "input": "a\u0005b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0006 is dropped",
+      "input": "a\u0006b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0007 is dropped",
+      "input": "a\u0007b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0008 is dropped",
+      "input": "a\bb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+000E is dropped",
+      "input": "a\u000eb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+000F is dropped",
+      "input": "a\u000fb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0010 is dropped",
+      "input": "a\u0010b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0011 is dropped",
+      "input": "a\u0011b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0012 is dropped",
+      "input": "a\u0012b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0013 is dropped",
+      "input": "a\u0013b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0014 is dropped",
+      "input": "a\u0014b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0015 is dropped",
+      "input": "a\u0015b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0016 is dropped",
+      "input": "a\u0016b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0017 is dropped",
+      "input": "a\u0017b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0018 is dropped",
+      "input": "a\u0018b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0019 is dropped",
+      "input": "a\u0019b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+001A is dropped",
+      "input": "a\u001ab",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+001B is dropped",
+      "input": "a\u001bb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+001C is dropped",
+      "input": "a\u001cb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+001D is dropped",
+      "input": "a\u001db",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+001E is dropped",
+      "input": "a\u001eb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+001F is dropped",
+      "input": "a\u001fb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+007F is dropped",
+      "input": "a\u007fb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0080 is dropped",
+      "input": "a\u0080b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0081 is dropped",
+      "input": "a\u0081b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0082 is dropped",
+      "input": "a\u0082b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0083 is dropped",
+      "input": "a\u0083b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0084 is dropped",
+      "input": "a\u0084b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0086 is dropped",
+      "input": "a\u0086b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0087 is dropped",
+      "input": "a\u0087b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0088 is dropped",
+      "input": "a\u0088b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0089 is dropped",
+      "input": "a\u0089b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+008A is dropped",
+      "input": "a\u008ab",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+008B is dropped",
+      "input": "a\u008bb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+008C is dropped",
+      "input": "a\u008cb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+008D is dropped",
+      "input": "a\u008db",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+008E is dropped",
+      "input": "a\u008eb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+008F is dropped",
+      "input": "a\u008fb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0090 is dropped",
+      "input": "a\u0090b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0091 is dropped",
+      "input": "a\u0091b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0092 is dropped",
+      "input": "a\u0092b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0093 is dropped",
+      "input": "a\u0093b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0094 is dropped",
+      "input": "a\u0094b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0095 is dropped",
+      "input": "a\u0095b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0096 is dropped",
+      "input": "a\u0096b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0097 is dropped",
+      "input": "a\u0097b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0098 is dropped",
+      "input": "a\u0098b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+0099 is dropped",
+      "input": "a\u0099b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+009A is dropped",
+      "input": "a\u009ab",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+009B is dropped",
+      "input": "a\u009bb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+009C is dropped",
+      "input": "a\u009cb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+009D is dropped",
+      "input": "a\u009db",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+009E is dropped",
+      "input": "a\u009eb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+009F is dropped",
+      "input": "a\u009fb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+061C is dropped",
+      "input": "a\u061cb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+200B is dropped",
+      "input": "a\u200bb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+200C is dropped",
+      "input": "a\u200cb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+200D is dropped",
+      "input": "a\u200db",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+200E is dropped",
+      "input": "a\u200eb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+200F is dropped",
+      "input": "a\u200fb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+202A is dropped",
+      "input": "a\u202ab",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+202B is dropped",
+      "input": "a\u202bb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+202C is dropped",
+      "input": "a\u202cb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+202D is dropped",
+      "input": "a\u202db",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+202E is dropped",
+      "input": "a\u202eb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+2060 is dropped",
+      "input": "a\u2060b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+2061 is dropped",
+      "input": "a\u2061b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+2062 is dropped",
+      "input": "a\u2062b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+2063 is dropped",
+      "input": "a\u2063b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+2064 is dropped",
+      "input": "a\u2064b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+2066 is dropped",
+      "input": "a\u2066b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+2067 is dropped",
+      "input": "a\u2067b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+2068 is dropped",
+      "input": "a\u2068b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+2069 is dropped",
+      "input": "a\u2069b",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "forbidden U+FEFF is dropped",
+      "input": "a\ufeffb",
+      "max_bytes": 128,
+      "expected": "ab"
+    },
+    {
+      "name": "truncation: ascii budget keeps the ellipsis inside it",
+      "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "max_bytes": 10,
+      "expected": "aaaaaaa\u2026"
+    },
+    {
+      "name": "truncation: never splits a 3-byte code point",
+      "input": "\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac\u20ac",
+      "max_bytes": 10,
+      "expected": "\u20ac\u20ac\u2026"
+    },
+    {
+      "name": "truncation: never splits a 4-byte code point",
+      "input": "\ud83d\ude00\ud83d\ude00",
+      "max_bytes": 7,
+      "expected": "\ud83d\ude00\u2026"
+    },
+    {
+      "name": "truncation: max_bytes == 4 fits only the ellipsis",
+      "input": "\u20ac\u20ac",
+      "max_bytes": 4,
+      "expected": "\u2026"
+    },
+    {
+      "name": "truncation: max_bytes == 3 keeps a 3-byte char and adds no ellipsis",
+      "input": "\u20ac\u20ac",
+      "max_bytes": 3,
+      "expected": "\u20ac"
+    },
+    {
+      "name": "truncation: max_bytes == 2 fits nothing",
+      "input": "\u20ac\u20ac",
+      "max_bytes": 2,
+      "expected": ""
+    },
+    {
+      "name": "truncation: max_bytes == 0 yields empty",
+      "input": "anything",
+      "max_bytes": 0,
+      "expected": ""
+    },
+    {
+      "name": "truncation: a cut right after a space keeps that space",
+      "input": "ab cdef",
+      "max_bytes": 6,
+      "expected": "ab \u2026"
+    }
+  ]
+}
