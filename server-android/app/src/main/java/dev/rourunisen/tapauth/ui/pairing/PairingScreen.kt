@@ -17,68 +17,77 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.rourunisen.tapauth.R
-import dev.rourunisen.tapauth.data.DeviceRepository
 import dev.rourunisen.tapauth.data.PairingUrl
-import dev.rourunisen.tapauth.network.PairingClient
-import dev.rourunisen.tapauth.network.PairingResult
-import kotlinx.coroutines.launch
+import dev.rourunisen.tapauth.network.PairingTransport
+import dev.rourunisen.tapauth.network.PairingUpdate
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PairingScreen(
     pairingUrl: PairingUrl,
+    viewModel: PairingViewModel,
     onPairingComplete: () -> Unit,
     onPairingFailed: (String) -> Unit,
     onBack: () -> Unit,
 ) {
-    var pairingState by remember { mutableStateOf<PairingState>(PairingState.Connecting) }
-    val scope = rememberCoroutineScope()
     val context = LocalContext.current
-    val pairingClient = remember { PairingClient(context) }
-    val deviceRepository = remember { DeviceRepository(context) }
+    // The session lives in the ViewModel, so this collector only renders what it reports.
+    val update by viewModel.update.collectAsState()
 
-    // Handle system back button
-    BackHandler(onBack = onBack)
+    // Idempotent: an attempt that is still running for this QR code is reused, so a re-created
+    // composition (rotation) re-attaches to it instead of starting a second handshake.
+    LaunchedEffect(pairingUrl) { viewModel.beginPairing(pairingUrl) }
 
-    LaunchedEffect(pairingUrl) {
-        scope.launch {
-            // Prefer IPv4 if available, fallback to IPv6
-            val ipAddress =
-                pairingUrl.ipv4
-                    ?: pairingUrl.ipv6
-                    ?: run {
-                        pairingState =
-                            PairingState.Failed(context.getString(R.string.pairing_no_ip))
-                        return@launch
+    // Terminal outcomes arrive as events, once each, from the ViewModel. They are deliberately not
+    // re-derived from the collected state: that state stays `Complete` after a successful pairing,
+    // so a screen seeded with it would report the previous attempt's outcome as the *next* one's
+    // and send the user straight back to Home — before the new session's `Connecting` even reached
+    // the collector, leaving that session running with no screen to show its SAS.
+    LaunchedEffect(Unit) {
+        viewModel.outcomes.collect { outcome ->
+            when (outcome) {
+                // A `Complete` whose proof never reached the desktop is not a pairing the user can
+                // use: the desktop will report the pairing as failed while this phone has a device
+                // record. It is reported as a failure, with what happened in the message, rather
+                // than being sent home as a success.
+                is PairingUpdate.Complete ->
+                    if (outcome.proofDelivered) {
+                        onPairingComplete()
+                    } else {
+                        onPairingFailed(context.getString(R.string.pairing_proof_undelivered))
                     }
-
-            // Phase 1: Initiate pairing and get SAS for verification
-            val initResult = pairingClient.initiatePairing(ipAddress, pairingUrl.port)
-
-            when (initResult) {
-                is dev.rourunisen.tapauth.network.PairingInitResult.AwaitingSASVerification -> {
-                    pairingState =
-                        PairingState.VerifySAS(
-                            sas = initResult.sas,
-                            socket = initResult.socket,
-                            psk = initResult.psk,
-                            clientEd25519Key = initResult.clientEd25519Key,
-                            clientDeviceName = initResult.clientDeviceName,
-                        )
-                }
-                is dev.rourunisen.tapauth.network.PairingInitResult.Error -> {
-                    pairingState = PairingState.Failed(initResult.message)
-                }
+                is PairingUpdate.Failed -> onPairingFailed(outcome.message)
+                PairingUpdate.Cancelled ->
+                    onPairingFailed(context.getString(R.string.pairing_cancelled_message))
+                else -> Unit
             }
         }
     }
+
+    // Disposing the composition is not a user decision. The ViewModel keeps the session alive and
+    // sends no `PairingAbort`, which is what makes a rotation during the SAS a non-event; only the
+    // explicit exits below end the pairing.
+    DisposableEffect(pairingUrl) {
+        onDispose { viewModel.leave(PairingExit.ScreenDisposed) }
+    }
+
+    // A deliberate exit, by contrast, has to tell the desktop: the ViewModel aborts a live SAS
+    // prompt. It no longer waits here for the abort to be written, because the session outlives
+    // this screen — leaving immediately cannot cancel it. The one exception is a pairing whose
+    // confirmation is in flight: the ViewModel answers "deferred", which means the outcome has not
+    // been reported yet and leaving now would drop it, so the screen stays until it arrives.
+    val leavePairing: () -> Unit = {
+        if (!viewModel.leave(PairingExit.UserRequested)) onBack()
+    }
+
+    BackHandler(onBack = leavePairing)
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text(text = stringResource(R.string.pairing_title)) },
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
+                    IconButton(onClick = leavePairing) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = stringResource(R.string.general_back),
@@ -92,63 +101,47 @@ fun PairingScreen(
             modifier = Modifier.fillMaxSize().padding(padding),
             contentAlignment = Alignment.Center,
         ) {
-            when (val state = pairingState) {
-                is PairingState.Connecting -> {
+            when (val state = update) {
+                is PairingUpdate.Connecting -> {
                     ConnectingView()
                 }
-                is PairingState.VerifySAS -> {
+                is PairingUpdate.AwaitingSas -> {
                     VerifySASView(
                         sas = state.sas,
-                        onConfirm = {
-                            pairingState = PairingState.Confirming
-                            scope.launch {
-                                // Phase 2: Complete pairing after SAS verification
-                                val result =
-                                    pairingClient.completePairing(
-                                        socket = state.socket,
-                                        psk = state.psk,
-                                        clientEd25519Key = state.clientEd25519Key,
-                                        clientDeviceName = state.clientDeviceName,
-                                        sasConfirmed = true,
-                                    )
-
-                                when (result) {
-                                    is PairingResult.Success -> {
-                                        // Save device to repository
-                                        deviceRepository.savePairedDevice(result.device)
-                                        pairingState = PairingState.Success
-                                        onPairingComplete()
-                                    }
-                                    is PairingResult.Error -> {
-                                        pairingState = PairingState.Failed(result.message)
-                                        onPairingFailed(result.message)
-                                    }
-                                }
-                            }
-                        },
-                        onCancel = {
-                            // Close socket and discard PSK
-                            state.socket.close()
-                            state.psk.fill(0)
-                            pairingState =
-                                PairingState.Failed(
-                                    context.getString(R.string.pairing_user_cancelled),
-                                )
-                            onPairingFailed(context.getString(R.string.pairing_cancelled_message))
-                        },
+                        transport = state.transport,
+                        onConfirm = { viewModel.approveSas() },
+                        onCancel = { viewModel.rejectSas() },
                     )
                 }
-                is PairingState.Confirming -> {
+                is PairingUpdate.Confirming -> {
                     ConfirmingView()
                 }
-                is PairingState.Success -> {
-                    SuccessView(onDone = onPairingComplete)
+                is PairingUpdate.Complete -> {
+                    if (state.proofDelivered) {
+                        SuccessView(onDone = onPairingComplete)
+                    } else {
+                        // The record exists on this phone and the desktop never got the proof. Say
+                        // so: "Pairing Successful!" here would be a claim the other side of the
+                        // pairing does not share.
+                        FailedView(
+                            message = stringResource(R.string.pairing_proof_undelivered),
+                            onRetry = { viewModel.retry() },
+                            onBack = leavePairing,
+                        )
+                    }
                 }
-                is PairingState.Failed -> {
+                is PairingUpdate.Failed -> {
                     FailedView(
                         message = state.message,
-                        onRetry = { pairingState = PairingState.Connecting },
-                        onBack = onBack,
+                        onRetry = { viewModel.retry() },
+                        onBack = leavePairing,
+                    )
+                }
+                PairingUpdate.Cancelled -> {
+                    FailedView(
+                        message = stringResource(R.string.pairing_user_cancelled),
+                        onRetry = { viewModel.retry() },
+                        onBack = leavePairing,
                     )
                 }
             }
@@ -176,7 +169,12 @@ private fun ConnectingView() {
 }
 
 @Composable
-private fun VerifySASView(sas: String, onConfirm: () -> Unit, onCancel: () -> Unit) {
+private fun VerifySASView(
+    sas: String,
+    transport: PairingTransport,
+    onConfirm: () -> Unit,
+    onCancel: () -> Unit,
+) {
     Column(
         modifier = Modifier.fillMaxWidth().padding(32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -192,6 +190,17 @@ private fun VerifySASView(sas: String, onConfirm: () -> Unit, onCancel: () -> Un
             text = stringResource(R.string.pairing_compare_code),
             style = MaterialTheme.typography.bodyLarge,
             textAlign = TextAlign.Center,
+        )
+
+        Text(
+            text =
+                when (transport) {
+                    PairingTransport.BLE -> stringResource(R.string.pairing_via_bluetooth)
+                    PairingTransport.UDP -> stringResource(R.string.pairing_via_network)
+                },
+            style = MaterialTheme.typography.labelLarge,
+            textAlign = TextAlign.Center,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
         Card(
@@ -323,22 +332,4 @@ private fun FailedView(message: String, onRetry: () -> Unit, onBack: () -> Unit)
             }
         }
     }
-}
-
-private sealed class PairingState {
-    object Connecting : PairingState()
-
-    data class VerifySAS(
-        val sas: String,
-        val socket: java.net.Socket,
-        val psk: ByteArray,
-        val clientEd25519Key: ByteArray,
-        val clientDeviceName: String,
-    ) : PairingState()
-
-    object Confirming : PairingState()
-
-    object Success : PairingState()
-
-    data class Failed(val message: String) : PairingState()
 }

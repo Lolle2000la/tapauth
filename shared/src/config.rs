@@ -18,20 +18,23 @@
 //!   safely created then chowned to `tapauthd:tapauthd` to keep strict ownership
 //! - File permissions are enforced on every write operation and validated on reads
 
+mod storage;
 mod toml_config;
 
-pub use toml_config::{TapAuthConfig, DEFAULT_CONFIG_PATH, DEFAULT_PAM_REFUSED_SERVICES};
+pub use storage::{ensure_secure_directory, get_config_dir, read_secure_file, write_secure_file};
+pub use toml_config::{
+    bounded_pam_timeout, TapAuthConfig, DEFAULT_CONFIG_PATH, DEFAULT_PAM_REFUSED_SERVICES,
+    MAX_PAM_TIMEOUT_SECS,
+};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::fs;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::crypto::{ClientSymmetricKey, Ed25519KeyPair};
-use nix::unistd::{geteuid, User};
+use crate::protocol::pb::{HashAlgorithm, SignatureAlgorithm, SymmetricAlgorithm};
+use zeroize::Zeroizing;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -62,6 +65,9 @@ pub const CLIENT_KEY_FILE: &str = "client_key";
 /// Client symmetric key file
 pub const CLIENT_SYMMETRIC_KEY_FILE: &str = "client_symmetric_key";
 
+/// Client-wide algorithm metadata that accompanies the CSK (v2)
+pub const CSK_META_FILE: &str = "csk_meta.json";
+
 /// Check if the current process is running as root.
 ///
 /// ## Returns
@@ -76,164 +82,6 @@ pub const CLIENT_SYMMETRIC_KEY_FILE: &str = "client_symmetric_key";
 pub fn is_root() -> bool {
     // Use nix to query effective UID without unsafe
     nix::unistd::geteuid().as_raw() == 0
-}
-
-/// Get active state/config directory (allows override via TAPAUTH_STATE_DIR in development/testing)
-pub fn get_config_dir() -> PathBuf {
-    #[cfg(any(feature = "dev-state-override", test))]
-    if let Ok(dir) = std::env::var("TAPAUTH_STATE_DIR") {
-        return PathBuf::from(dir);
-    }
-    PathBuf::from(CONFIG_DIR)
-}
-
-/// Resolve the system user "tapauthd" to its UID (cached best-effort).
-fn tapauthd_uid() -> Option<u32> {
-    // If NSS lookup fails or user does not exist yet (during install), we return None
-    // and default to accepting only root-owned files. Callers must handle None.
-    User::from_name("tapauthd")
-        .ok()
-        .flatten()
-        .map(|u| u.uid.as_raw())
-}
-
-/// Whether the effective UID is the tapauthd user.
-fn is_euid_tapauthd() -> bool {
-    match tapauthd_uid() {
-        Some(uid) => geteuid().as_raw() == uid,
-        None => false,
-    }
-}
-
-/// Whether the effective UID is privileged for writes (tapauthd, root, or custom TAPAUTH_STATE_DIR)
-fn is_euid_privileged_for_writes() -> bool {
-    #[cfg(any(feature = "dev-state-override", test))]
-    if std::env::var("TAPAUTH_STATE_DIR").is_ok() {
-        return true;
-    }
-    is_euid_tapauthd() || nix::unistd::geteuid().as_raw() == 0
-}
-
-/// Chown a path to tapauthd:tapauthd when running as root
-/// If tapauthd user doesn't exist (e.g., during development), skip chown silently
-fn chown_to_tapauthd(path: &Path) -> Result<(), ConfigError> {
-    #[cfg(any(feature = "dev-state-override", test))]
-    if std::env::var("TAPAUTH_STATE_DIR").is_ok() {
-        return Ok(());
-    }
-    // Only attempt when running as root
-    if nix::unistd::geteuid().as_raw() != 0 {
-        return Ok(());
-    }
-    let user = match User::from_name("tapauthd").ok().flatten() {
-        Some(u) => u,
-        None => {
-            // tapauthd user doesn't exist (development mode or pre-install) - skip chown
-            tracing::debug!("tapauthd user not found, skipping chown (development mode)");
-            return Ok(());
-        }
-    };
-    let uid = user.uid.as_raw();
-    let gid = user.gid.as_raw();
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
-    let rc = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error().into())
-    }
-}
-
-/// Ensure configuration directory exists with strict permissions (700)
-pub fn ensure_secure_directory(path: &Path) -> Result<(), ConfigError> {
-    // Only tapauthd or root may create/modify; if root, we will chown to tapauthd
-    if !is_euid_privileged_for_writes() {
-        return Err(ConfigError::InsufficientPermissions);
-    }
-
-    if !path.exists() {
-        fs::create_dir_all(path)?;
-    }
-
-    // Set permissions to 700 (rwx for owner only)
-    let metadata = fs::metadata(path)?;
-    let mut permissions = metadata.permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(path, permissions)?;
-
-    // Ensure ownership is tapauthd:tapauthd when invoked as root
-    if !is_euid_tapauthd() {
-        chown_to_tapauthd(path)?;
-    }
-
-    Ok(())
-}
-
-/// Write data to a file with strict owner-only permissions (600)
-pub fn write_secure_file(path: &Path, data: &[u8]) -> Result<(), ConfigError> {
-    // Only tapauthd or root may write; if root, we will chown to tapauthd
-    if !is_euid_privileged_for_writes() {
-        tracing::error!("write_secure_file: insufficient permissions");
-        return Err(ConfigError::InsufficientPermissions);
-    }
-
-    tracing::debug!(
-        "write_secure_file: writing {} bytes to {:?}",
-        data.len(),
-        path
-    );
-    fs::write(path, data)?;
-    tracing::debug!("write_secure_file: write complete");
-
-    // Set permissions to 600 (rw for owner only)
-    let metadata = fs::metadata(path)?;
-    let mut permissions = metadata.permissions();
-    permissions.set_mode(0o600);
-    fs::set_permissions(path, permissions)?;
-    tracing::debug!("write_secure_file: permissions set to 0600");
-
-    // Ensure ownership is tapauthd:tapauthd when invoked as root
-    if !is_euid_tapauthd() {
-        tracing::debug!("write_secure_file: attempting chown to tapauthd");
-        chown_to_tapauthd(path)?;
-        tracing::debug!("write_secure_file: chown complete");
-    }
-
-    Ok(())
-}
-
-/// Read data from a secure file
-pub fn read_secure_file(path: &Path) -> Result<Vec<u8>, ConfigError> {
-    // Verify file permissions
-    let metadata = fs::metadata(path)?;
-    let permissions = metadata.permissions();
-
-    // Check ownership: accept root:root, tapauthd:tapauthd, or current user when TAPAUTH_STATE_DIR is active
-    let owner_uid = metadata.uid();
-    let current_euid = nix::unistd::geteuid().as_raw();
-    let tap_uid = tapauthd_uid();
-    #[cfg(any(feature = "dev-state-override", test))]
-    let is_dev_dir = std::env::var("TAPAUTH_STATE_DIR").is_ok();
-    #[cfg(not(any(feature = "dev-state-override", test)))]
-    let is_dev_dir = false;
-
-    let owner_ok = owner_uid == 0
-        || tap_uid.map(|u| owner_uid == u).unwrap_or(false)
-        || (is_dev_dir && owner_uid == current_euid);
-    if !owner_ok {
-        return Err(ConfigError::InsufficientPermissions);
-    }
-
-    // Check group/other permissions
-    let mode = permissions.mode() & 0o777;
-
-    // For simplicity and safety, enforce 0600 or 0400 for all files (keys and config)
-    if mode != 0o600 && mode != 0o400 {
-        return Err(ConfigError::InsufficientPermissions);
-    }
-
-    Ok(fs::read(path)?)
 }
 
 /// Client configuration
@@ -268,6 +116,14 @@ pub struct PairedServer {
     pub allowed_users: Vec<String>,
     /// When this pairing was created
     pub paired_at: chrono::DateTime<chrono::Utc>,
+    /// Signature algorithm negotiated with this server (`SignatureAlgorithm::Ed25519`
+    /// for a v1 pairing, which stored no algorithm).
+    #[serde(default = "default_signature_algorithm")]
+    pub signature_algorithm: SignatureAlgorithm,
+}
+
+fn default_signature_algorithm() -> SignatureAlgorithm {
+    SignatureAlgorithm::Ed25519
 }
 
 impl PairedServer {
@@ -301,6 +157,38 @@ impl PairedClient {
     /// SECURITY: Empty list means NO users allowed (prevents privilege escalation)
     pub fn is_user_allowed(&self, username: &str) -> bool {
         self.allowed_users.iter().any(|u| u == username)
+    }
+}
+
+/// Client-wide cryptographic algorithm metadata for the CSK.
+///
+/// One multicast/BLE advertisement targets every paired server at once, so the
+/// symmetric and hash algorithms are properties of the CSK, not of an individual
+/// pairing (cryptography-specification.md §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CskMetadata {
+    /// AEAD algorithm used for `EncryptedPacket.ciphertext`.
+    #[serde(default = "default_symmetric_algorithm")]
+    pub symmetric_algorithm: SymmetricAlgorithm,
+    /// Hash algorithm used for the rotating temporal identifiers.
+    #[serde(default = "default_hash_algorithm")]
+    pub hash_algorithm: HashAlgorithm,
+}
+
+fn default_symmetric_algorithm() -> SymmetricAlgorithm {
+    SymmetricAlgorithm::Aes256Gcm
+}
+
+fn default_hash_algorithm() -> HashAlgorithm {
+    HashAlgorithm::Sha256
+}
+
+impl Default for CskMetadata {
+    fn default() -> Self {
+        Self {
+            symmetric_algorithm: default_symmetric_algorithm(),
+            hash_algorithm: default_hash_algorithm(),
+        }
     }
 }
 
@@ -390,13 +278,13 @@ impl ClientConfigManager {
             return Err(ConfigError::InvalidConfig);
         }
 
-        let data = read_secure_file(&key_path)?;
+        let data = Zeroizing::new(read_secure_file(&key_path)?);
 
         if data.len() != 32 {
             return Err(ConfigError::InvalidConfig);
         }
 
-        let mut bytes = [0u8; 32];
+        let mut bytes = Zeroizing::new([0u8; 32]);
         bytes.copy_from_slice(&data);
 
         tracing::info!("Loaded Ed25519 keypair from file");
@@ -410,7 +298,10 @@ impl ClientConfigManager {
     pub fn save_keypair(&self, keypair: &Ed25519KeyPair) -> Result<(), ConfigError> {
         self.init()?;
 
-        let bytes = keypair.signing_key_bytes();
+        // Zeroization, same class as `load_keypair` (R2-L5, extended to the save
+        // side): `signing_key_bytes()` hands back a plain `[u8; 32]` that lives on
+        // the stack until this function returns, past the write it feeds.
+        let bytes = Zeroizing::new(keypair.signing_key_bytes());
 
         #[cfg(feature = "tpm")]
         {
@@ -426,12 +317,14 @@ impl ClientConfigManager {
 
                 let tpm_key_path = self.config_dir.join(format!("{}.tpm", CLIENT_KEY_FILE));
                 let pcr_list = toml_config.tpm_pcr_policy.pcr_list();
-                crate::tpm::seal_data_with_tpm(&bytes, &tpm_key_path, pcr_list).map_err(|e| {
-                    ConfigError::Io(std::io::Error::other(format!(
-                        "Failed to seal key with TPM: {}",
-                        e
-                    )))
-                })?;
+                crate::tpm::seal_data_with_tpm(&bytes[..], &tpm_key_path, pcr_list).map_err(
+                    |e| {
+                        ConfigError::Io(std::io::Error::other(format!(
+                            "Failed to seal key with TPM: {}",
+                            e
+                        )))
+                    },
+                )?;
 
                 tracing::info!(
                     "Sealed Ed25519 keypair with TPM using PCR policy {:?} (no plaintext backup)",
@@ -444,7 +337,7 @@ impl ClientConfigManager {
         // File-only mode: save plaintext with 600 permissions
         // (Also used when TPM feature is not compiled in)
         let key_path = self.config_dir.join(CLIENT_KEY_FILE);
-        write_secure_file(&key_path, &bytes)?;
+        write_secure_file(&key_path, &bytes[..])?;
         tracing::info!("Saved Ed25519 keypair to file");
 
         Ok(())
@@ -465,16 +358,16 @@ impl ClientConfigManager {
             return Err(ConfigError::InvalidConfig);
         }
 
-        let data = read_secure_file(&csk_path)?;
+        let data = Zeroizing::new(read_secure_file(&csk_path)?);
 
         if data.len() != 32 {
             return Err(ConfigError::InvalidConfig);
         }
 
-        let mut bytes = [0u8; 32];
+        let mut bytes = Zeroizing::new([0u8; 32]);
         bytes.copy_from_slice(&data);
 
-        Ok(ClientSymmetricKey::from_bytes(bytes))
+        Ok(ClientSymmetricKey::from_bytes(*bytes))
     }
 
     /// Save CSK
@@ -497,13 +390,85 @@ impl ClientConfigManager {
         self.config_dir.join(CLIENT_SYMMETRIC_KEY_FILE).exists()
     }
 
+    /// Load the CSK algorithm metadata.
+    ///
+    /// A missing `csk_meta.json` (a v1 state directory, or a CSK that predates
+    /// the metadata file) yields [`CskMetadata::default`]: AES-256-GCM + SHA-256,
+    /// the v1 wire behaviour.
+    pub fn load_csk_metadata(&self) -> Result<CskMetadata, ConfigError> {
+        let meta_path = self.config_dir.join(CSK_META_FILE);
+
+        if !meta_path.exists() {
+            return Ok(CskMetadata::default());
+        }
+
+        let data = read_secure_file(&meta_path)?;
+        let metadata = serde_json::from_slice(&data)?;
+        Ok(metadata)
+    }
+
+    /// Save the CSK algorithm metadata.
+    pub fn save_csk_metadata(&self, meta: &CskMetadata) -> Result<(), ConfigError> {
+        self.init()?;
+        let meta_path = self.config_dir.join(CSK_META_FILE);
+        let data = serde_json::to_vec_pretty(meta)?;
+        write_secure_file(&meta_path, &data)?;
+        Ok(())
+    }
+
+    /// Whether the CSK algorithm metadata file is present on disk
+    pub fn has_csk_metadata_file(&self) -> bool {
+        self.config_dir.join(CSK_META_FILE).exists()
+    }
+
+    /// Delete the CSK algorithm metadata file, if there is one.
+    ///
+    /// Used whenever the device set the metadata describes disappears (a CSK
+    /// rotation, the last un-pairing). Nothing to delete is not an error.
+    pub fn clear_csk_metadata(&self) -> Result<(), ConfigError> {
+        let meta_path = self.config_dir.join(CSK_META_FILE);
+        if meta_path.exists() {
+            fs::remove_file(meta_path)?;
+        }
+        Ok(())
+    }
+
+    /// Drop the CSK algorithm metadata once no paired server is left.
+    ///
+    /// The metadata records the algorithm pair the *paired devices* are committed
+    /// to (one broadcast reaches all of them). With none left there is no
+    /// commitment to honour, so a leftover file would pin a suite for a device
+    /// set that no longer exists; the next pairing must be free to negotiate, and
+    /// `persist_pairing` writes the file again once it has.
+    fn clear_csk_metadata_if_unpaired(
+        &self,
+        servers: &HashMap<String, PairedServer>,
+    ) -> Result<(), ConfigError> {
+        if servers.is_empty() {
+            self.clear_csk_metadata()?;
+        }
+        Ok(())
+    }
+
     /// Rotate CSK (generates new one, invalidating all pairings)
     pub fn rotate_csk(&self) -> Result<ClientSymmetricKey, ConfigError> {
-        // Delete all paired servers since they have the old CSK
-        let _ = self.clear_paired_servers();
+        // Delete all paired servers since they have the old CSK. A failure here
+        // aborts the rotation: swallowing it would leave devices holding the old
+        // CSK next to a freshly generated one, i.e. a pairing set that can never
+        // authenticate again and a caller that believes it succeeded.
+        self.clear_paired_servers()?;
+
+        // The negotiated algorithm pair described those devices too. It is
+        // removed rather than reset to the baseline: after a rotation nothing is
+        // pinned, so the next pairing negotiates a suite from scratch and records
+        // it on the way out. Writing a default file here would leave a
+        // commitment behind for a device set that no longer exists.
+        self.clear_csk_metadata()?;
 
         // Generate and save new CSK
-        self.generate_and_save_csk()
+        let csk = self.generate_and_save_csk()?;
+
+        Ok(csk)
     }
 
     /// Load paired servers
@@ -549,6 +514,7 @@ impl ClientConfigManager {
         let mut servers = self.load_paired_servers()?;
         servers.remove(id);
         self.save_paired_servers(&servers)?;
+        self.clear_csk_metadata_if_unpaired(&servers)?;
         Ok(())
     }
 
@@ -566,6 +532,7 @@ impl ClientConfigManager {
             if server.allowed_users.is_empty() {
                 servers.remove(id);
                 self.save_paired_servers(&servers)?;
+                self.clear_csk_metadata_if_unpaired(&servers)?;
                 Ok(true) // Entire pairing removed
             } else {
                 // Save with updated user list
@@ -573,7 +540,10 @@ impl ClientConfigManager {
                 Ok(false) // Only user removed
             }
         } else {
-            // Server not found - nothing to remove
+            // Server not found - nothing to remove. The set is unchanged, but a
+            // metadata file left over from an earlier, now empty set is still
+            // stale, so the pinning rule is re-asserted.
+            self.clear_csk_metadata_if_unpaired(&servers)?;
             Ok(true)
         }
     }
@@ -684,6 +654,7 @@ mod tests {
             public_key: "abc123".to_string(),
             allowed_users: vec!["alice".to_string(), "bob".to_string()],
             paired_at: chrono::Utc::now(),
+            signature_algorithm: SignatureAlgorithm::Ed25519,
         };
 
         // Allowed users should pass
@@ -703,6 +674,7 @@ mod tests {
             public_key: "abc123".to_string(),
             allowed_users: vec![],
             paired_at: chrono::Utc::now(),
+            signature_algorithm: SignatureAlgorithm::Ed25519,
         };
 
         // No user should be allowed when list is empty
@@ -728,5 +700,521 @@ mod tests {
         assert_eq!(client.public_key, deserialized.public_key);
         assert_eq!(client.csk, deserialized.csk);
         assert_eq!(client.allowed_users, deserialized.allowed_users);
+    }
+
+    /// A `PairedServer` must round-trip its negotiated signature algorithm, and
+    /// the JSON form must be the canonical proto name.
+    /// The defect this catches: the field silently dropped from the on-disk
+    /// record (so a re-pairing/restart forgets what the server negotiated).
+    #[test]
+    fn test_paired_server_signature_algorithm_roundtrip() {
+        let server = PairedServer {
+            name: "Phone".to_string(),
+            public_key: "abc123".to_string(),
+            allowed_users: vec!["alice".to_string()],
+            paired_at: chrono::Utc::now(),
+            signature_algorithm: SignatureAlgorithm::Ed25519,
+        };
+
+        let json = serde_json::to_string(&server).unwrap();
+        assert!(
+            json.contains("\"signature_algorithm\":\"ED25519\""),
+            "the canonical proto name must be persisted, got: {}",
+            json
+        );
+        let deserialized: PairedServer = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            deserialized.signature_algorithm,
+            SignatureAlgorithm::Ed25519
+        );
+        assert_eq!(deserialized.name, server.name);
+        assert_eq!(deserialized.public_key, server.public_key);
+        assert_eq!(deserialized.paired_at, server.paired_at);
+    }
+
+    /// A v1 `paired_servers.json` entry has no `signature_algorithm`; it must
+    /// load as Ed25519 rather than failing the whole file.
+    /// The defect this catches: an upgrade from v1 making every pairing
+    /// unreadable (the daemon would then see no paired devices at all).
+    #[test]
+    fn test_legacy_paired_server_defaults_to_ed25519() {
+        let legacy = r#"{
+            "name": "OldPhone",
+            "public_key": "deadbeef",
+            "allowed_users": ["alice"],
+            "paired_at": "2024-01-01T00:00:00Z"
+        }"#;
+
+        let server: PairedServer = serde_json::from_str(legacy).unwrap();
+        assert_eq!(server.signature_algorithm, SignatureAlgorithm::Ed25519);
+        assert_eq!(server.allowed_users, vec!["alice".to_string()]);
+    }
+
+    /// Only the canonical name string deserialises; the numeric form is rejected.
+    /// The defect this catches: an integer silently loading as the "same"
+    /// algorithm, which would keep a legacy numeric spelling alive in the config
+    /// contract (and let an out-of-range value be coerced instead of refused).
+    #[test]
+    fn test_signature_algorithm_accepts_name_only() {
+        let by_name = r#"{
+            "name": "Phone",
+            "public_key": "abc",
+            "allowed_users": [],
+            "paired_at": "2024-01-01T00:00:00Z",
+            "signature_algorithm": "ED25519"
+        }"#;
+        let server: PairedServer = serde_json::from_str(by_name).unwrap();
+        assert_eq!(server.signature_algorithm, SignatureAlgorithm::Ed25519);
+
+        let by_integer = r#"{
+            "name": "Phone",
+            "public_key": "abc",
+            "allowed_users": [],
+            "paired_at": "2024-01-01T00:00:00Z",
+            "signature_algorithm": 1
+        }"#;
+        assert!(serde_json::from_str::<PairedServer>(by_integer).is_err());
+
+        // An unknown name is rejected, not silently defaulted.
+        let bogus = r#"{
+            "name": "Phone",
+            "public_key": "abc",
+            "allowed_users": [],
+            "paired_at": "2024-01-01T00:00:00Z",
+            "signature_algorithm": "ED25519_TYPO"
+        }"#;
+        assert!(serde_json::from_str::<PairedServer>(bogus).is_err());
+    }
+
+    /// `CskMetadata::default()` is the v1 baseline pair, and an empty JSON object
+    /// (a metadata file written before any algorithm was negotiated) loads as it.
+    /// The defect this catches: a fresh/legacy metadata file defaulting to
+    /// anything other than AES-256-GCM + SHA-256, which would break the wire
+    /// format every already-paired server expects.
+    #[test]
+    fn test_csk_metadata_defaults_and_legacy_json() {
+        let default = CskMetadata::default();
+        assert_eq!(default.symmetric_algorithm, SymmetricAlgorithm::Aes256Gcm);
+        assert_eq!(default.hash_algorithm, HashAlgorithm::Sha256);
+
+        let legacy: CskMetadata = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy, default);
+
+        // Missing single field: only that one falls back (with one active primitive
+        // per slot the fallback and the explicit value are the same suite, so this
+        // exercises `serde(default)` on the omitted field, not a choice of value).
+        let partial: CskMetadata = serde_json::from_str(r#"{"hash_algorithm": "SHA256"}"#).unwrap();
+        assert_eq!(partial.symmetric_algorithm, SymmetricAlgorithm::Aes256Gcm);
+        assert_eq!(partial.hash_algorithm, HashAlgorithm::Sha256);
+    }
+
+    /// `CskMetadata` must survive a full JSON round-trip with the canonical names,
+    /// and a *retired* algorithm name written by a pre-release build must fail to
+    /// load instead of falling back to the baseline.
+    /// The defect this catches: a deserialiser that accepts any string it does not
+    /// recognise and defaults (a device then believes it shares a suite it does
+    /// not), or one that keeps aliasing the reserved tags onto live algorithms.
+    #[test]
+    fn test_csk_metadata_roundtrip() {
+        let metadata = CskMetadata {
+            symmetric_algorithm: SymmetricAlgorithm::Aes256Gcm,
+            hash_algorithm: HashAlgorithm::Sha256,
+        };
+
+        let json = serde_json::to_string(&metadata).unwrap();
+        assert!(
+            json.contains("\"symmetric_algorithm\":\"AES_256_GCM\""),
+            "unexpected JSON: {}",
+            json
+        );
+        assert!(
+            json.contains("\"hash_algorithm\":\"SHA256\""),
+            "unexpected JSON: {}",
+            json
+        );
+
+        let parsed: CskMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, metadata);
+
+        // A retired name is not "unknown-but-close": it is refused outright.
+        for retired in [
+            r#"{"symmetric_algorithm": "CHACHA20_POLY1305"}"#,
+            r#"{"hash_algorithm": "BLAKE3"}"#,
+            r#"{"symmetric_algorithm": "UNKNOWN_ALG"}"#,
+            r#"{"hash_algorithm": "UNKNOWN_ALG"}"#,
+            r#"{"symmetric_algorithm": "AES_256_GCM", "hash_algorithm": "BLAKE3"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<CskMetadata>(retired).is_err(),
+                "{retired} must not load"
+            );
+        }
+
+        // Integer values are rejected: the name is the only on-disk spelling, and
+        // the freed tag `2` in particular must never be read back as an algorithm.
+        for by_integer in [
+            r#"{"symmetric_algorithm": 2, "hash_algorithm": 2}"#,
+            r#"{"symmetric_algorithm": 1, "hash_algorithm": 1}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<CskMetadata>(by_integer).is_err(),
+                "{by_integer} must not load"
+            );
+        }
+    }
+
+    // ---- CSK metadata lifecycle ------------------------------------------
+
+    fn paired_server(id: &str) -> PairedServer {
+        PairedServer {
+            name: id.to_string(),
+            public_key: id.to_string(),
+            allowed_users: vec!["alice".to_string()],
+            paired_at: chrono::Utc::now(),
+            signature_algorithm: SignatureAlgorithm::Ed25519,
+        }
+    }
+
+    /// A `ClientConfigManager` rooted at a scratch state directory.
+    ///
+    /// `write_secure_file`/`read_secure_file` only accept a non-`tapauthd` owner
+    /// when `TAPAUTH_STATE_DIR` is set, and that value is process-wide, so the
+    /// directory is held exclusively for as long as this guard lives.
+    struct ScratchStateDir {
+        path: PathBuf,
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScratchStateDir {
+        fn new(tag: &str) -> Self {
+            static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            // A poisoned lock only means an earlier scratch test panicked; the
+            // directory it guarded is thrown away below either way.
+            let serial = SERIAL
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let path = PathBuf::from(format!(
+                "/tmp/opencode/tapauth-config-{}-{}",
+                tag,
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            std::env::set_var("TAPAUTH_STATE_DIR", &path);
+            Self {
+                path,
+                _serial: serial,
+            }
+        }
+
+        fn manager(&self) -> ClientConfigManager {
+            ClientConfigManager {
+                config_dir: self.path.clone(),
+            }
+        }
+    }
+
+    impl Drop for ScratchStateDir {
+        fn drop(&mut self) {
+            std::env::remove_var("TAPAUTH_STATE_DIR");
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Install one file into a scratch state directory as the daemon leaves it.
+    ///
+    /// The file is mode 0600 — the posture `write_secure_file` establishes and the
+    /// one `read_secure_file` accepts — and owned by the test user, the only
+    /// ownership an unprivileged test can produce (and the one accepted for a
+    /// `TAPAUTH_STATE_DIR`). No permission check is relaxed: the directory is
+    /// installed as a real daemon would have left it.
+    fn install_state_file(dir: &std::path::Path, name: &str, contents: &[u8]) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join(name);
+        fs::write(&path, contents).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// A rotation deletes every paired device, so nothing is left that the
+    /// negotiated algorithm pair could be pinned to.
+    ///
+    /// The defect this catches: `rotate_csk` writing `CskMetadata::default()`
+    /// after clearing the devices. The file then claims a commitment for pairings
+    /// that no longer exist, and any reader that trusts the file pins a suite the
+    /// next (first) pairing never negotiated.
+    #[test]
+    fn rotating_the_csk_leaves_nothing_pinned_for_a_renegotiation() {
+        let scratch = ScratchStateDir::new("rotate");
+        let manager = scratch.manager();
+        manager.save_csk_metadata(&CskMetadata::default()).unwrap();
+        manager
+            .add_paired_server("aa".to_string(), paired_server("aa"))
+            .unwrap();
+        assert!(manager.has_csk_metadata_file());
+
+        manager.rotate_csk().unwrap();
+
+        assert!(
+            manager.load_paired_servers().unwrap().is_empty(),
+            "a rotation invalidates every pairing"
+        );
+        assert!(manager.has_csk_file(), "a rotation writes a fresh CSK");
+        assert!(
+            !manager.has_csk_metadata_file(),
+            "no device is paired any more, so no algorithm suite may stay pinned"
+        );
+    }
+
+    /// A rotation that cannot delete the paired devices must not replace the CSK.
+    ///
+    /// The defect this catches: `let _ = self.clear_paired_servers()`, which
+    /// reported success while the phones kept a CSK the client had already
+    /// replaced — a device set that can never authenticate again.
+    #[test]
+    fn a_rotation_that_cannot_clear_the_pairings_does_not_replace_the_csk() {
+        let scratch = ScratchStateDir::new("rotate-failure");
+        let manager = scratch.manager();
+        manager.generate_and_save_csk().unwrap();
+        let before = manager.load_csk().unwrap().as_bytes().to_vec();
+        // `paired_servers.json` as a directory: deleting it fails with `EISDIR`
+        // while every other write in the state directory still succeeds.
+        fs::create_dir(scratch.path.join(PAIRED_SERVERS_FILE)).unwrap();
+
+        assert!(
+            manager.rotate_csk().is_err(),
+            "a rotation that cannot clear the pairings must report the failure"
+        );
+        assert_eq!(
+            manager.load_csk().unwrap().as_bytes(),
+            before.as_slice(),
+            "the CSK must not be replaced behind a failed device reset"
+        );
+    }
+
+    /// Un-pairing the last device drops the metadata; un-pairing one of several
+    /// keeps it, because the remaining device is still committed to that suite.
+    ///
+    /// The defect this catches: a removal that leaves the metadata behind after
+    /// the last device is gone (the next pairing is then refused the suite its
+    /// phone offers), and one that drops it too early (a still-paired device's
+    /// broadcast can then be re-negotiated out from under it).
+    #[test]
+    fn un_pairing_the_last_device_drops_the_metadata() {
+        let scratch = ScratchStateDir::new("remove");
+        let manager = scratch.manager();
+        manager.save_csk_metadata(&CskMetadata::default()).unwrap();
+        manager
+            .add_paired_server("aa".to_string(), paired_server("aa"))
+            .unwrap();
+        manager
+            .add_paired_server("bb".to_string(), paired_server("bb"))
+            .unwrap();
+
+        assert!(
+            manager.remove_user_from_pairing("aa", "alice").unwrap(),
+            "the only allowed user of aa takes the whole pairing with it"
+        );
+        assert!(
+            manager.has_csk_metadata_file(),
+            "bb is still paired and committed to the stored suite"
+        );
+
+        assert!(manager.remove_user_from_pairing("bb", "alice").unwrap());
+        assert!(
+            !manager.has_csk_metadata_file(),
+            "no device is paired any more, so nothing may stay pinned"
+        );
+
+        // The same lifecycle through the other removal entry point.
+        manager
+            .add_paired_server("cc".to_string(), paired_server("cc"))
+            .unwrap();
+        manager.save_csk_metadata(&CskMetadata::default()).unwrap();
+        manager.remove_paired_server("cc").unwrap();
+        assert!(!manager.has_csk_metadata_file());
+    }
+
+    /// The on-disk state a v0.12.0 daemon left in `/var/lib/tapauth` still loads.
+    ///
+    /// Provenance: `shared/testdata/legacy-v0.12.0-state/` is the exact text
+    /// v0.12.0 wrote — `serde_json::to_vec_pretty` of `ClientConfig` (`save_config`)
+    /// and of the `HashMap<String, PairedServer>` (`save_paired_servers`), with no
+    /// `signature_algorithm` in the paired-server record and no `csk_meta.json`
+    /// anywhere in the directory. The writers are byte-identical at the release tag
+    /// `v0.12.0` (`bb9d3cd`) and at `f30e43c` (`v0.12.0-10-gf30e43c`, this branch's
+    /// merge base): `git diff bb9d3cd f30e43c -- shared/src/config.rs
+    /// tapauthd/src/admin_handler.rs` differs only in one `pub use` line, so the
+    /// fixture describes both revisions. `paired_at` carries nanoseconds because the
+    /// daemon's only writer is `chrono::Utc::now()` (`handle_complete_pairing`,
+    /// `tapauthd/src/admin_handler.rs:614` in OLD), which serialises with
+    /// `SecondsFormat::AutoSi` — full precision, not a whole second.
+    ///
+    /// The two raw 32-byte key files are synthesised below rather than checked in,
+    /// because v0.12.0 wrote them un-framed (`save_keypair` / `save_csk`):
+    /// `0x00..=0x1f` is the Ed25519 signing seed, `0xc0..=0xdf` the CSK. Nothing
+    /// here is or was a real secret.
+    ///
+    /// Defects this catches: an upgrade that loses the existing pairing (the v1
+    /// record refused, the new algorithm field defaulting to other than Ed25519,
+    /// `allowed_users` dropped, or `paired_at` narrowed to whole seconds, which no
+    /// real record satisfies), one that refuses to start because the absent
+    /// `csk_meta.json` is not defaulted, and one that no longer reads the existing
+    /// CSK (the material that makes the pairing usable at all).
+    #[test]
+    fn an_existing_v0_12_0_state_directory_still_loads() {
+        use std::os::unix::fs::PermissionsExt;
+
+        /// v0.12.0's `PairedServer`, field for field and in the same order: the
+        /// oracle the fixture is re-serialised through, so a fixture that drifts
+        /// from what `save_paired_servers` produced (compact form, a renamed or
+        /// reordered key, a numeric `paired_at`) cannot pass this test.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct PairedServerV0120 {
+            name: String,
+            public_key: String,
+            allowed_users: Vec<String>,
+            paired_at: chrono::DateTime<chrono::Utc>,
+        }
+
+        const LEGACY_CONFIG: &str =
+            include_str!("../testdata/legacy-v0.12.0-state/client_config.json");
+        const LEGACY_SERVERS: &str =
+            include_str!("../testdata/legacy-v0.12.0-state/paired_servers.json");
+        /// The synthetic server key: both the map key and `public_key`, as
+        /// `add_paired_server(hex::encode(server_public_key), …)` writes them.
+        const LEGACY_SERVER_KEY: &str =
+            "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f";
+        const LEGACY_CLIENT_KEY: [u8; 32] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+        const LEGACY_CSK: [u8; 32] = [
+            0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd,
+            0xce, 0xcf, 0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xdb,
+            0xdc, 0xdd, 0xde, 0xdf,
+        ];
+
+        // A copy of the install, owned by the test user, in the 0700 directory and
+        // 0600 files `ensure_secure_directory` / `write_secure_file` leave behind.
+        let scratch = ScratchStateDir::new("legacy-v0-12-0");
+        fs::set_permissions(&scratch.path, fs::Permissions::from_mode(0o700)).unwrap();
+        install_state_file(&scratch.path, CLIENT_CONFIG_FILE, LEGACY_CONFIG.as_bytes());
+        install_state_file(
+            &scratch.path,
+            PAIRED_SERVERS_FILE,
+            LEGACY_SERVERS.as_bytes(),
+        );
+        install_state_file(&scratch.path, CLIENT_KEY_FILE, &LEGACY_CLIENT_KEY);
+        install_state_file(&scratch.path, CLIENT_SYMMETRIC_KEY_FILE, &LEGACY_CSK);
+        let manager = scratch.manager();
+
+        // `client_config.json`: loaded, and byte-identical to what the writer emits.
+        let config = manager.load_config().unwrap();
+        assert_eq!(config.hostname, "legacy-laptop");
+        assert_eq!(
+            serde_json::to_vec_pretty(&config).unwrap(),
+            LEGACY_CONFIG.as_bytes(),
+            "the fixture must be exactly what `save_config` wrote"
+        );
+
+        // `paired_servers.json`: the pairing survives with Ed25519 and its users.
+        let servers = manager.load_paired_servers().unwrap();
+        assert_eq!(servers.len(), 1, "the v1 pairing must not be dropped");
+        let server = servers
+            .get(LEGACY_SERVER_KEY)
+            .expect("the pairing is keyed by the server's hex public key");
+        assert_eq!(server.name, "Pixel 6");
+        assert_eq!(server.public_key, LEGACY_SERVER_KEY);
+        assert_eq!(
+            server.signature_algorithm,
+            SignatureAlgorithm::Ed25519,
+            "a v1 record stored no algorithm, and the v1 wire format is Ed25519"
+        );
+        assert_eq!(server.allowed_users, vec!["alice".to_string()]);
+        assert!(server.is_user_allowed("alice"));
+        assert_eq!(
+            server.paired_at,
+            chrono::DateTime::parse_from_rfc3339("2024-03-05T08:15:00.123456789Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            "the sub-second part `Utc::now()` writes must survive, not be truncated or refused"
+        );
+        assert!(
+            !LEGACY_SERVERS.contains("signature_algorithm"),
+            "v0.12.0 wrote no signature_algorithm; a fixture that has one is not a v1 record"
+        );
+        let legacy: HashMap<String, PairedServerV0120> =
+            serde_json::from_str(LEGACY_SERVERS).unwrap();
+        assert_eq!(
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+            LEGACY_SERVERS.as_bytes(),
+            "the fixture must be exactly what `save_paired_servers` wrote"
+        );
+
+        // No `csk_meta.json` in a v0.12.0 directory: the default pair is the v1
+        // wire behaviour, not an error and not a different suite.
+        assert!(!scratch.path.join(CSK_META_FILE).exists());
+        let metadata = manager.load_csk_metadata().unwrap();
+        assert_eq!(metadata, CskMetadata::default());
+        assert_eq!(metadata.symmetric_algorithm, SymmetricAlgorithm::Aes256Gcm);
+        assert_eq!(metadata.hash_algorithm, HashAlgorithm::Sha256);
+
+        // The key material that makes the stored pairing usable: the CSK file is
+        // still the raw 32 bytes `ClientSymmetricKey::from_bytes` takes, and the
+        // Ed25519 seed is still the pairing's `Ed_C`.
+        assert_eq!(
+            manager.load_csk().unwrap().as_bytes(),
+            &LEGACY_CSK,
+            "`client_symmetric_key` must still yield the stored pairing's CSK"
+        );
+        assert_eq!(
+            manager.load_keypair().unwrap().signing_key_bytes(),
+            LEGACY_CLIENT_KEY
+        );
+    }
+
+    /// A *present* `csk_meta.json` loads as the baseline suite, but a retired
+    /// pre-release name in one is refused rather than aliased.
+    ///
+    /// Defects this catches: a loader that errors on any present metadata file —
+    /// `tapauthd` turns that into a failed authentication for every device paired
+    /// by a v2 build (`auth_handler`, the `load_csk_metadata` error arm) — and one
+    /// that reads `CHACHA20_POLY1305` or `BLAKE3`, which no shipped release wrote,
+    /// as the one live primitive instead of refusing the file.
+    #[test]
+    fn csk_metadata_loads_the_baseline_from_a_present_file_but_refuses_retired_names() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = ScratchStateDir::new("csk-meta");
+        fs::set_permissions(&scratch.path, fs::Permissions::from_mode(0o700)).unwrap();
+        let manager = scratch.manager();
+
+        // Positive control: a present, valid file is the everyday case.
+        install_state_file(
+            &scratch.path,
+            CSK_META_FILE,
+            br#"{"symmetric_algorithm": "AES_256_GCM", "hash_algorithm": "SHA256"}"#,
+        );
+        assert!(manager.has_csk_metadata_file());
+        let metadata = manager.load_csk_metadata().unwrap();
+        assert_eq!(metadata, CskMetadata::default());
+        assert_eq!(metadata.symmetric_algorithm, SymmetricAlgorithm::Aes256Gcm);
+        assert_eq!(metadata.hash_algorithm, HashAlgorithm::Sha256);
+
+        // Retired pre-release names stay refused rather than being aliased onto the
+        // one live primitive.
+        for refused in [
+            r#"{"symmetric_algorithm": "CHACHA20_POLY1305", "hash_algorithm": "SHA256"}"#,
+            r#"{"symmetric_algorithm": "AES_256_GCM", "hash_algorithm": "Blake3"}"#,
+            r#"{"symmetric_algorithm": "AES_256_GCM", "hash_algorithm": "BLAKE3"}"#,
+        ] {
+            install_state_file(&scratch.path, CSK_META_FILE, refused.as_bytes());
+            assert!(
+                manager.load_csk_metadata().is_err(),
+                "{refused} must not load"
+            );
+        }
     }
 }

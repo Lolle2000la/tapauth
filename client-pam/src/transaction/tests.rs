@@ -112,6 +112,7 @@ fn run_with_probe<T: IpcResponseReader>(
     };
     let finished = run(
         ctx.service(),
+        ctx.process().name().unwrap_or_default(),
         "tty-probe-test-user",
         &participation,
         &mut host,
@@ -593,6 +594,7 @@ fn shown_order(ctx: &CallerContext, tty: Option<&str>) -> (Vec<Emitted>, usize) 
     let cancels = std::cell::Cell::new(0usize);
     let _finished = run(
         ctx.service(),
+        ctx.process().name().unwrap_or_default(),
         "announcement-order-user",
         &participation,
         &mut host,
@@ -625,6 +627,7 @@ fn shown_while_running<T: IpcResponseReader>(
     let participation = participation_for(ctx);
     let finished = run(
         ctx.service(),
+        ctx.process().name().unwrap_or_default(),
         username,
         &participation,
         &mut host,
@@ -767,6 +770,7 @@ fn gui_ipc_error_cancels_through_the_effects_seam() {
     };
     let finished = run(
         ctx.service(),
+        ctx.process().name().unwrap_or_default(),
         "cancel-seam-user",
         &participation,
         &mut host,
@@ -834,6 +838,7 @@ fn precollected_never_plans() {
     let connects = std::cell::Cell::new(0usize);
     let finished = run(
         ctx.service(),
+        ctx.process().name().unwrap_or_default(),
         "precollected-user",
         &participation,
         &mut host,

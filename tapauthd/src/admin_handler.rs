@@ -1,138 +1,55 @@
 use crate::auth_handler::DaemonState;
 use crate::peer_identity::{check_authorization, resolve_peer};
-use shared::{
-    config::{ClientConfig, PairedServer},
-    crypto::keys::ClientSymmetricKey,
-    firewall::{FirewallGuard, Protocol},
-    ipc::pb as ipc,
-    models::pairing::generate_pairing_url,
-    protocol::ClientPairingSession,
-};
-use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use shared::ipc::pb as ipc;
+use std::future::Future;
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock};
 
-fn err_resp(status: ipc::AdminStatus, msg: impl Into<String>) -> ipc::AdminResponse {
-    ipc::AdminResponse {
-        status: status as i32,
-        error_message: msg.into(),
-        payload: None,
+use crate::transport::EnabledTransports;
+
+mod device;
+mod pairing;
+mod response;
+
+use device::{
+    handle_get_config, handle_get_daemon_status, handle_get_servers, handle_recover_tpm,
+    handle_remove_device, handle_rotate_csk, handle_save_config,
+};
+use pairing::{
+    handle_cancel_pairing, handle_complete_pairing, handle_start_pairing, handle_wait_for_pairing,
+};
+use response::err_resp;
+
+pub use crate::pairing::PairingState;
+
+/// What one admin arm decided: the reply, and whether it changed daemon state.
+///
+/// The fact is carried by the type rather than by a boolean beside the reply, so "this request
+/// mutates state" is a property of the arm that answers it. A new mutating request has to say
+/// [`Handled::Mutated`]; writing [`Handled::Read`] instead is a visible classification error
+/// instead of a tuple slot nobody remembered, and the reload itself lives in exactly one `match`
+/// ([`settle`]) instead of one boolean per row.
+enum Handled {
+    /// The request only read state: the in-memory snapshot is still current.
+    Read(ipc::AdminResponse),
+    /// The request changed on-disk state, so the daemon must reload before the next reader.
+    Mutated(ipc::AdminResponse),
+}
+
+/// Turn a dispatched request into its reply: reload the daemon exactly once when the arm that
+/// answered changed state, and never otherwise.
+///
+/// This is the single site where the two classes differ, and the `match` is exhaustive, so a third
+/// class cannot be added without deciding here what it does to the daemon. `reload` is a parameter
+/// rather than a direct call so a unit test can count it.
+async fn settle(handled: Handled, reload: impl Future<Output = ()>) -> ipc::AdminResponse {
+    match handled {
+        Handled::Read(response) => response,
+        Handled::Mutated(response) => {
+            reload.await;
+            response
+        }
     }
-}
-
-fn empty_success() -> ipc::AdminResponse {
-    ipc::AdminResponse {
-        status: ipc::AdminStatus::AdminSuccess as i32,
-        error_message: String::new(),
-        payload: None,
-    }
-}
-
-fn get_servers_success(servers: Vec<ipc::PairedServerInfo>) -> ipc::AdminResponse {
-    ipc::AdminResponse {
-        status: ipc::AdminStatus::AdminSuccess as i32,
-        error_message: String::new(),
-        payload: Some(ipc::admin_response::Payload::GetServers(
-            ipc::GetServersResponse { servers },
-        )),
-    }
-}
-
-fn start_pairing_success(url: String, port: u32) -> ipc::AdminResponse {
-    ipc::AdminResponse {
-        status: ipc::AdminStatus::AdminSuccess as i32,
-        error_message: String::new(),
-        payload: Some(ipc::admin_response::Payload::StartPairing(
-            ipc::StartPairingResponse { url, port },
-        )),
-    }
-}
-
-fn wait_pairing_success(sas_code: String, port: u32) -> ipc::AdminResponse {
-    ipc::AdminResponse {
-        status: ipc::AdminStatus::AdminSuccess as i32,
-        error_message: String::new(),
-        payload: Some(ipc::admin_response::Payload::WaitForPairing(
-            ipc::WaitForPairingResponse { sas_code, port },
-        )),
-    }
-}
-
-fn complete_pairing_success(server_hex: String) -> ipc::AdminResponse {
-    ipc::AdminResponse {
-        status: ipc::AdminStatus::AdminSuccess as i32,
-        error_message: String::new(),
-        payload: Some(ipc::admin_response::Payload::CompletePairing(
-            ipc::CompletePairingResponse { server_hex },
-        )),
-    }
-}
-
-fn get_config_success(
-    hostname: String,
-    udp_port: u32,
-    enable_ble: bool,
-    enable_network: bool,
-) -> ipc::AdminResponse {
-    ipc::AdminResponse {
-        status: ipc::AdminStatus::AdminSuccess as i32,
-        error_message: String::new(),
-        payload: Some(ipc::admin_response::Payload::GetConfig(
-            ipc::GetConfigResponse {
-                hostname,
-                udp_port,
-                enable_ble,
-                enable_network,
-            },
-        )),
-    }
-}
-
-fn daemon_status_success(tpm_enabled: bool, tpm_error: String) -> ipc::AdminResponse {
-    ipc::AdminResponse {
-        status: ipc::AdminStatus::AdminSuccess as i32,
-        error_message: String::new(),
-        payload: Some(ipc::admin_response::Payload::GetDaemonStatus(
-            ipc::GetDaemonStatusResponse {
-                tpm_enabled,
-                tpm_error,
-            },
-        )),
-    }
-}
-
-pub struct PendingPairing {
-    pub listener: TcpListener,
-    pub firewall_guard: Option<Arc<FirewallGuard>>,
-    pub session: ClientPairingSession,
-    #[allow(dead_code)]
-    pub url: String,
-    pub port: u16,
-    pub generation: u64,
-}
-
-pub struct ActivePairing {
-    pub stream: TcpStream,
-    pub session: ClientPairingSession,
-    pub server_public_key: [u8; 32],
-    pub server_device_name: String,
-    pub port: u16,
-    #[allow(dead_code)]
-    pub firewall_guard: Option<Arc<FirewallGuard>>,
-    pub generation: u64,
-}
-
-pub enum PairingState {
-    Pending(PendingPairing),
-    Active(ActivePairing),
-}
-
-static PAIRING_GENERATION: AtomicU64 = AtomicU64::new(0);
-
-fn next_generation() -> u64 {
-    PAIRING_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
 pub async fn handle_admin_request(
@@ -166,608 +83,374 @@ pub async fn handle_admin_request(
 
     let username = identity.username;
 
-    let (response, needs_reload) = match request.payload {
+    settle(
+        dispatch(request, &daemon, pairing_state, &username).await,
+        async {
+            let new_daemon = daemon.reload();
+            *daemon_lock.write().await = new_daemon;
+            tracing::info!("Daemon state reloaded after admin operation");
+        },
+    )
+    .await
+}
+
+/// Dispatch one authorized admin request to its handler, naming the class of every arm.
+///
+/// Each arm says whether the request changed state ([`Handled`]); the reload that follows is
+/// [`settle`]'s single job. There is deliberately no `Some(_)` catch-all, so a new payload variant
+/// does not compile until it is given a class.
+async fn dispatch(
+    request: ipc::AdminRequest,
+    daemon: &Arc<DaemonState>,
+    pairing_state: &Arc<Mutex<Option<PairingState>>>,
+    username: &str,
+) -> Handled {
+    match request.payload {
         Some(ipc::admin_request::Payload::GetServers(_)) => {
-            (handle_get_servers(&daemon, &username).await, false)
+            Handled::Read(handle_get_servers(daemon, username).await)
         }
         Some(ipc::admin_request::Payload::StartPairing(_)) => {
-            (handle_start_pairing(&daemon, pairing_state).await, false)
+            // The toggles are read per request, like `AuthSession::handle_authenticate`
+            // does, so a change made in the GUI takes effect on the next attempt
+            // without a daemon restart.
+            let transports = EnabledTransports::from_config();
+            Handled::Read(handle_start_pairing(daemon, pairing_state, transports).await)
         }
         Some(ipc::admin_request::Payload::WaitForPairing(req)) => {
-            (handle_wait_for_pairing(pairing_state, req).await, false)
+            Handled::Read(handle_wait_for_pairing(pairing_state, req).await)
         }
-        Some(ipc::admin_request::Payload::CompletePairing(req)) => (
-            handle_complete_pairing(&daemon, pairing_state, &username, req).await,
-            true,
-        ),
+        Some(ipc::admin_request::Payload::CompletePairing(req)) => {
+            Handled::Mutated(handle_complete_pairing(daemon, pairing_state, username, req).await)
+        }
+        Some(ipc::admin_request::Payload::CancelPairing(req)) => {
+            Handled::Read(handle_cancel_pairing(pairing_state, req).await)
+        }
         Some(ipc::admin_request::Payload::RemoveDevice(req)) => {
-            (handle_remove_device(&daemon, &username, req).await, true)
+            Handled::Mutated(handle_remove_device(daemon, username, req).await)
         }
-        Some(ipc::admin_request::Payload::RotateCsk(_)) => (handle_rotate_csk(&daemon).await, true),
+        Some(ipc::admin_request::Payload::RotateCsk(_)) => {
+            Handled::Mutated(handle_rotate_csk(daemon).await)
+        }
         Some(ipc::admin_request::Payload::SaveConfig(req)) => {
-            (handle_save_config(&daemon, req).await, true)
+            Handled::Mutated(handle_save_config(daemon, req).await)
         }
         Some(ipc::admin_request::Payload::RecoverTpm(_)) => {
-            (handle_recover_tpm(&daemon).await, true)
+            Handled::Mutated(handle_recover_tpm(daemon).await)
         }
         Some(ipc::admin_request::Payload::GetConfig(_)) => {
-            (handle_get_config(&daemon).await, false)
+            Handled::Read(handle_get_config(daemon).await)
         }
         Some(ipc::admin_request::Payload::GetDaemonStatus(_)) => {
-            (handle_get_daemon_status(&daemon).await, false)
+            Handled::Read(handle_get_daemon_status(daemon).await)
         }
-        None => (
-            err_resp(ipc::AdminStatus::AdminError, "Empty admin request"),
-            false,
-        ),
-    };
-
-    if needs_reload {
-        let new_daemon = daemon.reload();
-        *daemon_lock.write().await = new_daemon;
-        tracing::info!("Daemon state reloaded after admin operation");
-    }
-
-    response
-}
-
-/// Loads paired servers directly from disk (not the in-memory snapshot).
-/// This ensures `GetServers` always returns fresh data, even between daemon
-/// reloads. Auth requests use the in-memory snapshot (DaemonState.paired_servers)
-/// which may be slightly stale — the snapshots are refreshed on each reconnect.
-async fn handle_get_servers(daemon: &Arc<DaemonState>, username: &str) -> ipc::AdminResponse {
-    match daemon.config_manager.load_paired_servers() {
-        Ok(servers) => {
-            let infos: Vec<ipc::PairedServerInfo> = servers
-                .into_iter()
-                .filter(|(_, s)| s.is_user_allowed(username))
-                .map(|(pk, s)| ipc::PairedServerInfo {
-                    name: s.name,
-                    public_key: pk,
-                    allowed_users: s.allowed_users,
-                    paired_at: s.paired_at.to_rfc3339(),
-                })
-                .collect();
-            get_servers_success(infos)
-        }
-        Err(e) => err_resp(
+        None => Handled::Read(err_resp(
             ipc::AdminStatus::AdminError,
-            format!("Failed to load servers: {}", e),
-        ),
+            "Empty admin request",
+        )),
     }
 }
 
-async fn handle_start_pairing(
-    daemon: &Arc<DaemonState>,
-    pairing_state: &Arc<Mutex<Option<PairingState>>>,
-) -> ipc::AdminResponse {
-    // The Ed25519 keypair identifies this client to the server during pairing.
-    // It MUST be the daemon's persistent keypair — otherwise the server stores
-    // a transient public key and subsequent auth requests fail signature verification.
-    let keypair = match daemon.config_manager.load_keypair() {
-        Ok(kp) => kp,
-        Err(shared::config::ConfigError::InvalidConfig) => {
-            match daemon.config_manager.generate_and_save_keypair() {
-                Ok(kp) => kp,
-                Err(e) => {
-                    return err_resp(
-                        ipc::AdminStatus::AdminError,
-                        format!("Keypair generation failed: {}", e),
-                    )
-                }
-            }
-        }
-        Err(e) => {
-            return err_resp(
-                ipc::AdminStatus::AdminError,
-                format!("Failed to load keypair: {}", e),
-            )
-        }
-    };
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::pairing::{advertised_port, cancel_outcome, check_requested_port};
+    use super::*;
+    use prost::Message as _;
 
-    let ipv4 = match local_ip_address::local_ip() {
-        Ok(std::net::IpAddr::V4(ip)) if !ip.is_loopback() => Some(ip),
-        _ => find_non_loopback_ipv4(),
-    };
+    /// `CancelPairing` after the worker already retired is a success, while a
+    /// real failure keeps its error answer.
+    ///
+    /// The defect this catches: mapping every `request_cancellation` error to the
+    /// success reply would report a genuine timeout as "cancelled"; mapping
+    /// `Ended` back to an error makes the GUI show "Failed to cancel the pairing
+    /// session" for a session that ended by itself — the race the deferred
+    /// terminal phase widens, because `is_ended()` only becomes true once the
+    /// teardown has finished.
+    #[test]
+    fn a_cancellation_that_races_teardown_is_a_success_and_a_real_failure_is_not() {
+        // The worker answered the cancel.
+        let answered = cancel_outcome(Ok(()));
+        assert_eq!(answered.status, ipc::AdminStatus::AdminSuccess as i32);
+        assert_eq!(answered.error_message, "");
+        assert!(matches!(
+            answered.payload,
+            Some(ipc::admin_response::Payload::CancelPairing(_))
+        ));
 
-    let ipv6 = find_non_loopback_ipv6();
+        // The worker retired between the phase check and the command.
+        let raced = cancel_outcome(Err(crate::pairing::PairingError::Ended(
+            "the pairing worker is gone".to_string(),
+        )));
+        assert_eq!(raced.status, ipc::AdminStatus::AdminSuccess as i32);
+        assert_eq!(raced.error_message, "");
 
-    let listener = match TcpListener::bind("0.0.0.0:0").await {
-        Ok(l) => l,
-        Err(e) => {
-            return err_resp(
-                ipc::AdminStatus::AdminError,
-                format!("Failed to bind TCP listener: {}", e),
-            )
-        }
-    };
+        // A genuine failure keeps the error answer, with the reason.
+        let failed = cancel_outcome(Err(crate::pairing::PairingError::Timeout));
+        assert_eq!(failed.status, ipc::AdminStatus::AdminError as i32);
+        assert!(
+            failed
+                .error_message
+                .contains("Failed to cancel the pairing session"),
+            "unexpected message: {}",
+            failed.error_message
+        );
+        assert!(
+            failed.error_message.contains("Timed out"),
+            "the reason must survive into the reply: {}",
+            failed.error_message
+        );
+        assert!(failed.payload.is_none());
+    }
 
-    let port = match listener.local_addr() {
-        Ok(a) => a.port(),
-        Err(e) => {
-            return err_resp(
-                ipc::AdminStatus::AdminError,
-                format!("Failed to get port: {}", e),
-            )
-        }
-    };
+    /// `StartPairing` must be refused when no transport can work, before anything
+    /// is keyed, bound or spawned.
+    ///
+    /// The defects this catches: `handle_start_pairing` starting a session from a
+    /// configuration with the network transport off and BLE unavailable — the
+    /// worker then has no socket and no advertisement, so nothing can ever reach
+    /// it, `WaitForPairing` holds the GUI until the session expires and the user is
+    /// left with a QR code (and a "pairing in progress" handle) that cannot work.
+    /// The reply's wording is asserted, not just its status, so a refusal that
+    /// reports some other failure does not pass.
+    #[tokio::test]
+    async fn start_pairing_without_any_transport_is_refused() {
+        let daemon = Arc::new(DaemonState {
+            config_manager: Arc::new(shared::config::ClientConfigManager::new()),
+            paired_servers: Arc::new(std::collections::HashMap::new()),
+            keypair: None,
+            csk: None,
+            hostname: "host".to_string(),
+            udp_socket: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            init_error: None,
+        });
+        let pairing_state: Arc<Mutex<Option<PairingState>>> = Arc::new(Mutex::new(None));
 
-    // Opening the pairing firewall port is best-effort only in test builds
-    // (containers/user-namespaces without usable iptables). Production builds
-    // keep the original strict behaviour: a firewall error aborts pairing rather
-    // than leaving the ephemeral TCP listener reachable without a rule.
-    #[cfg(feature = "dev-firewall-bypass")]
-    let firewall_guard: Option<Arc<FirewallGuard>> = match FirewallGuard::new(port, Protocol::Tcp) {
-        Ok(g) => Some(g),
-        Err(e) => {
-            // NOTE: the "dev-firewall-bypass" token in this message is the only
-            // signature the binary scanners can detect for this feature (there
-            // is no env var). scripts/ci/check-production-build.sh and
-            // scripts/ci/scan-package-artifacts.sh grep for it, and their
-            // positive controls fail if it disappears — keep the spelling.
-            tracing::warn!(
-                "Failed to open firewall port for pairing (continuing anyway; dev-firewall-bypass): {}",
-                e
-            );
-            None
-        }
-    };
+        let refusal = handle_start_pairing(
+            &daemon,
+            &pairing_state,
+            EnabledTransports::new(false, false),
+        )
+        .await;
 
-    #[cfg(not(feature = "dev-firewall-bypass"))]
-    let firewall_guard: Option<Arc<FirewallGuard>> = match FirewallGuard::new(port, Protocol::Tcp) {
-        Ok(g) => Some(g),
-        Err(e) => {
-            return err_resp(
-                ipc::AdminStatus::AdminError,
-                format!("Firewall error: {}", e),
-            )
-        }
-    };
-
-    let session = match ClientPairingSession::new(keypair) {
-        Ok(s) => s,
-        Err(e) => {
-            return err_resp(
-                ipc::AdminStatus::AdminError,
-                format!("Session creation failed: {}", e),
-            )
-        }
-    };
-
-    let x25519_pubkey_hex = hex::encode(session.x25519_public_key());
-    let url = generate_pairing_url(&x25519_pubkey_hex, port, ipv4, ipv6);
-
-    let gen = next_generation();
-    let pending = PendingPairing {
-        listener,
-        firewall_guard,
-        session,
-        url: url.clone(),
-        port,
-        generation: gen,
-    };
-
-    let mut guard = pairing_state.lock().await;
-    if guard.is_some() {
-        return err_resp(
-            ipc::AdminStatus::AdminError,
-            "A pairing session is already in progress. Cancel or complete it first.",
+        assert_eq!(
+            refusal.status,
+            ipc::AdminStatus::AdminError as i32,
+            "a session with no transport must not be started"
+        );
+        assert_eq!(
+            refusal.error_message, "All transports (BLE and Local Network) are disabled",
+            "the refusal must name the cause the way the PAM side does"
+        );
+        assert!(
+            refusal.payload.is_none(),
+            "a refused StartPairing must not hand out a QR code or a port"
+        );
+        assert!(
+            pairing_state.lock().await.is_none(),
+            "no session may be registered for a configuration nothing can reach"
         );
     }
-    *guard = Some(PairingState::Pending(pending));
-    drop(guard);
 
-    spawn_pairing_timeout(pairing_state, gen);
+    /// A mutating request reloads the daemon exactly once, a read-only one never — and the two
+    /// classes come from the arm that answered, through [`settle`].
+    ///
+    /// The defect this catches: a mutating arm written as `Handled::Read` (the old "forgot
+    /// `true` in the tuple slot"), so `CompletePairing` persists the device and the daemon keeps
+    /// serving the snapshot it built before the pairing, `RemoveDevice` leaves the removed server
+    /// able to authenticate, and `SaveConfig`'s transport toggles never reach the next attempt —
+    /// with no error anywhere. It also catches the opposite direction: a read that reloads, which
+    /// dirties the in-memory snapshot for a request that changed nothing.
+    #[tokio::test]
+    async fn only_a_mutating_request_reloads_the_daemon() {
+        let daemon = Arc::new(DaemonState {
+            config_manager: Arc::new(shared::config::ClientConfigManager::new()),
+            paired_servers: Arc::new(std::collections::HashMap::new()),
+            keypair: None,
+            csk: None,
+            hostname: "host".to_string(),
+            udp_socket: Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            init_error: None,
+        });
+        let pairing_state: Arc<Mutex<Option<PairingState>>> = Arc::new(Mutex::new(None));
+        let reloads = std::sync::atomic::AtomicUsize::new(0);
+        let count_one_reload = || async {
+            reloads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        };
 
-    start_pairing_success(url, port as u32)
-}
-
-fn spawn_pairing_timeout(pairing_state: &Arc<Mutex<Option<PairingState>>>, generation: u64) {
-    let state = pairing_state.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-        let mut guard = state.lock().await;
-        if matches!(*guard, Some(PairingState::Pending(ref p)) if p.generation == generation) {
-            tracing::warn!(
-                "Pending pairing (gen={}) timed out, cleaning up",
-                generation
-            );
-            *guard = None;
-        }
-    });
-}
-
-fn spawn_active_pairing_timeout(pairing_state: &Arc<Mutex<Option<PairingState>>>, generation: u64) {
-    let state = pairing_state.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-        let mut guard = state.lock().await;
-        if matches!(*guard, Some(PairingState::Active(ref a)) if a.generation == generation) {
-            tracing::warn!(
-                "Active pairing (gen={}, SAS verification) timed out, cleaning up",
-                generation
-            );
-            *guard = None;
-        }
-    });
-}
-
-async fn handle_wait_for_pairing(
-    pairing_state: &Arc<Mutex<Option<PairingState>>>,
-    req: ipc::WaitForPairingRequest,
-) -> ipc::AdminResponse {
-    let mut guard = pairing_state.lock().await;
-
-    let expected_port = match &*guard {
-        Some(PairingState::Pending(p)) => p.port,
-        Some(PairingState::Active(_)) => {
-            return err_resp(
-                ipc::AdminStatus::AdminError,
-                "Pairing already in active phase",
-            )
-        }
-        None => return err_resp(ipc::AdminStatus::AdminError, "No pending pairing session"),
-    };
-
-    if req.port != 0 && req.port != expected_port as u32 {
-        return err_resp(
-            ipc::AdminStatus::AdminError,
-            format!(
-                "Port mismatch: expected {}, got {}",
-                expected_port, req.port
+        // A read: answered from the in-memory snapshot, so nothing is reloaded.
+        let read = dispatch(
+            ipc::AdminRequest {
+                payload: Some(ipc::admin_request::Payload::GetDaemonStatus(
+                    ipc::GetDaemonStatusRequest {},
+                )),
+            },
+            &daemon,
+            &pairing_state,
+            "luca",
+        )
+        .await;
+        let read_reply = settle(read, count_one_reload()).await;
+        assert_eq!(read_reply.status, ipc::AdminStatus::AdminSuccess as i32);
+        assert!(
+            matches!(
+                read_reply.payload,
+                Some(ipc::admin_response::Payload::GetDaemonStatus(_))
             ),
+            "the read must be answered by its own handler"
+        );
+        assert_eq!(
+            reloads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a read-only request must not reload the daemon"
+        );
+
+        // A mutation: with no pairing session pending the handler answers an error, and the class
+        // is about what the arm does to state, not about whether it succeeded — a failed mutation
+        // may still have written something.
+        let mutated = dispatch(
+            ipc::AdminRequest {
+                payload: Some(ipc::admin_request::Payload::CompletePairing(
+                    ipc::CompletePairingRequest { port: None },
+                )),
+            },
+            &daemon,
+            &pairing_state,
+            "luca",
+        )
+        .await;
+        let mutated_reply = settle(mutated, count_one_reload()).await;
+        assert_eq!(
+            mutated_reply.status,
+            ipc::AdminStatus::AdminError as i32,
+            "there is no pairing session to complete"
+        );
+        assert_eq!(
+            reloads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a mutating request must reload the daemon exactly once"
         );
     }
 
-    let pending = match guard.take() {
-        Some(PairingState::Pending(p)) => p,
-        _ => unreachable!("checked above"),
-    };
+    /// A session with no UDP socket (BLE-only) reports its port as the field being
+    /// **absent**, and that absence survives the wire as `None` rather than turning
+    /// into `0`.
+    ///
+    /// The defect this catches: the `port = 0` sentinel coming back — a reply that
+    /// sends `0` for a BLE-only session, or a decoder that maps absence onto `0` — so
+    /// a caller cannot tell "no port" from "port 0", and the value it sends back is
+    /// read as either.
+    #[test]
+    fn a_ble_only_session_reports_no_port_and_absence_survives_the_wire() {
+        assert_eq!(
+            advertised_port(0),
+            None,
+            "a BLE-only session must report absence, not port 0"
+        );
+        assert_eq!(advertised_port(41234), Some(41234));
 
-    drop(guard);
+        // The reply's field is `optional`, so absence is the field not being
+        // written: it decodes back to `None`, never to `Some(0)`.
+        let unset = ipc::WaitForPairingResponse {
+            sas_code: "123-456".to_string(),
+            port: None,
+        };
+        let decoded =
+            ipc::WaitForPairingResponse::decode(unset.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.port, None);
+        assert_eq!(decoded.sas_code, "123-456");
 
-    let accept_result = tokio::time::timeout(
-        std::time::Duration::from_secs(300),
-        pending.listener.accept(),
-    )
-    .await;
-
-    let (stream, _addr) = match accept_result {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            return err_resp(ipc::AdminStatus::AdminError, format!("Accept error: {}", e))
-        }
-        Err(_) => {
-            return err_resp(
-                ipc::AdminStatus::AdminError,
-                "Timeout waiting for connection",
-            )
-        }
-    };
-
-    let client_device_name = daemon_hostname();
-
-    let mut session = pending.session;
-    let gen = pending.generation;
-
-    match session.initiate_pairing(stream, &client_device_name).await {
-        Ok((stream, server_public_key, server_device_name, sas)) => {
-            let sas_display = shared::crypto::format_sas(&sas);
-
-            let active = ActivePairing {
-                stream,
-                session,
-                server_public_key,
-                server_device_name,
-                port: pending.port,
-                firewall_guard: pending.firewall_guard,
-                generation: gen,
-            };
-
-            let mut guard = pairing_state.lock().await;
-            if guard.is_some() {
-                tracing::warn!(
-                    "Pairing state changed during accept (gen={}), discarding completed connection",
-                    gen
-                );
-                return err_resp(
-                    ipc::AdminStatus::AdminError,
-                    "Pairing session was superseded by a newer request",
-                );
-            }
-            *guard = Some(PairingState::Active(active));
-            drop(guard);
-
-            spawn_active_pairing_timeout(pairing_state, gen);
-
-            wait_pairing_success(sas_display, pending.port as u32)
-        }
-        Err(e) => err_resp(
-            ipc::AdminStatus::AdminError,
-            format!("Pairing initiation failed: {}", e),
-        ),
-    }
-}
-
-fn daemon_hostname() -> String {
-    whoami::hostname().unwrap_or_else(|_| "Unknown".to_string())
-}
-
-fn find_non_loopback_ipv4() -> Option<std::net::Ipv4Addr> {
-    if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
-        for (_name, ip) in interfaces {
-            if let IpAddr::V4(ipv4) = ip {
-                if !ipv4.is_loopback() {
-                    return Some(ipv4);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn find_non_loopback_ipv6() -> Option<std::net::Ipv6Addr> {
-    if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
-        for (_name, ip) in interfaces {
-            if let IpAddr::V6(ipv6) = ip {
-                if !ipv6.is_loopback() && !ipv6.is_unspecified() {
-                    return Some(ipv6);
-                }
-            }
-        }
-    }
-    None
-}
-
-async fn handle_complete_pairing(
-    daemon: &Arc<DaemonState>,
-    pairing_state: &Arc<Mutex<Option<PairingState>>>,
-    username: &str,
-    req: ipc::CompletePairingRequest,
-) -> ipc::AdminResponse {
-    let mut guard = pairing_state.lock().await;
-
-    let expected_port = match &*guard {
-        Some(PairingState::Active(a)) => a.port,
-        Some(PairingState::Pending(_)) => {
-            return err_resp(
-                ipc::AdminStatus::AdminError,
-                "Pairing still pending, wait for connection first",
-            )
-        }
-        None => return err_resp(ipc::AdminStatus::AdminError, "No active pairing session"),
-    };
-
-    if req.port != 0 && req.port != expected_port as u32 {
-        return err_resp(
-            ipc::AdminStatus::AdminError,
-            format!(
-                "Port mismatch: expected {}, got {}",
-                expected_port, req.port
-            ),
+        // And a request's absence is accepted without being compared to anything:
+        // there is no port to match against a session that has none.
+        assert!(check_requested_port(None, 0).is_ok());
+        assert!(
+            check_requested_port(None, 41234).is_ok(),
+            "an absent port names no port, so it cannot mismatch one"
         );
     }
 
-    let active = match guard.take() {
-        Some(PairingState::Active(a)) => a,
-        _ => unreachable!("checked above"),
-    };
+    /// An **explicitly present** `0` and absence are two different things on the wire:
+    /// `Some(0)` writes the field and decodes back to `Some(0)`, `None` writes nothing
+    /// and decodes back to `None`.
+    ///
+    /// The defect this catches: the field reverting to a plain proto3 scalar. There
+    /// `Some(0)` would encode to nothing and an explicit `0` on the wire would decode to
+    /// `None`, so "an explicit zero is invalid" would silently become a second spelling
+    /// of "BLE-only" and `check_requested_port`'s refusal of `Some(0)` would be
+    /// unreachable — while the absence test above and every other test here stay green.
+    #[test]
+    fn a_present_zero_port_is_written_and_does_not_decode_as_absence() {
+        // Field 2, wire type 0 (varint) is tag `0x10`; an empty `sas_code` (field 1)
+        // writes nothing, so these are the whole encoding. A plain proto3 scalar omits a
+        // zero, so the written zeros in these bytes are the `optional` keyword's doing.
+        let present = ipc::WaitForPairingResponse {
+            sas_code: String::new(),
+            port: Some(0),
+        };
+        let present_bytes = present.encode_to_vec();
+        assert_eq!(
+            present_bytes,
+            vec![0x10, 0x00],
+            "a present zero port must be written as tag 0x10 + varint 0, not omitted"
+        );
+        let decoded = ipc::WaitForPairingResponse::decode(present_bytes.as_slice()).unwrap();
+        assert_eq!(
+            decoded.port,
+            Some(0),
+            "an explicit zero on the wire must decode as Some(0), never as None"
+        );
 
-    drop(guard);
-
-    let csk = match daemon.config_manager.load_csk() {
-        Ok(c) => c,
-        Err(shared::config::ConfigError::InvalidConfig) => {
-            if daemon.config_manager.has_csk_file() {
-                return err_resp(
-                    ipc::AdminStatus::AdminError,
-                    "CSK file is corrupt.  Use `Rotate CSK` in settings to regenerate \
-                     (this will invalidate all existing pairings).",
-                );
-            }
-            match ClientSymmetricKey::generate() {
-                Ok(c) => c,
-                Err(e) => {
-                    return err_resp(
-                        ipc::AdminStatus::AdminError,
-                        format!("CSK generation failed: {}", e),
-                    )
-                }
-            }
-        }
-        Err(e) => {
-            return err_resp(
-                ipc::AdminStatus::AdminError,
-                format!("Failed to load CSK: {}", e),
-            )
-        }
-    };
-
-    let mut session = active.session;
-
-    match session.finish_pairing(active.stream, &csk, username).await {
-        Ok(()) => {}
-        Err(e) => {
-            return err_resp(
-                ipc::AdminStatus::AdminError,
-                format!("Pairing completion failed: {}", e),
-            )
-        }
+        // Absence is the field not being written at all, and it decodes back to absence.
+        let absent = ipc::WaitForPairingResponse {
+            sas_code: String::new(),
+            port: None,
+        };
+        let absent_bytes = absent.encode_to_vec();
+        assert_eq!(
+            absent_bytes,
+            Vec::<u8>::new(),
+            "an absent port must not be written at all"
+        );
+        let decoded = ipc::WaitForPairingResponse::decode(absent_bytes.as_slice()).unwrap();
+        assert_eq!(decoded.port, None);
     }
 
-    if let Err(e) = daemon.config_manager.save_csk(&csk) {
-        return err_resp(
-            ipc::AdminStatus::AdminError,
-            format!(
-                "Paired on phone, but saving local key failed: {}. \
-                 Ensure tapauthd is installed and the 'tapauthd' user and group exist, \
-                 then retry pairing.",
-                e
-            ),
+    /// `Some(0)` and an out-of-range value are **invalid**, not a second spelling of
+    /// "BLE-only", and a real port must still match the session's.
+    ///
+    /// The defect this catches: reading `0` back as absence (the sentinel returning
+    /// through the value path) or `port as u16`-style truncation, which would let
+    /// `65536` silently address port `0` instead of being refused.
+    #[test]
+    fn a_zero_or_out_of_range_pairing_port_is_refused_as_invalid() {
+        let zero = check_requested_port(Some(0), 41234).unwrap_err();
+        assert_eq!(zero.status, ipc::AdminStatus::AdminError as i32);
+        assert!(
+            zero.error_message.contains("Invalid pairing port: 0"),
+            "a zero port must be named as invalid, got {:?}",
+            zero.error_message
+        );
+
+        let too_big = check_requested_port(Some(u32::from(u16::MAX) + 1), 41234).unwrap_err();
+        assert_eq!(too_big.status, ipc::AdminStatus::AdminError as i32);
+        assert!(
+            too_big
+                .error_message
+                .contains("Invalid pairing port: 65536"),
+            "an out-of-range port must be named as invalid, got {:?}",
+            too_big.error_message
+        );
+
+        assert!(
+            check_requested_port(Some(41234), 41234).is_ok(),
+            "the session's own port must match"
+        );
+        let mismatch = check_requested_port(Some(41235), 41234).unwrap_err();
+        assert!(
+            mismatch
+                .error_message
+                .contains("Port mismatch: expected 41234, got 41235"),
+            "a different real port must be reported as a mismatch, got {:?}",
+            mismatch.error_message
         );
     }
-
-    let server_hex = hex::encode(active.server_public_key);
-    let paired_server = PairedServer {
-        name: active.server_device_name,
-        public_key: server_hex.clone(),
-        paired_at: chrono::Utc::now(),
-        allowed_users: vec![username.to_string()],
-    };
-
-    match daemon
-        .config_manager
-        .add_paired_server(server_hex.clone(), paired_server)
-    {
-        Ok(()) => complete_pairing_success(server_hex),
-        Err(e) => err_resp(
-            ipc::AdminStatus::AdminError,
-            format!("Failed to save paired server: {}", e),
-        ),
-    }
-}
-
-async fn handle_remove_device(
-    daemon: &Arc<DaemonState>,
-    username: &str,
-    req: ipc::RemoveDeviceRequest,
-) -> ipc::AdminResponse {
-    match daemon
-        .config_manager
-        .remove_user_from_pairing(&req.public_key, username)
-    {
-        Ok(entire_pairing_removed) => {
-            tracing::info!(
-                "{} pairing for device {}",
-                if entire_pairing_removed {
-                    "Removed entire"
-                } else {
-                    "Removed user from"
-                },
-                req.public_key
-            );
-            empty_success()
-        }
-        Err(e) => err_resp(
-            ipc::AdminStatus::AdminError,
-            format!("Failed to remove device: {}", e),
-        ),
-    }
-}
-
-async fn handle_rotate_csk(daemon: &Arc<DaemonState>) -> ipc::AdminResponse {
-    match daemon.config_manager.rotate_csk() {
-        Ok(_) => {
-            tracing::info!("CSK rotated successfully");
-            empty_success()
-        }
-        Err(e) => err_resp(
-            ipc::AdminStatus::AdminError,
-            format!("Failed to rotate CSK: {}", e),
-        ),
-    }
-}
-
-/// Writes config to disk, saving TOML (port, requires restart) first
-/// before ClientConfig (hostname, takes effect immediately).
-/// If TOML save fails, nothing is written. If ClientConfig save fails,
-/// the port change is still persisted (correct, just needs restart).
-///
-/// Transport toggles (BLE / Local Network) are only written when the request
-/// carries them (explicit presence), so older clients cannot accidentally
-/// disable transports.
-async fn handle_save_config(
-    daemon: &Arc<DaemonState>,
-    req: ipc::SaveConfigRequest,
-) -> ipc::AdminResponse {
-    if req.udp_port == 0 || req.udp_port > 65535 {
-        return err_resp(
-            ipc::AdminStatus::AdminError,
-            "Invalid UDP port: must be 1-65535",
-        );
-    }
-    let hostname = req.hostname.trim().to_string();
-    if hostname.is_empty() {
-        return err_resp(ipc::AdminStatus::AdminError, "Hostname must not be empty");
-    }
-    let port = req.udp_port as u16;
-
-    let mut toml_config = shared::config::TapAuthConfig::load();
-    toml_config.udp_port = port;
-    if let Some(enable_ble) = req.enable_ble {
-        toml_config.enable_ble = enable_ble;
-    }
-    if let Some(enable_network) = req.enable_network {
-        toml_config.enable_network = enable_network;
-    }
-    if let Err(e) = toml_config.save() {
-        return err_resp(
-            ipc::AdminStatus::AdminError,
-            format!("Failed to save TOML config: {}", e),
-        );
-    }
-
-    let client_config = ClientConfig { hostname };
-    if let Err(e) = daemon.config_manager.save_config(&client_config) {
-        return err_resp(
-            ipc::AdminStatus::AdminError,
-            format!("Failed to save client config: {}", e),
-        );
-    }
-    tracing::info!(
-        "UDP port changed to {} — will take effect on next daemon restart",
-        port
-    );
-    tracing::info!(
-        "Transports: BLE={}, LocalNetwork={} — takes effect on next authentication attempt",
-        toml_config.enable_ble,
-        toml_config.enable_network
-    );
-
-    empty_success()
-}
-
-async fn handle_recover_tpm(daemon: &Arc<DaemonState>) -> ipc::AdminResponse {
-    #[cfg(feature = "tpm")]
-    {
-        match daemon.config_manager.recover_from_tpm_failure() {
-            Ok(()) => {
-                tracing::info!("TPM recovery complete");
-                empty_success()
-            }
-            Err(e) => err_resp(
-                ipc::AdminStatus::AdminError,
-                format!("TPM recovery failed: {}", e),
-            ),
-        }
-    }
-    #[cfg(not(feature = "tpm"))]
-    {
-        let _ = daemon;
-        err_resp(ipc::AdminStatus::AdminError, "TPM support not compiled in")
-    }
-}
-
-async fn handle_get_config(daemon: &Arc<DaemonState>) -> ipc::AdminResponse {
-    let client_config = daemon.config_manager.load_config().unwrap_or_default();
-    let toml_config = shared::config::TapAuthConfig::load();
-    get_config_success(
-        client_config.hostname,
-        toml_config.udp_port as u32,
-        toml_config.enable_ble,
-        toml_config.enable_network,
-    )
-}
-
-async fn handle_get_daemon_status(daemon: &Arc<DaemonState>) -> ipc::AdminResponse {
-    let tpm_enabled = cfg!(feature = "tpm");
-    let tpm_error = if tpm_enabled && daemon.keypair.is_none() {
-        daemon
-            .get_init_error()
-            .unwrap_or("TPM key unseal failed")
-            .to_string()
-    } else {
-        String::new()
-    };
-    daemon_status_success(tpm_enabled, tpm_error)
 }

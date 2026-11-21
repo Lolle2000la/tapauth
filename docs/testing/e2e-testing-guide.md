@@ -6,7 +6,7 @@ This document describes the automated end-to-end (E2E) test harness for TapAuth,
 
 ## 1. Overview & Test Architecture
 
-The E2E test stack validates real cryptographic protocols, daemon state transitions, IPC boundaries, PAM module integration, network transports (TCP/UDP), and Bluetooth Low Energy (BLE) GATT communication against real Android software stacks and the Linux PAM infrastructure.
+The E2E test stack validates real cryptographic protocols, daemon state transitions, IPC boundaries, PAM module integration, network transports (UDP multicast/unicast and the ephemeral UDP pairing socket), and Bluetooth Low Energy (BLE) GATT communication against real Android software stacks and the Linux PAM infrastructure.
 
 ```mermaid
 graph TB
@@ -26,7 +26,7 @@ graph TB
     subgraph AndroidGuest["Android Device / Emulator"]
         direction TB
         subgraph AndroidServices["Background & UI Services"]
-            PAIR_CLIENT["PairingClient (TCP) / PairingE2eTest"]
+            PAIR_CLIENT["PairingSession / PairingE2eTest<br/>(UDP + BLE GATT)"]
             AUTH_SRV["AuthenticationService (UDP)"]
             BLE_SRV["BleGattService (GATT Server/Client)"]
         end
@@ -41,7 +41,7 @@ graph TB
         BLE_SRV --> BIOMETRICS
     end
 
-    DAEMON <-->|"TCP Pairing Handshake (Ephemeral Port)<br/>+ SAS Anti-MITM Verification"| PAIR_CLIENT
+    DAEMON <-->|"UDP Pairing Socket (Ephemeral Port) / BLE GATT<br/>+ SAS Anti-MITM Verification"| PAIR_CLIENT
     DAEMON <-->|"UDP Multicast & Unicast (36692 / 36695)<br/>EncryptedPacket (AES-256-GCM + CSK)"| AUTH_SRV
     DAEMON <-->|"BLE GATT Service (b4ad84c0...)<br/>/dev/vhci ◄► Bumble ◄► Netsim"| BLE_SRV
 ```
@@ -52,23 +52,23 @@ graph TB
 
 The master test runner (`scripts/test-e2e.sh`) executes a comprehensive test matrix covering positive authentication, protocol races, adversarial injections, timeout handling, and un-pairing:
 
-### Phase 1: Real TCP Device Pairing & SAS Anti-MITM Verification
-- **Phase 1a (Negative Pairing / SAS Rejection)**:
-  1. Desktop starts an ephemeral TCP pairing listener.
-  2. Android connects via `PairingE2eTest -e reject_sas true`.
-  3. Ephemeral ECDH exchange completes and derives the SAS, but Android rejects the SAS confirmation and closes the TCP connection.
-  4. Desktop's `complete-pairing` fails: the suite asserts both its non-zero exit code and that `get-servers` records 0 paired devices on disk.
-- **Phase 1b (Legitimate Pairing Handshake)**:
-  1. `tapauthd` generates a dynamic TCP listener port and ephemeral X25519 pairing keypair.
-  2. Android emulator runs `PairingE2eTest` connecting to host `10.0.2.2:<port>`.
-  3. Handshake executes:
-     - `PairingHello` with Android public keys.
-     - `PairingResponse` with Desktop public keys.
-     - Both derive ephemeral PSK via ECDH and compute 6-digit Short Authentication String (SAS).
-  4. Desktop and Android assert identical SAS codes (`XXX-XXX`).
-  5. Desktop transmits AES-256-GCM encrypted Client Symmetric Key (CSK) with SHA-256 hash confirmation.
-  6. Android stores paired desktop in `DeviceRepository`, and desktop saves server key to `/var/lib/tapauth/paired_servers.json`.
-  7. State directory security properties are asserted (`/var/lib/tapauth` 700 `tapauthd:tapauthd`, key files 600, socket 660 `root:tapauthd-clients`).
+### Phase 1: Protocol v2 Pairing (UDP + BLE) & SAS Anti-MITM Verification
+Pairing runs over the same two transports as authentication — there is no TCP listener: the desktop opens an ephemeral UDP socket and advertises the pairing over BLE GATT at the same time, the phone races both, and the first acceptable `PairingResponse` locks the transport.
+- **Phase 1a-i (Negative Pairing / SAS Rejection)**:
+  1. Desktop runs `start-pairing`, which prints the ephemeral pairing port, the session id and a `tapauth://pair?v=2&...` QR URL.
+  2. Android runs `PairingE2eTest -e pairing_url <url> -e reject_sas true`; the ECDH/SAS exchange completes and both sides derive the same code.
+  3. Android rejects the SAS and aborts with `USER_REJECTED_SAS`; the suite requires the daemon to log the accepted `PairingInit` and `Pairing aborted by the phone (USER_REJECTED_SAS)`.
+  4. Desktop's `complete-pairing` fails with that abort reason, and `get-servers` records 0 paired devices on disk.
+- **Phase 1a-ii (QR `pk` Pin)**: the harness replaces `pk` in the QR with a different well-formed 64-hex X25519 key. The phone's constant-time pin check rejects the daemon's `PairingResponse`, logs `PairingResponse rejected: …` and **drops the packet without sending any abort** — `KEY_MISMATCH` is declared in the proto but emitted by no implementation — so the run ends on the phone's own response deadline. The harness then cancels the session from the desktop and asserts 0 devices were stored.
+- **Phase 1a-iii (Desktop Cancels a Live Session)**: `cancel-pairing` ends a live session, the phone reports the abort, a later `complete-pairing` refuses it as cancelled, and nothing is stored.
+- **Phase 1b (Legitimate Pairing Handshake over UDP)**:
+  1. `tapauthd` opens the ephemeral UDP pairing socket (and a UDP firewall rule) and prints a v2 QR with `p`/`ip4`/`ip6`.
+  2. The emulator runs `PairingE2eTest` against host `10.0.2.2` (QEMU SLIRP) and sends `PairingInit` until a `PairingResponse` arrives, keeping the NAT mapping alive with `PairingKeepalive`.
+  3. Both sides derive and compare the same 6-digit SAS (`XXX-XXX`).
+  4. `complete-pairing` provisions the CSK inside `PairingConfirmClient` (AEAD under $K_{\text{c2s}}$, AAD `"tapauth-pair-v2-provision" || H`) and the phone proves receipt with `PairingConfirmServer` (signed by `Ed_S`).
+  5. Android stores the paired desktop in `DeviceRepository`, the desktop saves the server key to `/var/lib/tapauth/paired_servers.json` and `get-servers` lists it.
+  6. In systemd mode the state directory security properties are asserted (`/var/lib/tapauth` 700 `tapauthd:tapauthd`, key files 600, socket 660 `root:tapauthd-clients`).
+- **Phase 1c (BLE-Only Pairing)**: with `ip4`/`ip6` stripped from the QR the phone starts no UDP candidate and pairs over the Bumble `/dev/vhci` adapter: the daemon advertises the pairing, the phone connects GATT, writes `PairingInit` and takes the provisioning payload from the characteristic.
 
 ### Phase 2: Local Network (UDP) End-to-End Authentication
 1. Desktop enables UDP transport and disables BLE via admin IPC (`set-transports --network true --ble false`).
@@ -78,6 +78,7 @@ The master test runner (`scripts/test-e2e.sh`) executes a comprehensive test mat
 5. `AuthenticationService` on Android receives packet, validates temporal ID via `TemporalIdCache`, decrypts `AuthRequest`, and prompts for biometrics.
 6. Android verifies biometrics and replies with `AuthenticationGrant` signed by its Ed25519 key to `10.0.2.2:36692`.
 7. `tapauthd` verifies signature, responds with `GrantConfirmation` (up to 3 times), and returns `SUCCESS` (0) to PAM client.
+8. The daemon's own `Authentication granted over Udp` line is asserted for this session, so `enable_ble=false` is verified behaviourally and not only as a value in `config.toml`: a daemon that ignores the toggle and rings the phone over BLE fails here even though the PAM call succeeded.
 
 ### Phase 2b: Real PAM Module Authentication (`pamtester`)
 1. Test suite creates temporary PAM service definition at `/etc/pam.d/tapauth-test-e2e` pointing to `libclient_pam.so`.
@@ -94,8 +95,11 @@ The master test runner (`scripts/test-e2e.sh`) executes a comprehensive test mat
 3. The pending session is cancelled via `pam-cancel` IPC; the blocked client exits promptly with `OUTCOME=IGNORE` (never `SUCCESS`).
 
 ### Phase 2d: Adversarial UDP — Tampered Ciphertext
-1. The captured grant is re-injected with a flipped bit inside the AES-256-GCM tag (protobuf framing and temporal ID stay intact).
-2. The daemon fails AEAD verification, aborts fail-closed (`OUTCOME=IGNORE` → PAM password fallback), and logs "Failed to decrypt response packet".
+1. With auto-grant **on**, the captured grant is re-injected with a flipped bit inside the AES-256-GCM tag (protobuf framing and temporal ID stay intact) while a fresh auth session is pending and before the phone's own grant lands.
+2. A second injection in the same window needs neither the captured packet nor the key: `udp_attack.py send --garbage` sends a short byte string that cannot decode as an `EncryptedPacket` (every byte carries the varint continuation bit, so the leading tag varint overruns protobuf's 10-byte maximum). It is the cheapest form of the same attack, and it exercises a different rule — the decode-time drop at `shared/src/network/udp.rs:706-717`, before any crypto runs.
+3. The daemon reaches AEAD verification, fails it, and **drops** the datagram rather than treating it as a response: it logs "Failed to decrypt response packet" and keeps waiting. The rule under test is that an attempt concludes only on a verified response from an authorised server, on its own deadline, or on an explicit local cancel or user denial — never on an arbitrary datagram from the link, which would let any host on it end an authentication with one frame. The undecodable frame is dropped one layer below that and is asserted separately, on its own per-frame line ("Dropped a datagram from … (<N> bytes)"), whose byte count is the harness's own payload length.
+4. The phone's real grant then authenticates the session: `pam-auth` prints `OUTCOME=SUCCESS`, exits 0, and the daemon attributes the grant to `Udp` (BLE is disabled for this phase, so the success cannot have come from the other transport). The phase therefore asserts the strictly stronger property — both injections are dropped **and** a genuine authentication still completes — instead of the fail-closed abort it asserted before that rule existed.
+5. The AEAD warn is the aggregate drop warning: it carries that phrase on its first occurrence and is then rate-limited to one per 60 s (`DROP_WARN_INTERVAL`, `tapauthd/src/auth_handler.rs`), with per-frame detail at `debug`, so an unauthenticated host cannot turn one datagram into unbounded journal output. This phase's injection is the only frame in the suite that fails AEAD, so the occurrence it asserts is the first one. The decode drop has its own counter and its own rate-limited aggregate; the assertion uses its per-frame `debug` line instead, which is why the suite raises the log level for `shared::network::udp` (see §5).
 
 ### Phase 3: Bluetooth Low Energy (BLE) Authentication
 1. Desktop enables BLE transport and disables UDP (`set-transports --network false --ble true`).
@@ -106,7 +110,9 @@ The master test runner (`scripts/test-e2e.sh`) executes a comprehensive test mat
 ### Phase 4: Parallel Discovery Race (UDP + BLE Simultaneous)
 1. Both transports enabled (`set-transports --network true --ble true`).
 2. Desktop fires simultaneous discovery on UDP and BLE.
-3. First responding transport wins; `tapauthd` cleans up the competing transport without duplicate grant conflicts.
+3. First responding transport wins; `tapauthd` cleans up the competing transport without duplicate grant conflicts. Either winner is a pass by design, so the phase does not assert which one won — only that one was named.
+4. Both transports must have **participated**, asserted separately so a failure names the half that did not: the daemon registered the BLE advertisement for the session (`BLE advertising started`, `tapauthd/src/transport/ble.rs:671`) and sent the request to the IPv4 discovery group (`Sent IPv4 multicast on …`, `shared/src/network/udp.rs:461`). A daemon that serves the race over one transport while the other silently does nothing fails here.
+5. The phone raised **no more than one prompt per challenge** for the request, grouped from logcat rather than inferred from timing: the phase's per-request `pam_service` token scopes the window to this request (`AuthRequestManager.submitRequest` logs the caller-context line once per submission), and each prompt's `challenge=` prefix is the grouping key — the same key the phone's transport lock claims on (`TransportLockManager.tryClaimTransport`), so a challenge reached over both transports is one prompt. Two prompts for one challenge mean the daemon opened a session per transport. Two prompts for two challenges are a legitimate retry (the phase retries by design) and pass; a window with no prompt at all, or with a prompt line that no longer carries `challenge=`, fails rather than passing vacuously. `TAPAUTH_E2E_SELFTEST=race-prompts` exercises all of those cases on synthetic dumps without a device.
 
 ### Phase 5: Explicit User Denial
 1. Authentication requested while auto-grant helper is paused.
@@ -220,6 +226,17 @@ per package across a `--workspace` build, the test features requested for `tapau
 that package's `client-pam`/`tapauth-config` (e.g. `shared/dev-udp-loopback` in the PAM module). No distro
 E2E package is byte-for-byte the production feature set; production artifacts are built per crate and
 scanned separately (`check-production-build.sh`).
+
+**Daemon log level.** The suite raises the daemon's log filter for two targets only —
+`tapauthd::transport::ble=trace` and `shared::network::udp=trace` — because the three facts Phases 2d and 4
+assert about the transports are logged below the level the daemon otherwise runs at (`INFO` in journald,
+`debug` on stdout): the BLE advertisement registration, the IPv4 multicast egress, and the per-frame
+decode drop. Every other module keeps its level, so no other phase's log volume or assertions change. In
+systemd mode the directive must go on `TAPAUTH_JOURNALD_LOG_LEVEL`, not on `RUST_LOG`: under systemd the
+daemon installs only the journald layer and keys it off that variable
+(`tapauthd/src/logging.rs:40-51`). A malformed value cannot abort the daemon: both variables are parsed with
+`EnvFilter::try_new(...)` and fall back to a plain `info` filter, so the worst case is that the trace lines
+go missing and the phases fail on absent evidence (`tapauthd/src/logging.rs:19-20`, `:44-45`).
 
 Other CI steps that back this suite:
 - `./gradlew test` runs the Android JVM unit tests (§3) without an emulator.

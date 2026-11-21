@@ -5,7 +5,7 @@ mod settings;
 
 pub use device_list::DeviceListScreen;
 pub use main_menu::MainMenuScreen;
-pub use pairing::PairingScreen;
+pub use pairing::{CloseAction, PairingScreen};
 pub use settings::SettingsScreen;
 
 use crate::l10n::L10n;
@@ -25,6 +25,17 @@ impl Screen {
         let (screen, task) = MainMenuScreen::new(l10n);
         (Screen::MainMenu(screen), task)
     }
+
+    /// What closing the window must do about the pairing session the current
+    /// screen still holds. Used by the window-close path, so the daemon is told
+    /// before the process disappears — except while a completion is already in
+    /// flight, which the daemon finishes on its own.
+    pub fn close_action(&mut self) -> CloseAction {
+        match self {
+            Screen::Pairing(screen) => screen.close_action(),
+            _ => CloseAction::CloseNow,
+        }
+    }
 }
 
 /// Messages that can be sent between screens
@@ -43,10 +54,17 @@ pub enum ScreenMessage {
 
     // Pairing
     PairingStarted,
-    PairingComplete(String), // device_id or SAS
+    PairingSessionStarted(crate::ipc::PairingSession), // StartPairing succeeded
+    PairingComplete(String),                           // device_id or SAS
     PairingFailed(crate::ipc::GuiIpcError),
     PairingCancelled,
-    PairingSASConfirmed, // User confirmed SAS
+    PairingCancelledOnDaemon, // result of the fire-and-forget CancelPairing
+    PairingCancelRequested,   // user asked to drop a stale session and retry
+    PairingSASConfirmed,      // User confirmed SAS
+    /// An abandoned `CompletePairing` was cancelled. Deliberately inert: the
+    /// screen that armed its cancel handle has been torn down, so it is
+    /// delivered to whichever screen is current and must change nothing there.
+    PairingCompletionAbandoned,
 
     // Device List
     RemoveDevice(String), // device_id
@@ -82,9 +100,15 @@ impl Screen {
         match message {
             // Navigation messages
             ScreenMessage::NavigateToMainMenu => {
+                // Tearing the pairing screen down abandons any session the
+                // daemon is still waiting on, so cancel it there.
+                let cancel_task = match self {
+                    Screen::Pairing(screen) => screen.take_cancel_task(),
+                    _ => Task::none(),
+                };
                 let (screen, task) = MainMenuScreen::new(l10n.clone());
                 *self = Screen::MainMenu(screen);
-                task
+                Task::batch([task, cancel_task])
             }
             ScreenMessage::NavigateToPairing => {
                 *self = Screen::Pairing(PairingScreen::new(l10n.clone()));

@@ -34,9 +34,11 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -44,12 +46,18 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.ViewModelProvider
+import dev.rourunisen.tapauth.data.AuthContextDisplay
 import dev.rourunisen.tapauth.data.AuthRequest
+import dev.rourunisen.tapauth.data.ContextSanitizer
 import dev.rourunisen.tapauth.data.PairingUrl
 import dev.rourunisen.tapauth.service.AuthRequestManager
+import dev.rourunisen.tapauth.service.scrubLogValue
 import dev.rourunisen.tapauth.ui.devices.DeviceListScreen
 import dev.rourunisen.tapauth.ui.home.HomeScreen
+import dev.rourunisen.tapauth.ui.navigation.AppScreenSaver
 import dev.rourunisen.tapauth.ui.pairing.PairingScreen
+import dev.rourunisen.tapauth.ui.pairing.PairingViewModel
 import dev.rourunisen.tapauth.ui.scanner.QRScannerScreen
 import dev.rourunisen.tapauth.ui.settings.SettingsScreen
 import dev.rourunisen.tapauth.ui.theme.TapAuthTheme
@@ -65,6 +73,9 @@ class MainActivity : FragmentActivity() {
     internal val locationGranted = mutableStateOf(false)
     internal val backgroundLocationGranted = mutableStateOf(false)
     internal val notificationGranted = mutableStateOf(false)
+
+    // One-shot `tapauth://pair?...` deeplink handed to the Compose navigation, then cleared.
+    internal val pendingPairingUrl = mutableStateOf<PairingUrl?>(null)
 
     // Request codes for classic permission requests
     companion object {
@@ -84,6 +95,9 @@ class MainActivity : FragmentActivity() {
 
         setupBiometricPrompt()
         setupAuthRequestReceiver()
+
+        // The manifest filters `tapauth://pair` VIEW intents on this activity.
+        handlePairingIntent(intent)
 
         // Note: We no longer handle auth requests via intent here in onCreate.
         // The BiometricPromptActivity handles notification taps directly.
@@ -120,7 +134,7 @@ class MainActivity : FragmentActivity() {
                                     handleAuthResponse(
                                         authRequest.requestId,
                                         approved = false,
-                                        signedChallenge = null,
+                                        challenge = null,
                                         explicitDenial = true,
                                     )
                                     currentAuthRequest = null
@@ -244,7 +258,12 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun handleAuthRequest(authRequest: AuthRequest) {
-        Log.d(TAG, "Received auth request for ${authRequest.username}@${authRequest.hostname}")
+        // The caller's own strings, scrubbed like every other place they reach logcat: an
+        // unwrapped newline would forge a line (see `scrubLogValue`).
+        Log.d(
+            TAG,
+            "Received auth request for ${scrubLogValue(authRequest.username)}@${scrubLogValue(authRequest.hostname)}",
+        )
 
         // Check if biometric authentication is available (Class 3 BIOMETRIC_STRONG required)
         val biometricManager = BiometricManager.from(this)
@@ -263,7 +282,7 @@ class MainActivity : FragmentActivity() {
                 TAG,
                 "Biometric authentication not available (strong=$canAuthStrong)",
             )
-            handleAuthResponse(authRequest.requestId, approved = false, signedChallenge = null)
+            handleAuthResponse(authRequest.requestId, approved = false, challenge = null)
         }
     }
 
@@ -271,10 +290,15 @@ class MainActivity : FragmentActivity() {
         val promptInfo =
             BiometricPrompt.PromptInfo.Builder()
                 .setTitle("Authentication Request")
-                .setSubtitle("Approve login for ${authRequest.username}@${authRequest.hostname}")
-                .setDescription(
-                    "From device: ${authRequest.deviceName} via ${authRequest.transportType.displayName}",
+                .setSubtitle(
+                    "Approve login for " +
+                        "${ContextSanitizer.sanitize(authRequest.username, AuthContextDisplay.IDENTITY_MAX_BYTES)}" +
+                        "@" +
+                        "${ContextSanitizer.sanitize(authRequest.hostname, AuthContextDisplay.IDENTITY_MAX_BYTES)}",
                 )
+                // Same sanitized context paragraph + device/transport line as the
+                // notification-launched prompt (AuthContextDisplay.promptDescription).
+                .setDescription(AuthContextDisplay.promptDescription(authRequest))
                 .setNegativeButtonText("Deny")
                 .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
                 .build()
@@ -285,11 +309,38 @@ class MainActivity : FragmentActivity() {
     private fun handleAuthResponse(
         requestId: String,
         approved: Boolean,
-        signedChallenge: ByteArray?,
+        challenge: ByteArray?,
         explicitDenial: Boolean = false,
     ) {
         val authRequestManager = AuthRequestManager.getInstance()
-        authRequestManager.handleResponse(requestId, approved, signedChallenge, explicitDenial)
+        authRequestManager.handleResponse(requestId, approved, challenge, explicitDenial)
+    }
+
+    /**
+     * Hand a `tapauth://pair?...` VIEW intent to the pairing flow.
+     *
+     * [PairingUrl.parse] accepts only a well-formed v2 URL; it returns null for a wrong version, a
+     * malformed `sid`/`pk`, or an out-of-range `p`. Such an intent is logged and dropped — the same
+     * "invalid QR" outcome the scanner reports — so a hostile or stale link cannot crash the
+     * activity. A parsed URL is passed through unchanged: `port` is optional, because a QR with no
+     * UDP endpoint describes a BLE-only pairing and the pairing screen decides what that means.
+     */
+    private fun handlePairingIntent(intent: Intent?) {
+        if (intent?.action != Intent.ACTION_VIEW) return
+        val data = intent.dataString ?: return
+
+        val pairingUrl = PairingUrl.parse(data)
+        if (pairingUrl == null) {
+            // Do not log the raw URL: it carries untrusted, potentially control-character-laden
+            // input from an external intent.
+            Log.w(TAG, "Ignoring malformed tapauth pairing deeplink")
+            return
+        }
+
+        Log.i(TAG, "Pairing deeplink accepted (port=${pairingUrl.port})")
+        pendingPairingUrl.value = pairingUrl
+        // Consume the intent so a re-creation (e.g. rotation) does not re-enter pairing.
+        setIntent(Intent(this, MainActivity::class.java))
     }
 
     private fun checkAllPermissions() {
@@ -486,6 +537,7 @@ class MainActivity : FragmentActivity() {
         // Note: Auth request intents from notifications now go to BiometricPromptActivity
         // This onNewIntent is kept for compatibility but shouldn't receive auth requests
         // unless MainActivity is explicitly targeted (which it no longer is)
+        handlePairingIntent(intent)
     }
 }
 
@@ -503,8 +555,38 @@ fun TapAuthApp() {
         return
     }
 
-    // All permissions granted, show main app
-    var currentScreen by remember { mutableStateOf<AppScreen>(AppScreen.Home) }
+    // All permissions granted, show main app.
+    //
+    // Saved, not just remembered: a configuration change used to drop this back to `Home`, which
+    // took the pairing screen (and the session it owned) with it.
+    var currentScreen by
+        rememberSaveable(stateSaver = AppScreenSaver) { mutableStateOf<AppScreen>(AppScreen.Home) }
+
+    // The pairing session is hosted by a ViewModel, so a configuration change re-attaches to the
+    // live session instead of disposing it mid-handshake. The store lives on the activity and
+    // survives its re-creation, so this returns the same instance after a rotation.
+    //
+    // No null check: the permission gate above can only have passed for a real `MainActivity` —
+    // `allGranted` is false when `activity` is null — so there is no nullable owner left here.
+    val viewModelOwner = activity
+    val pairingViewModel =
+        remember(viewModelOwner) {
+            ViewModelProvider(viewModelOwner, PairingViewModel.factory(viewModelOwner))
+                .get(PairingViewModel::class.java)
+        }
+
+    // One-shot `tapauth://pair` deeplink hand-off: navigate straight to the pairing screen with the
+    // parsed URL and clear it, so Back returns to Home instead of re-pairing. A rotation does not
+    // repeat the hand-off: the saved screen is already `Pairing`, and the cleared deeplink is not
+    // restored, so the rotation restores the pairing screen rather than re-pairing from scratch.
+    val pendingPairingUrl = activity.pendingPairingUrl
+    val deeplinkUrl = pendingPairingUrl.value
+    LaunchedEffect(deeplinkUrl) {
+        if (deeplinkUrl != null) {
+            currentScreen = AppScreen.Pairing(deeplinkUrl)
+            pendingPairingUrl.value = null
+        }
+    }
 
     when (val screen = currentScreen) {
         is AppScreen.Home -> {
@@ -523,6 +605,7 @@ fun TapAuthApp() {
         is AppScreen.Pairing -> {
             PairingScreen(
                 pairingUrl = screen.url,
+                viewModel = pairingViewModel,
                 onPairingComplete = { currentScreen = AppScreen.Home },
                 onPairingFailed = {
                     /* Handle error specifically if necessary (currently this callback is unused) */

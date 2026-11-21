@@ -1,16 +1,20 @@
-# Initial Key Exchange Protocol
+# Initial Key Exchange Protocol (v2 — Unified UDP + BLE)
 
 ## Overview
 
-This document outlines a secure and byte-efficient protocol for the initial pairing of a **Client** (e.g., a Linux desktop) with a **Server** (e.g., an Android phone). The goal is to securely share the Client's long-term symmetric key with a new Server. The protocol uses a QR code to bootstrap trust, a high-speed key exchange to create a temporary secure channel, and a user-verified Short Authentication String (SAS) to prevent Man-in-the-Middle (MITM) attacks.
+This document specifies Protocol v2 for pairing a **Client** (Linux desktop) with a **Server** (Android phone). The protocol securely provisions the Client's long-term `CSK`, mutually exchanges and authenticates both devices' static Ed25519 identity keys, negotiates cryptographic algorithms, and prevents Man-in-the-Middle (MITM) and Unknown Key-Share (UKS) attacks using a QR code commitment plus a transcript-bound Short Authentication String (SAS).
+
+Pairing runs over the exact same two transports as authentication — **UDP** and **Bluetooth Low Energy (BLE)** — using one unified protobuf state machine (`PairingPacket` in [`proto/auth_protocol.proto`](../../../proto/auth_protocol.proto)). Only devices that have scanned the QR code can discover the Client over BLE or locate its ephemeral UDP socket, preventing unsolicited pairing spam.
 
 ***
 
 ## Cryptography and Keys
 
-* **Cryptographic Primitives**: All cryptographic algorithms used in this protocol are explicitly defined in the [`cryptography-specification.md`](cryptography-specification.md) document.
-* **Key Exchange**: An X25519 key exchange is performed to generate a temporary **Pairing Symmetric Key (`PSK`)**.
-* **Client Symmetric Key** (`CSK`): The Client's long-term key for encrypting all standard communication. This is the key that will be shared during this protocol.
+* **Cryptographic Primitives**: Defined in [`cryptography-specification.md`](cryptography-specification.md).
+* **QR Code Commitment**: The Client encodes a random 16-byte `session_id` (`sid`) and its ephemeral X25519 public key ($X_C$, `pk`) into the QR URL.
+* **Transcript-Bound Ephemeral Keys ($K_{\text{c2s}}, K_{\text{s2c}}$)**: Derived via HKDF-SHA256 from the X25519 shared secret $Z = \text{X25519}(x, Y)$, salted by the full SHA-256 handshake transcript hash $H$.
+* **Static Identity Proof**: Both sides exchange their long-term Ed25519 public keys ($Ed_C, Ed_S$) and sign the handshake transcript $H$ to prove possession before trusting the peer key.
+* **Client Symmetric Key (`CSK`)**: The Client's long-term key (and its associated `SymmetricAlgorithm` and `HashAlgorithm`), provisioned inside an AEAD-encrypted payload together with `username` and `client_hostname`.
 
 ***
 
@@ -22,94 +26,145 @@ sequenceDiagram
     participant Client (Desktop)
     participant Server (Phone)
 
-    User->>Client (Desktop): Initiate pairing
-    Client (Desktop)->>Client (Desktop): Generate Key Pairs (if needed)
-    Client (Desktop)->>Client (Desktop): Generate CSK (if none) when the pairing completes
-    Client (Desktop)-->>User: Display QR Code (URL with pk, ip, port)
+    User->>Client (Desktop): Initiate pairing (StartPairing)
+    Client (Desktop)->>Client (Desktop): Generate ephemeral X25519 (X_C), random sid (16B)
+    Client (Desktop)->>Client (Desktop): Bind ephemeral UDP socket [::]:0 & start BLE pairing adv
+    Client (Desktop)-->>User: Display QR Code (v=2, sid, pk=X_C, optional p/ip4/ip6)
 
     User->>Server (Phone): Scan QR Code
-    Server (Phone)->>Server (Phone): Read Client info from the QR code
-    Server (Phone)->>Server (Phone): Generate own Key Pairs
-    
-    Server (Phone)->>Client (Desktop): Connect (TCP) and send PairingHello
-    Client (Desktop)->>Server (Phone): Send PairingResponse (client keys, selected algorithms)
-    
-    Note over Client (Desktop),Server (Phone): Both sides now compute the temporary PSK
-    Client (Desktop)->>Client (Desktop): psk = ECDH(Client_Priv, Server_Pub)
-    Server (Phone)->>Server (Phone): psk = ECDH(Server_Priv, Client_Pub)
-    
-    Note over Client (Desktop),Server (Phone): Both derive SAS and display it
+    Server (Phone)->>Server (Phone): Generate ephemeral X25519 (X_S)
+    Note over Server (Phone): Derive 10B BLE adv ID from (sid, pk)
+
+    par UDP + BLE Transport Race
+        Server (Phone)->>Client (Desktop): UDP PairingInit (retransmit 500ms)
+    and
+        Note over Server (Phone): After 250ms head-start if BLE enabled, hardware ScanFilter matches adv ID
+        Server (Phone)->>Client (Desktop): BLE GATT connect -> PairingInit
+    end
+
+    Client (Desktop)->>Client (Desktop): Intersect supported algorithms, compute transcript hash H
+    Client (Desktop)->>Client (Desktop): Derive PRK, K_c2s, K_s2c, SAS; sign ("tapauth-pair-client-sig-v2" || H) with Ed_C
+    Client (Desktop)->>Server (Phone): Send PairingResponse (locked onto winning transport)
+
+    Server (Phone)->>Server (Phone): Verify response.client_x25519_public_key == qr.pk (constant-time)
+    Server (Phone)->>Server (Phone): Compute H, verify client_signature under Ed_C, derive PRK, K_c2s, K_s2c, SAS
+
     Client (Desktop)-->>User: Display SAS (e.g., "123-456")
     Server (Phone)-->>User: Display SAS (e.g., "123-456")
 
     User->>User: Visually confirm SAS matches
-    User->>Client (Desktop): Approve pairing
-    User->>Server (Phone): Approve pairing
-    
-    Client (Desktop)->>Server (Phone): Send PairingCskMessage (CSK encrypted with PSK)
-    Server (Phone)->>Client (Desktop): Send PairingComplete (CSK hash encrypted with PSK)
-    
-    Note over Client (Desktop),Server (Phone): Pairing complete. Both discard PSK and store CSK.
+    User->>Client (Desktop): Confirm SAS (CompletePairing)
+    User->>Server (Phone): Confirm SAS
+
+    Note over Server (Phone): Over UDP, send PairingKeepalive every 1000ms while waiting
+    Client (Desktop)->>Server (Phone): PairingConfirmClient (AEAD(K_c2s, "tapauth-pair-v2-provision" || H, {CSK, username, hostname}))
+    Server (Phone)->>Server (Phone): Decrypt provision payload under K_c2s, sign ("tapauth-pair-server-sig-v2" || H || CSK) with Ed_S
+    Server (Phone)->>Client (Desktop): PairingConfirmServer (AEAD(K_s2c, "tapauth-pair-v2-complete" || H, {server_signature}))
+    Client (Desktop)->>Client (Desktop): Decrypt & verify server_signature under Ed_S; persist PairedServer + CSK
+    Client (Desktop)->>Server (Phone): PairingConfirmClient retry (every 500ms while the proof is unverified)
+    Server (Phone)->>Client (Desktop): PairingConfirmServer (same cached bytes, during the 1.25s linger)
+    Note over Server (Phone): conclude() — the only terminal transition; Drop is the backstop
+
+    Note over Client (Desktop),Server (Phone): Discard X_C/X_S priv keys, PRK, K_c2s, K_s2c on conclude(), never on the proof itself.
 ```
 
 ***
 
 ## Pairing Protocol Steps
 
-### Step 1: Client Presents QR Code
+### Step 1: Client Presents QR Code & Starts Dual-Transport Listeners
 
-The **Client (desktop)** generates its key pair (if one doesn't exist) — and, when a pairing completes, its Client Symmetric Key (`CSK`) if it has none yet — then encodes its connection information into a QR code which **must** contain a custom URL with the following format:
+When the user triggers pairing (`StartPairing` IPC):
 
-`tapauth://pair?v=1&pk=<hex_encoded_pubkey>&p=<port>&ip4=<ipv4_address>&ip6=<ipv6_address>`
+1. The Client generates a cryptographically random 16-byte `session_id` (`sid`) and an ephemeral X25519 keypair $(x_C, X_C)$. (The Client's long-term `CSK` is generated upon first completion if none exists yet.)
+2. **UDP Listener** (if `enable_network` is true):
+   * The daemon binds an ephemeral dual-stack UDP socket (`[::]:0`, `IPV6_V6ONLY = false`, without `SO_REUSEPORT`) and opens a UDP firewall rule via `FirewallGuard::new(port, Protocol::Udp)`.
+   * Using an ephemeral pairing socket prevents datagram contention with `daemon.udp_socket` (`udp_port`) if an authentication attempt runs concurrently, and keeps the pairing socket isolated.
+   * **Loopback / Emulator NAT**: Unlike the multicast auth socket, the UDP pairing socket does **not** filter out packets sourced from `127.0.0.1` (`is_local_ip`), allowing Android emulator QEMU SLIRP NAT (`10.0.2.2:<port>` $\to$ `127.0.0.1:<slirp_ephemeral>`) to work without port redirection, while still rejecting exact self-port echoes.
+3. **BLE Discovery Advertisement** (if `enable_ble` is true):
+   * The Client computes a 10-byte pairing advertisement identifier:
+     $$\text{pairing\_adv\_id} = \text{SHA-256}(\texttt{"tapauth-ble-pair-v2"} \parallel \text{session\_id} \parallel X_C)[0..10]$$
+   * The Client advertises `pairing_adv_id` in `ServiceData(SERVICE_UUID)` (3B Flags + 28B ServiceData = 31 bytes exact legacy BLE budget; see [`ble-gatt-specification.md`](ble-gatt-specification.md)).
+   * Unpaired nearby phones that did not scan the QR code cannot recognize `pairing_adv_id` and silently ignore the advertisement — eliminating unsolicited pairing spam.
+   * The daemon keeps the **same static 4-characteristic GATT service** registered (with `PAIRING_CHAR_UUID`), avoiding Android `BD_ADDR` GATT handle cache staleness immediately after pairing.
+4. **QR Code URL**:
+   ```text
+   tapauth://pair?v=2&sid=<32 hex>&pk=<64 hex>[&p=<udp_port>][&ip4=<ipv4>][&ip6=<ipv6>]
+   ```
+   * `v=2`: Protocol v2 pairing version; every other version is refused.
+   * `sid`: 16-byte random session identifier, written as exactly 32 hex characters.
+   * `pk`: Client's 32-byte ephemeral X25519 public key $X_C$, written as exactly 64 hex characters and never the all-zero key (the Server reads an all-zero `pk` as its "skip the QR comparison" sentinel, so an honest Client never emits one).
+   * `p`, `ip4`, `ip6`: **optional** — the ephemeral UDP pairing port and the Client's IPv4/IPv6 addresses, present only when a UDP pairing socket exists; a BLE-only session omits all three and the Server must proceed without them when BLE is available. A present `p` is ASCII digits in `1..=65535` (`0` is not an endpoint).
+   * The whole URL is capped at 512 bytes (`MAX_PAIRING_URL_LEN`, `shared/src/models.rs`), every query key may appear at most once, and values are percent-encoded by the generator and percent-decoded by the parser under mirrored rules — `generate_pairing_url_v2` and `PairingInfo::parse` in `shared/src/models.rs`, with `PairingUrl.parse` in Kotlin and `shared/testdata/pairing_url_vectors.json` pinning the two together.
 
-* **`tapauth://pair`**: The scheme and action that identifies this as a TapAuth pairing request.
-* **`v=1`**: The protocol version for the pairing process (`PAIRING_VERSION`; a mismatch in either handshake message is rejected).
-* **`pk`**: The Client's **ephemeral X25519** public key for this pairing session, encoded as a hexadecimal string (`ClientPairingSession::x25519_public_key`). It is not the long-term Ed25519 identity key: both sides exchange X25519 and Ed25519 keys inside `PairingHello`/`PairingResponse`, and the shipped Android client derives the PSK from the X25519 key in `PairingResponse` rather than from `pk`.
-* **`p`**: The **TCP** port the Client is listening on for the pairing connection — an ephemeral port the daemon binds (`0.0.0.0:0`) when the QR code is generated.
-* **`ip4` / `ip6`**: The Client's IP addresses. At least one **must** be present for the Server to reach it; the URL parser itself treats both as optional (`PairingInfo::parse`).
+### Step 2: Server Initiates Unified UDP + BLE Transport Race (`PairingInit`)
 
-> **Security Warning**: The security of this initial step relies on the user scanning the QR code directly from the trusted Client's screen. An attacker could attempt to trick a user into scanning a malicious QR code (e.g., from a photo or a different screen), which would lead to pairing with the attacker's device. The Short Authentication String (SAS) in Step 4 is the critical defense against this.
+Upon scanning the QR code, the Server (Android):
+1. Parses `v`, `sid`, `pk` ($X_C$), and optional `p` / `ip4` / `ip6`.
+2. Generates its own ephemeral X25519 keypair $(x_S, X_S)$.
+3. Constructs a single `PairingPacket { version: 2, session_id, msg: PairingInit(...) }` containing:
+   * `server_x25519_public_key` ($X_S$)
+   * `server_ed25519_public_key` ($Ed_S$, the phone's long-term signing key)
+   * `server_device_name` (the phone's display name, and part of the transcript: **required and non-blank** — a name that is empty, whitespace-only, or made only of zero-width/format code points is refused with `PairingAbort(PROTOCOL_ERROR)` rather than stored, see the pre-validation in Step 3 — and at most 64 UTF-8 bytes, which the Server enforces by cutting its own name on a character boundary before sending)
+   * `supported_symmetric_algorithms`, `supported_hash_algorithms`, `supported_signature_algorithms` — the algorithms this build implements, taken from `SUPPORTED_*` in `shared/src/protocol/pairing/negotiation.rs` in list order (preferred first). Today that is one element each — `[AES_256_GCM]`, `[SHA256]`, `[ED25519]` — because v2 ships one active primitive per slot; a later release appends the new id (next free tag, never `2`) first in that slice and keeps the baseline, so a Client that implements only the baseline still finds a match. The protocol version is not negotiated: only v2 is accepted (see [`authentication-flow.md`](authentication-flow.md) §2.6).
+4. Races the transports:
+   * **UDP**: If IP & port are present, sends `PairingInit` every **500ms** (up to 15s) until `PairingResponse` arrives.
+   * **BLE**: Computes `pairing_adv_id` from `(sid, pk)` and (after a **250ms** head start for LAN UDP, or immediately if no IP/UDP is available) runs a foreground hardware-filtered `ScanFilter` matching the exact 10-byte `pairing_adv_id`, connects GATT, requests `MTU 517`, subscribes to notifications on `PAIRING_CHAR_UUID`, and writes `PairingInit`.
+   * Whichever transport delivers a valid `PairingResponse` first wins and locks the transport for Steps 3–6; the other transport attempt is cancelled.
 
-### Step 2: Server Initiates Connection
+### Step 3: Client Algorithm Negotiation, Transcript Hash & Signed `PairingResponse`
 
-The **User** scans the code with the **Server (phone)**. The app parses the URL, extracts the connection details — the address to dial and the TCP port — and generates its own key pair. It then establishes a **TCP connection** to the Client. (The `pk` value is parsed as well, but the shipped Android client does not use it for the key exchange; see Step 1.)
+Upon receiving `PairingInit` matching `session_id`:
 
-Upon connection, the Server sends a `PairingHello` message. This message contains:
-*   The Server's X25519 public key and its long-term Ed25519 public key.
-*   The Server's device name (display only).
-*   A list of cryptographic algorithms the Server supports (for signatures, symmetric encryption, and hashing).
+**Two refusals are decided before anything below runs**, because everything below is one-way: from step 2 onwards $H$, $K_{\text{c2s}}$/$K_{\text{s2c}}$ and the SAS exist, and every frame the Client sends — a refusal included — would then be tagged under them.
 
-The Client stores the Server's public keys and its list of supported algorithms for the duration of the pairing session, then replies with a `PairingResponse` containing its own X25519 and Ed25519 public keys, its device name, and the algorithms it selected from the Server's list (`selected_symmetric_algorithm`, `selected_hash_algorithm`, `selected_signature_algorithm`). The response is sent **before** the SAS is shown, so the Server has the Client's keys in time to derive the same SAS.
+* **Blank device name.** `server_device_name` must name the phone: a name that is empty, whitespace-only, or built only from zero-width/format code points is refused with `PairingAbort(PROTOCOL_ERROR)` (`Session::on_init` in `tapauthd/src/pairing.rs`, which applies the same normalization rules as the display sanitizer). No $H$, no keys, no negotiated algorithms and no session state are produced for that init, and nothing is persisted.
+* **Over-long peer name.** A `server_device_name` longer than 64 UTF-8 bytes is refused as `ProtocolError` (`ClientPairingState::handle_init`) instead of being truncated: the field is spliced into $H$ exactly as received, so silently shortening it would let two peers hash different bytes for the same handshake. `ServerPairingSession::verify_response` applies the identical rule to `response.client_device_name`, so the bound holds symmetrically. Only names *we* build are truncated (the Client cuts its own name, the Server its own, to 64 bytes on a character boundary).
 
-### Step 3: Temporary Key Agreement
+The abort of a refusal decided at that point is **sent without a MAC** (`auth_tag` empty): no $K_{\text{dir}}$ exists yet, so there is nothing to sign it with. That is the reason the decision belongs here and not after step 2 — a `PROTOCOL_ERROR` raised later could only be tagged under a key the phone never derived, which the phone's `verify_abort` reports as an invalid signature and (per Step 4) ignores. A tag-less abort is unauthenticated by construction and is likewise ignored, so the abort is informational for a peer that is misbehaving, and the Server's own deadline remains the backstop.
 
-Both devices independently compute the same temporary **Pairing Symmetric Key (`PSK`)** using X25519 and the specified KDF. This key exists only for the duration of this pairing session.
+1. The Client intersects each `supported_*` list from `PairingInit` with its own supported algorithms (preferring the active CSK's `SymmetricAlgorithm` and `HashAlgorithm` if a `CSK` already exists so all paired Servers remain compatible with multicast packets). If any intersection is empty, the Client sends `PairingAbort(UNSUPPORTED_ALGORITHM)` and aborts.
+2. The Client computes the canonical **Handshake Transcript Hash** $H$ over all security-relevant parameters (`version`, `session_id`, $X_C$, $X_S$, $Ed_C$, $Ed_S$, normalized device names, the full `supported_*` lists, and the selected algorithms — see [`cryptography-specification.md`](cryptography-specification.md)).
+3. The Client signs `"tapauth-pair-client-sig-v2" || H` using its static Ed25519 private key ($Ed_{C,\text{priv}}$) to prove possession of $Ed_C$ and bind it to the transcript.
+4. The Client computes $Z = \text{X25519}(x_C, X_S)$ (aborting on all-zero low-order output) and derives:
+   $$\text{PRK} = \text{HKDF-Extract}_{\text{SHA256}}(\text{salt} = H,\; \text{IKM} = Z)$$
+   * $K_{\text{c2s}} = \text{HKDF-Expand}(\text{PRK},\; \texttt{"tapauth-pair-v2-c2s"},\; 32)$
+   * $K_{\text{s2c}} = \text{HKDF-Expand}(\text{PRK},\; \texttt{"tapauth-pair-v2-s2c"},\; 32)$
+   * $\text{SAS\_bytes} = \text{HKDF-Expand}(\text{PRK},\; \texttt{"tapauth-pair-v2-sas"},\; 8)$
+5. The Client sends `PairingResponse` on the winning transport (and over UDP caches it so duplicate `PairingInit` retries update `peer_addr` and receive the cached `PairingResponse`).
 
-### Step 4: Anti-MITM Verification
+### Step 4: Server QR Key Verification, Signature Check & Mutual SAS Comparison
 
-This is the most critical security step in the pairing process. Both devices compute and display a **Short Authentication String (SAS)**.
+Before displaying the SAS to the user, the Server **must**:
+1. Perform a **constant-time equality check**: `response.client_x25519_public_key == qr.pk` (`ServerPairingSession::verify_response`, `shared/src/protocol/pairing/server.rs`). An active attacker cannot substitute $X_C$ even before SAS verification.
+2. Compute $H$ from its own view of the handshake fields and verify `response.client_signature` over `"tapauth-pair-client-sig-v2" || H` using `response.client_ed25519_public_key`.
+3. Verify the selected algorithms are in its own supported sets.
+4. Compute $Z = \text{X25519}(x_S, X_C)$ (rejecting all-zero output), $\text{PRK}$, $K_{\text{c2s}}$, $K_{\text{s2c}}$, and the 6-digit SAS, where $n = \text{u64::from\_be\_bytes}(\text{SAS\_bytes}) \bmod 1{,}000{,}000$:
+   $$\text{SAS} = \text{format!}(\text{"\{:03\}-\{:03\}"},\; n / 1000,\; n \bmod 1000)$$
+   i.e. the zero-padded three-digit halves joined by a hyphen (`format!("{:03}-{:03}", …)` in `shared/src/crypto/kdf.rs`, the string both sides display unchanged — `"123-456"`).
 
-**SAS Generation:**
-The SAS **must** be a 6-digit number derived as follows:
-1.  Create a byte string by concatenating the two ephemeral X25519 public keys, Client first: `input_material = Client_X25519_Pub | Server_X25519_Pub`.
-2.  Derive 8 bytes with HKDF-SHA256, using the `PSK` as the input keying material (`IKM`), no salt, and `info = "tapauth-sas" | input_material` (the label and the concatenated public keys are passed as successive HKDF info chunks, `derive_sas` in `shared/src/crypto/kdf.rs`).
-3.  Read those 8 bytes as a big-endian `u64`, calculate `value mod 1,000,000`, and pad with leading zeros if necessary to create a 6-digit string. This string should be displayed to the user in a friendly format (e.g., "123-456").
+A failing check does **not** produce a `PairingAbort`. The Server logs the rejection (`PairingResponse rejected: …`) and **silently drops the packet**, then keeps listening for an acceptable `PairingResponse` on either transport until its own response deadline expires (`server-android/app/src/main/java/dev/rourunisen/tapauth/network/PairingSession.kt:72-74`, `:473-500`, `:503-530`; the Rust entry point returns `ProtocolError::ChallengeMismatch` / `ProtocolError::UnsupportedAlgorithm` / `ProtocolError::InvalidMessageFormat` — the last one for a `client_device_name` over 64 UTF-8 bytes, which is refused rather than truncated — for the caller to swallow). This is deliberate: the pairing UDP port and the BLE characteristic are reachable by anyone on the link, so one spoofed packet must not be able to abort a pairing that is in progress. Only an *authenticated* `PairingAbort` (MAC'd under $K_{\text{dir}}$, see below) or the deadline ends the session early, and the Server's own abort reasons are limited to `USER_REJECTED_SAS` and `SESSION_EXPIRED` (`PairingSession.kt:177-181`). `KEY_MISMATCH` and `PROTOCOL_ERROR` therefore remain declared in [`proto/auth_protocol.proto`](../../../proto/auth_protocol.proto) but are never emitted for an unverifiable response — neither side learns why the packet was ignored.
 
-**The user MUST visually confirm that the SAS displayed on the Client screen and the Server screen are identical before proceeding.**
+Because **both** $K_{\text{c2s}}/K_{\text{s2c}}$ and $\text{SAS}$ are derived from $\text{HKDF-Extract}(\text{salt}=H, \text{ikm}=Z)$, tampering with **any** field — $X_C, X_S, Ed_C, Ed_S$, device names, or negotiated algorithms — produces a completely different $H$ and causes an overwhelming SAS mismatch (1 in $10^6$).
 
-Failure to verify the SAS could allow a Man-in-the-Middle (MITM) attacker to intercept the connection and compromise the shared key. The user interface on both devices **must** make this verification step prominent and mandatory. For example, the confirmation button could be disabled until the user actively confirms the match via a checkbox.
+**The user MUST visually confirm that the SAS displayed on both screens is identical before confirming.**
+* If the user cancels/rejects on either screen, that side sends an authenticated `PairingAbort(USER_REJECTED_SAS)` (`auth_tag = HMAC-SHA256(K_dir, "tapauth-pair-v2-abort" || H || be32(reason))`), via `CancelPairing` IPC from the GUI on Linux or directly from the Phone.
 
-### Step 5: Client Sends Shared Key
+### Step 5: Authenticated Provisioning (`PairingConfirmClient`)
 
-After the user confirms the SAS on the Client, the Client sends a `PairingCskMessage` message to the Server. This message contains the long-term `CSK`, encrypted with the temporary `PSK`, plus the username of the user who is pairing (`encrypted_csk`, `username`). The algorithm choices were already sent in `PairingResponse`; today they carry no operational weight, because each algorithm enumeration defines a single value and every send and verify path hardcodes it.
+Once the user approves the SAS on the Desktop (`CompletePairing` IPC):
+1. The Client constructs `PairingProvisionPayload { csk, username, client_hostname }` (so `username` and `client_hostname` are **authenticated and encrypted**, never sent in cleartext).
+2. The Client encrypts `PairingProvisionPayload` using **AEAD** under $K_{\text{c2s}}$ with a random 12-byte nonce and:
+   $$\text{AAD} = \texttt{"tapauth-pair-v2-provision"} \parallel H$$
+3. Over UDP, the Client sends `PairingConfirmClient` to the latest `peer_addr` and retransmits every **500ms** until `PairingConfirmServer` (or `PairingAbort`) arrives or the session expires. Meanwhile, once the Phone has entered the awaiting-confirm state, it sends `PairingKeepalive` every **1000ms** over UDP so home NATs and QEMU SLIRP's ~4-second UDP NAT mapping do not expire during human SAS inspection. Over BLE, the Client notifies `PAIRING_CHAR_UUID`.
 
-### Step 6: Server Confirms and Finalizes
+### Step 6: Mutual Confirmation & Persistence (`PairingConfirmServer`)
 
-The Server receives the message and decrypts it using the `PSK` to retrieve the `CSK`. After the user confirms the SAS on the Server, it computes a hash of the received `CSK` using SHA-256 — the only hash the protocol defines, and the value the implementation always reports in `hash_algorithm` regardless of what the Client selected. It then sends a `PairingComplete` message back to the Client, containing:
-*   A `success` flag (a false flag is treated as a failed pairing).
-*   The `hash_algorithm` used.
-*   The resulting hash, encrypted with the `PSK`.
+Once the user confirms the SAS on the Phone **and** `PairingConfirmClient` arrives:
+1. The Server decrypts `PairingConfirmClient.encrypted_payload` under $K_{\text{c2s}}$ with $\text{AAD} = \texttt{"tapauth-pair-v2-provision"} \parallel H$, extracting `csk`, `username`, and `client_hostname`.
+2. The Server signs `"tapauth-pair-server-sig-v2" || H || csk` with its static Ed25519 private key ($Ed_{S,\text{priv}}$), proving possession of $Ed_S$ and confirming exact receipt of `csk`.
+3. The Server encrypts `PairingCompletePayload { server_signature }` under $K_{\text{s2c}}$ with $\text{AAD} = \texttt{"tapauth-pair-v2-complete"} \parallel H$, persists `(Ed_C, client_hostname, csk, selected_symmetric_algorithm, selected_hash_algorithm, selected_signature_algorithm, allowed_users += username)`, and sends `PairingConfirmServer` (3 times at `0ms, 100ms, 250ms` over UDP, or once via GATT Write on `PAIRING_CHAR_UUID` over BLE) — always the **same cached frame**, never re-encrypted. The Server then keeps the session and the link open for a **1.25 s linger** (200 ms receive slices) in which every retransmitted `PairingConfirmClient` is decrypted again and answered with those same `PairingConfirmServer` bytes: the Client retries every **500 ms** until the proof verifies, so a burst lost in full would otherwise leave the Phone paired and the Client timing out.
+4. The Client decrypts `PairingConfirmServer` under $K_{\text{s2c}}$ with $\text{AAD} = \texttt{"tapauth-pair-v2-complete"} \parallel H$, verifies `server_signature` under $Ed_S$, persists `PairedServer` (including `Ed_S`, `selected_signature_algorithm`, `allowed_users += username`) and the active CSK algorithm metadata, and closes the pairing socket / stops BLE pairing advertisement.
+5. The session keys are **not** dropped by the completion proof. $Z$ and $\text{PRK}$ do not outlive the derivation ($Z$ is dropped as soon as the keys are derived, $\text{PRK}$ lives in a zeroizing buffer inside it) and each side takes its ephemeral X25519 secret at the same point, but $K_{\text{c2s}}, K_{\text{s2c}}$ and $H$ stay live until `conclude()`: the Client concludes once `verify_confirm_server` returns `Ok`, the Phone when its linger is over (or on an abort), so a retransmitted `PairingConfirmClient` can still be decrypted while the Client may be retrying. Releasing the session object also concludes it (`Drop`).
 
-### Step 7: Completion
-
-The Client decrypts the confirmation. If the hash matches the hash of the `CSK` it sent (calculated with the same algorithm), the pairing is successful. Both devices **must** now securely discard the ephemeral `PSK` and store the long-term `CSK` and the peer's Ed25519 public key (the Client stores it as a paired server, the Server as a paired device together with its `allowed_users` list).
+`create_confirm_server` is therefore **not** a terminal transition: it records that the proof went out, which refuses a second proof and a late `create_init` (`ProtocolError::ConfirmationAlreadySent`), while `process_confirm_client` stays valid and idempotent — that is what lets the Phone answer the Client's retransmissions after the burst. `conclude()` is the only transition that ends a session: afterwards every entry point fails with `ProtocolError::SessionConcluded`, `verify_confirm_server` included (it reports the conclusion rather than a missing key, so the failure is not mistaken for a tampered message on the other side of the FFI), and both `create_abort` and dropping the session conclude it as well.

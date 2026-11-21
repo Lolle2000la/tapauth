@@ -35,8 +35,11 @@ import org.junit.runner.RunWith
  *   dev.rourunisen.tapauth.e2e.test/dev.rourunisen.tapauth.crypto.TapAuthTestRunner
  * ```
  *
- * This is deliberately **not** wired into CI: hosted runners have no real radio, and the CI
- * instrumentation run is filtered to `TapAuthCryptoTest`. Treat it as a repeatable manual check.
+ * This is deliberately **not** wired into CI. Hosted runners have no real radio, and neither CI
+ * instrumentation run could reach it anyway: both select their classes explicitly, and neither
+ * names this one. `scripts/ci/run-all-e2e.sh` runs `TapAuthCryptoTest` only (`-e class`), and
+ * `scripts/test-e2e.sh` drives `PairingE2eTest` in five sub-phases over three distros (Ubuntu on
+ * the host, Fedora and Arch in systemd containers). Treat it as a repeatable manual check.
  *
  * The group addresses MUST match `IPV4_MULTICAST_ADDR` / `IPV6_MULTICAST_ADDR` in
  * `shared/src/network.rs` (and the constants in `AuthenticationService`):

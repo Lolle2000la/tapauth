@@ -1,5 +1,6 @@
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 use prost::Message;
+use shared::ipc::framing;
 use shared::ipc::pb as ipc;
 use std::io;
 use std::path::Path;
@@ -9,6 +10,21 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 
 const DEFAULT_SOCKET: &str = "/run/tapauthd/tapauthd.sock";
+
+/// Read timeout for `CompletePairing`, the admin request that waits on a
+/// pairing worker.
+///
+/// It must outlive the daemon's own bound: the worker answers a pending
+/// pairing at most `SESSION_REPLY_TIMEOUT` (135 s — `SESSION_DEADLINE`, 120 s,
+/// plus 5 s of slack) after `StartPairing`, see `tapauthd/src/pairing.rs`. A
+/// client read timeout at or below `SESSION_DEADLINE` therefore races the
+/// daemon into a spurious `ResponseTimeout` for a slow-but-legitimate pairing.
+/// `wait_for_pairing` keeps its own, longer 300 s read timeout.
+///
+/// The invariant is **not** compiler-enforced — the GUI cannot depend on
+/// `tapauthd` — so recheck `SESSION_DEADLINE`/`SESSION_REPLY_TIMEOUT` whenever
+/// this value changes.
+const PAIRING_REPLY_READ_TIMEOUT: Duration = Duration::from_secs(150);
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum GuiIpcError {
@@ -75,9 +91,10 @@ pub async fn daemon_socket() -> io::Result<UnixStream> {
 }
 
 async fn write_framed(stream: &mut UnixStream, msg: &[u8]) -> io::Result<()> {
-    let len = msg.len() as u32;
+    let prefix = framing::encode_len(msg.len())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let mut buf = BytesMut::with_capacity(4 + msg.len());
-    buf.put_u32(len);
+    buf.extend_from_slice(&prefix);
     buf.extend_from_slice(msg);
     stream.write_all(&buf).await
 }
@@ -85,13 +102,8 @@ async fn write_framed(stream: &mut UnixStream, msg: &[u8]) -> io::Result<()> {
 async fn read_framed(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 10 * 1024 * 1024 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame too large",
-        ));
-    }
+    let len = framing::decode_len(len_buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let mut data = vec![0u8; len];
     stream.read_exact(&mut data).await?;
     Ok(data)
@@ -165,7 +177,40 @@ pub async fn get_paired_servers() -> Result<Vec<ipc::PairedServerInfo>, GuiIpcEr
     }
 }
 
-pub async fn start_pairing() -> Result<(String, u16), GuiIpcError> {
+/// A pairing session opened by `StartPairing`.
+///
+/// `session_id` together with `port` identifies the session to the daemon, so
+/// an abandoned pairing attempt can be cancelled instead of holding its UDP
+/// socket and BLE advertisement until the daemon's own timeout.
+#[derive(Debug, Clone)]
+pub struct PairingSession {
+    /// The v2 `tapauth://pair?...` URL to render as a QR code.
+    pub url: String,
+    /// Ephemeral UDP pairing port the daemon listens on, or `None` for a BLE-only
+    /// session, which bound no socket and therefore has no port to name. The wire
+    /// spells that absence by leaving the field unset; `0` is not a port.
+    pub port: Option<u16>,
+    /// The 16-byte session identifier carried by the QR URL's `sid`.
+    pub session_id: Vec<u8>,
+}
+
+/// The wire's `optional uint32 port` on the way in: absent is a BLE-only session.
+///
+/// A present value must be a real UDP port, so `0` (the sentinel this wire used to
+/// carry for "BLE-only") and anything past `65535` are rejected instead of being
+/// turned into absence behind the caller's back.
+fn pairing_port(port: Option<u32>) -> Result<Option<u16>, GuiIpcError> {
+    match port {
+        None => Ok(None),
+        Some(port) => u16::try_from(port)
+            .ok()
+            .filter(|port| *port != 0)
+            .map(Some)
+            .ok_or(GuiIpcError::UnexpectedResponse),
+    }
+}
+
+pub async fn start_pairing() -> Result<PairingSession, GuiIpcError> {
     let request = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::StartPairing(
             ipc::StartPairingRequest {},
@@ -179,15 +224,44 @@ pub async fn start_pairing() -> Result<(String, u16), GuiIpcError> {
     }
 
     match response.payload {
-        Some(ipc::admin_response::Payload::StartPairing(resp)) => Ok((resp.url, resp.port as u16)),
+        Some(ipc::admin_response::Payload::StartPairing(resp)) => Ok(PairingSession {
+            url: resp.url,
+            port: pairing_port(resp.port)?,
+            session_id: resp.session_id,
+        }),
         _ => Err(GuiIpcError::UnexpectedResponse),
     }
 }
 
-pub async fn wait_for_pairing(port: u32) -> Result<(String, u16), GuiIpcError> {
+/// Build the admin request that abandons the pairing session identified by
+/// `port` and `session_id` (see `proto/ipc.proto`'s `CancelPairingRequest`).
+fn cancel_pairing_request(port: Option<u16>, session_id: &[u8]) -> ipc::AdminRequest {
+    ipc::AdminRequest {
+        payload: Some(ipc::admin_request::Payload::CancelPairing(
+            ipc::CancelPairingRequest {
+                port: port.map(u32::from),
+                session_id: session_id.to_vec(),
+            },
+        )),
+    }
+}
+
+pub async fn cancel_pairing(port: Option<u16>, session_id: Vec<u8>) -> Result<(), GuiIpcError> {
+    let response = send_admin_request(cancel_pairing_request(port, &session_id)).await?;
+
+    if response.status != ipc::AdminStatus::AdminSuccess as i32 {
+        return Err(GuiIpcError::DaemonError(err_msg(&response)));
+    }
+
+    Ok(())
+}
+
+pub async fn wait_for_pairing(port: Option<u16>) -> Result<(String, Option<u16>), GuiIpcError> {
     let request = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::WaitForPairing(
-            ipc::WaitForPairingRequest { port },
+            ipc::WaitForPairingRequest {
+                port: port.map(u32::from),
+            },
         )),
     };
 
@@ -199,20 +273,23 @@ pub async fn wait_for_pairing(port: u32) -> Result<(String, u16), GuiIpcError> {
 
     match response.payload {
         Some(ipc::admin_response::Payload::WaitForPairing(resp)) => {
-            Ok((resp.sas_code, resp.port as u16))
+            Ok((resp.sas_code, pairing_port(resp.port)?))
         }
         _ => Err(GuiIpcError::UnexpectedResponse),
     }
 }
 
-pub async fn complete_pairing(port: u32) -> Result<String, GuiIpcError> {
+pub async fn complete_pairing(port: Option<u16>) -> Result<String, GuiIpcError> {
     let request = ipc::AdminRequest {
         payload: Some(ipc::admin_request::Payload::CompletePairing(
-            ipc::CompletePairingRequest { port },
+            ipc::CompletePairingRequest {
+                port: port.map(u32::from),
+            },
         )),
     };
 
-    let response = send_admin_request(request).await?;
+    let response =
+        send_admin_request_with_read_timeout(request, PAIRING_REPLY_READ_TIMEOUT).await?;
 
     if response.status != ipc::AdminStatus::AdminSuccess as i32 {
         return Err(GuiIpcError::DaemonError(err_msg(&response)));
@@ -356,5 +433,113 @@ pub async fn get_config() -> Result<ClientConfigValues, GuiIpcError> {
             enable_network: resp.enable_network,
         }),
         _ => Err(GuiIpcError::UnexpectedResponse),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The daemon's own source, compiled into this test binary: the GUI cannot
+    /// depend on `tapauthd`, but the timeout it must outlive lives there, and
+    /// parsing the real file is what keeps the two from drifting apart.
+    const DAEMON_PAIRING_SRC: &str = include_str!("../../tapauthd/src/pairing.rs");
+
+    /// The seconds of `tapauthd/src/pairing.rs`'s `const <name>: Duration =
+    /// Duration::from_secs(<n>)`.
+    ///
+    /// Deliberately literal: the point is to notice a change to the daemon's
+    /// bound, so a rewrite this cannot read must fail loudly rather than skip.
+    fn daemon_duration_secs(name: &str) -> u64 {
+        let marker = format!("const {name}: Duration = Duration::from_secs(");
+        let start = DAEMON_PAIRING_SRC.find(&marker).unwrap_or_else(|| {
+            panic!(
+                "`{name}` is not declared as `const {name}: Duration = \
+                 Duration::from_secs(<n>)` in tapauthd/src/pairing.rs any more; \
+                 re-read that file and update this test"
+            )
+        }) + marker.len();
+        let rest = &DAEMON_PAIRING_SRC[start..];
+        let end = rest.find(')').unwrap_or_else(|| {
+            panic!("`{name}` in tapauthd/src/pairing.rs has no closing parenthesis")
+        });
+        rest[..end].trim().parse().unwrap_or_else(|_| {
+            panic!("`{name}` in tapauthd/src/pairing.rs is not a plain number of seconds")
+        })
+    }
+
+    #[test]
+    fn complete_pairing_read_timeout_outlives_the_daemon_deadline() {
+        let deadline = Duration::from_secs(daemon_duration_secs("SESSION_DEADLINE"));
+        let reply = Duration::from_secs(daemon_duration_secs("SESSION_REPLY_TIMEOUT"));
+
+        // What this is really guarding: the daemon answers `CompletePairing` at
+        // or before its reply bound, so the client must wait longer than that.
+        assert!(
+            PAIRING_REPLY_READ_TIMEOUT > reply,
+            "CompletePairing would time out at {PAIRING_REPLY_READ_TIMEOUT:?}, before the \
+             daemon's {reply:?} reply bound"
+        );
+        assert!(
+            PAIRING_REPLY_READ_TIMEOUT >= deadline + Duration::from_secs(5),
+            "CompletePairing would time out at {PAIRING_REPLY_READ_TIMEOUT:?}, within the \
+             daemon's {deadline:?} session deadline plus its slack"
+        );
+        assert_eq!(PAIRING_REPLY_READ_TIMEOUT, Duration::from_secs(150));
+    }
+
+    #[test]
+    fn cancel_pairing_request_carries_the_port_and_session_id() {
+        let session_id: Vec<u8> = (0u8..16).collect();
+
+        match cancel_pairing_request(Some(41234), &session_id).payload {
+            Some(ipc::admin_request::Payload::CancelPairing(request)) => {
+                assert_eq!(request.port, Some(41234));
+                assert_eq!(request.session_id, session_id);
+            }
+            other => panic!("expected a CancelPairing payload, got {other:?}"),
+        }
+    }
+
+    /// A BLE-only session has no port, and the request must say so by leaving the
+    /// field unset — not by sending `0`, which is what the daemon used to read as
+    /// "BLE-only" and now refuses as an invalid port.
+    ///
+    /// The defect this catches: a caller that serializes absence as `Some(0)`,
+    /// which the daemon answers with an "Invalid pairing port" error instead of
+    /// cancelling (or, worse, a daemon that reads `0` back as absence).
+    #[test]
+    fn cancel_pairing_request_serializes_absence_as_absence() {
+        let session_id: Vec<u8> = (0u8..16).collect();
+
+        match cancel_pairing_request(None, &session_id).payload {
+            Some(ipc::admin_request::Payload::CancelPairing(request)) => {
+                assert_eq!(request.port, None, "absence must not be sent as 0");
+                assert_eq!(request.session_id, session_id);
+            }
+            other => panic!("expected a CancelPairing payload, got {other:?}"),
+        }
+    }
+
+    /// The reply's `optional uint32 port` is read the same way: absent stays absent,
+    /// a real port survives, and the `0` sentinel is refused rather than decoded
+    /// into "BLE-only".
+    ///
+    /// The defect this catches: `resp.port as u16`, which turns both absence and `0`
+    /// into the same `0`, so a BLE-only session and a daemon that still sends the
+    /// sentinel are indistinguishable — and the GUI would then send `0` back.
+    #[test]
+    fn a_pairing_port_is_absent_or_a_real_port() {
+        assert!(matches!(pairing_port(None), Ok(None)));
+        assert!(matches!(pairing_port(Some(41234)), Ok(Some(41234))));
+        assert!(matches!(pairing_port(Some(65535)), Ok(Some(65535))));
+        assert!(matches!(
+            pairing_port(Some(0)),
+            Err(GuiIpcError::UnexpectedResponse)
+        ));
+        assert!(matches!(
+            pairing_port(Some(65536)),
+            Err(GuiIpcError::UnexpectedResponse)
+        ));
     }
 }

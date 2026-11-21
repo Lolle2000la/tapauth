@@ -13,8 +13,8 @@
 use prost::Message;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 
@@ -25,6 +25,81 @@ use super::NetworkError;
 use crate::protocol::pb::EncryptedPacket;
 
 const MAX_UDP_MESSAGE_SIZE: usize = 16 * 1024; // 16KB, matches TCP pairing path
+
+/// Whether a received datagram is small enough to hand to `EncryptedPacket::decode`.
+///
+/// The one spelling of the cap: the receive loop below gates on it before decoding, so
+/// the largest thing a peer can make this process decode is `MAX_UDP_MESSAGE_SIZE`.
+/// Crate-visible rather than public — the `fuzz/` target reaches it through
+/// `datagram_within_size_cap_for_fuzz` (`fuzz-api`).
+pub(crate) fn datagram_within_size_cap(len: usize) -> bool {
+    len <= MAX_UDP_MESSAGE_SIZE
+}
+
+/// `fuzz-api` only: [`datagram_within_size_cap`], so the packet-decode target's domain
+/// is the set of datagrams this receive path would actually decode. Uncompiled in every
+/// other configuration.
+#[cfg(feature = "fuzz-api")]
+#[doc(hidden)]
+pub fn datagram_within_size_cap_for_fuzz(len: usize) -> bool {
+    datagram_within_size_cap(len)
+}
+
+/// How often the aggregate "dropped a datagram" warning may fire.
+///
+/// The receive port is reachable by every host on the link, so the rate of
+/// datagrams that never become a response is set by an attacker, not by the
+/// phone. A `warn!` per drop would therefore make the log the amplification
+/// target of a single unauthenticated packet: one host could fill the journal at
+/// line rate, leaving journald's own rate limiter as the only bound, and each
+/// line would say no more than the aggregate does. Per-drop detail is logged at
+/// `debug`; the aggregate is reported at `warn` at most once per this interval.
+const DROP_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Datagrams dropped before they could become a response, since process start.
+static DROPPED_DATAGRAMS: AtomicU64 = AtomicU64::new(0);
+
+/// When the last aggregate drop warning was emitted (`None`: never).
+static DROP_WARN_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Record a datagram that was dropped instead of being returned to the caller.
+///
+/// Dropping is not the same decision as failing: a datagram we cannot read says
+/// nothing about the attempt, and the wait for a real response continues. Only
+/// [`DROP_WARN_INTERVAL`] bounds the `warn`, because the log would otherwise be
+/// the place an unauthenticated host amplifies one datagram into unbounded
+/// output. (The session layer rate limits its own `warn` for the frames that
+/// *do* decode but fail to authenticate, for the same reason; its replay notice
+/// is the one line there that stays per occurrence, because its rate is set by
+/// the retransmission interval rather than by the sender.)
+fn record_dropped_datagram(reason: &str, addr: SocketAddr, len: usize) {
+    let dropped = DROPPED_DATAGRAMS.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::debug!(
+        "Dropped a datagram from {} ({} bytes): {}; still waiting for a response",
+        addr,
+        len,
+        reason
+    );
+
+    let mut last_warn = DROP_WARN_AT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let due = match *last_warn {
+        Some(at) => at.elapsed() >= DROP_WARN_INTERVAL,
+        None => true,
+    };
+    if due {
+        *last_warn = Some(Instant::now());
+        tracing::warn!(
+            "Dropped {} unusable UDP datagram(s) so far (most recent: {} bytes from {}: {}); \
+             still waiting for a response",
+            dropped,
+            len,
+            addr,
+            reason
+        );
+    }
+}
 
 // Track whether IPv6 is available (cached after first check)
 static IPV6_AVAILABLE: AtomicBool = AtomicBool::new(true);
@@ -529,6 +604,14 @@ pub async fn send_udp_unicast(
 }
 
 /// Receive an encrypted packet from UDP - async
+///
+/// Returns the first datagram that decodes; every datagram that does not is
+/// dropped here rather than reported, so an undecodable frame can neither end
+/// the caller's wait nor be mistaken for a reply. Attribution — whether the
+/// decoded frame really answers the request in flight — happens above this
+/// layer, and only an attributed answer may conclude an attempt. A dropped
+/// datagram is counted and logged at `debug`, with one aggregate `warn` per
+/// [`DROP_WARN_INTERVAL`] so the log cannot be used as an amplifier.
 pub async fn receive_udp_packet(
     socket: &UdpSocket,
 ) -> Result<(EncryptedPacket, SocketAddr), NetworkError> {
@@ -567,6 +650,12 @@ pub async fn receive_udp_packet(
         if local_port == Some(addr.port()) && is_local_ip(&src_ip) {
             tracing::debug!("Ignored self-echoed UDP packet from {}", addr);
             // drop and continue waiting for next packet
+            //
+            // Yielding before the next read matters on the drop paths only: a
+            // sustained flood keeps `recv_from` ready, so a loop that never
+            // awaits never returns `Pending` and the caller's timeout is never
+            // polled. On any other path this is one extra scheduler turn.
+            tokio::task::yield_now().await;
             continue;
         }
 
@@ -581,6 +670,11 @@ pub async fn receive_udp_packet(
         if !skip_local_filter && is_local_ip(&src_ip) {
             tracing::debug!("Ignored self-sent UDP packet from {}", addr);
             // drop and continue waiting for next packet
+            //
+            // Same reason as the self-echo branch above: the caller's deadline
+            // is only observable at a yield point, so no drop path may loop
+            // without one.
+            tokio::task::yield_now().await;
             continue;
         }
 
@@ -597,14 +691,31 @@ pub async fn receive_udp_packet(
                 "buffer length mismatch",
             ))
         })?;
-        if packet_bytes.len() > MAX_UDP_MESSAGE_SIZE {
-            tracing::warn!(
-                "UDP packet too large ({} bytes), dropping",
-                packet_bytes.len()
+        if !datagram_within_size_cap(packet_bytes.len()) {
+            record_dropped_datagram(
+                "larger than the maximum datagram size",
+                addr,
+                packet_bytes.len(),
             );
+            // Back off to the scheduler before reading again: `recv_from` can
+            // keep returning data without ever yielding, and the caller's
+            // timeout only fires at a yield point.
+            tokio::task::yield_now().await;
             continue;
         }
-        let packet = EncryptedPacket::decode(packet_bytes)?;
+        // A datagram that does not decode is not a response to us: drop it and
+        // keep waiting for one that is. Returning the error here would let any
+        // host on the link end the attempt with a single malformed datagram.
+        let packet = match EncryptedPacket::decode(packet_bytes) {
+            Ok(packet) => packet,
+            Err(e) => {
+                record_dropped_datagram(&e.to_string(), addr, packet_bytes.len());
+                // Same reason as above: a sustained flood must not be able to
+                // hold this loop away from the caller's deadline.
+                tokio::task::yield_now().await;
+                continue;
+            }
+        };
         return Ok((packet, addr));
     }
 }
@@ -707,6 +818,113 @@ mod tests {
             // Every returned interface carries at least one usable address.
             assert!(iface.ipv4.is_some() || iface.ipv6.is_some());
         }
+    }
+
+    /// Both halves of the read-then-write handoff must compare the address, and
+    /// each defect is only visible on the path it lives on.
+    ///
+    /// A refresh whose result is written but then compared against a stale local
+    /// (what a "don't hold the lock across a syscall" refactor produces) answers
+    /// `false` for every non-loopback address on the one call that takes the
+    /// write path: the local it compares was read before the refresh ran, so on a
+    /// cold cache it is empty and nothing is local. That call is therefore the
+    /// first one made here, and the address it asks about is a host interface
+    /// address, whose right answer is `true` — only a stale snapshot says
+    /// otherwise. A `false`-answering address there would be vacuous: a stale
+    /// snapshot answers `false` for that too, and so does a correct cache.
+    ///
+    /// A membership test replaced by a non-emptiness check answers `true` for
+    /// every address. On the fast read path the documentation address catches it
+    /// while the cache is warm; on the write path only an expired cache reaches
+    /// the comparison, so the documentation address is asserted again after the
+    /// cache has been forced stale (by writing `last_refresh` back, not by
+    /// sleeping) — that call re-enumerates a set it has just found non-empty, and
+    /// must still answer `false`.
+    ///
+    /// Both preconditions are asserted rather than assumed: the cold half fails
+    /// loudly if a test earlier in this binary already initialised the cache, and
+    /// the expired half sets `last_refresh` itself so no concurrent refresh can
+    /// turn it into a fast-path call.
+    ///
+    /// The two defects point in opposite directions, which is why the host's own
+    /// address and the documentation address are both asserted on the write path
+    /// instead of one standing in for the other.
+    #[test]
+    fn an_interface_address_is_local_and_a_documentation_address_is_not() {
+        // Loopback returns before the cache is even initialised, so this holds on
+        // any host and warms nothing.
+        assert!(is_local_ip(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(is_local_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+
+        // Enumerated before the cache is touched: the assertions below need the
+        // host's addresses in hand while the cache is still cold.
+        let mut local: Vec<(String, IpAddr)> = Vec::new();
+        for iface in get_multicast_interfaces() {
+            for addr in [iface.ipv4.map(IpAddr::V4), iface.ipv6.map(IpAddr::V6)]
+                .into_iter()
+                .flatten()
+            {
+                local.push((iface.name.clone(), addr));
+            }
+        }
+
+        if local.is_empty() {
+            // No non-loopback interface on this host, so the refresh path has
+            // no address to be right about and only the loopback half applies.
+            return;
+        }
+
+        // The cold half only discriminates on a genuinely uninitialised cache:
+        // `is_local_ip` mutates a process-wide static that every lib test in this
+        // binary shares, so a test that called it first would leave the cache
+        // warm and silently downgrade the assertion below to a warm one.
+        assert!(
+            INTERFACE_ADDR_CACHE.get().is_none(),
+            "INTERFACE_ADDR_CACHE is already initialised, so the cold assertion below would \
+             be answered from a warm cache and prove nothing"
+        );
+
+        // The first cache-touching call answers `true`. On a cold cache it goes
+        // through the write path, whose comparison is the one a stale snapshot
+        // gets wrong.
+        let (name, addr) = &local[0];
+        assert!(
+            is_local_ip(addr),
+            "{addr} is assigned to {name} but the cold cache said it is not local"
+        );
+
+        // Every other host address, now on the warm fast path.
+        for (name, addr) in &local[1..] {
+            assert!(
+                is_local_ip(addr),
+                "{addr} is assigned to {name} but is_local_ip said it is not local"
+            );
+        }
+
+        // TEST-NET-3 (RFC 5737) is reserved for documentation and belongs to no
+        // interface. A host that really used it would fail here, and that is the
+        // only assumption these assertions make.
+        let documentation = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        assert!(
+            !is_local_ip(&documentation),
+            "the warm cache answered true for an address no interface carries"
+        );
+
+        // Force the cache stale deterministically rather than sleeping out the
+        // TTL: a concurrent refresh landing inside such a window would leave the
+        // cache warm and send this call down the fast path, skipping the
+        // write-path comparison without failing.
+        {
+            let cache = INTERFACE_ADDR_CACHE
+                .get()
+                .expect("the assertions above initialised the cache");
+            let mut guard = cache.write().expect("the cache lock is not poisoned");
+            guard.last_refresh = Instant::now() - INTERFACE_CACHE_TTL * 2;
+        }
+        assert!(
+            !is_local_ip(&documentation),
+            "the expired cache answered true for an address no interface carries"
+        );
     }
 
     #[test]

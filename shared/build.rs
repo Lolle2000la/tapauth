@@ -47,7 +47,24 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=../proto/ipc.proto");
 
     let mut config = prost_build::Config::new();
-    config.type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
+    // serde for every generated message, and for every enum/oneof except the
+    // three cryptographic algorithm enums: those get hand-written
+    // `Serialize`/`Deserialize` impls in `src/protocol/algorithms.rs` so JSON
+    // carries the canonical proto names ("AES_256_GCM", "ED25519") instead of
+    // the Rust variant names. A derive here would make those impls conflict.
+    config.message_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
+    for path in [
+        ".tapauth.protocol.PayloadType",
+        ".tapauth.protocol.PairingAbortReason",
+        ".tapauth.protocol.PairingPacket.msg",
+        ".tapauth.ipc.PamOutcome",
+        ".tapauth.ipc.AdminStatus",
+        ".tapauth.ipc.IpcEnvelope.msg",
+        ".tapauth.ipc.AdminRequest.payload",
+        ".tapauth.ipc.AdminResponse.payload",
+    ] {
+        config.enum_attribute(path, "#[derive(serde::Serialize, serde::Deserialize)]");
+    }
     if protoc_needs_proto3_optional_flag() {
         config.protoc_arg(PROTO3_OPTIONAL_FLAG);
     }

@@ -1,32 +1,32 @@
-# User authentication interaction flow
+# User Authentication Interaction Flow (v2)
 
 ## User grants authentication on server (i.e. scans their fingerprint)
 
-When the server receives an authentication request from a client, it will prompt the user to authenticate. Currently, we only conceive of biometric authentication to be sufficiently secure and user-friendly for this purpose, and most other methods could be just as well handled by the client. The user will be asked to scan their fingerprint (or use another biometric method) to authenticate. As of this writing, normal android biometric authentication will be used, other schemes such as iOS FaceID will not be covered. The protocol itself is agnostic to the actual authentication method used. 
+When the Server receives an `AuthenticationRequest`, verifies its AEAD tag, Client Ed25519 signature, replay nonce, and timestamp window, and confirms the target `username` is in the paired Client's `allowedUsers`, it prompts the user via notification / `BiometricPromptActivity`.
+
+In v2, if the verified request carries optional signed contextual fields (`pam_service`, `process_name`, `command_preview`, `tty_present`), the prompt renders:
+* **Primary identity**: Target `username` @ `hostname` (prominent header).
+* **Secondary context** (sanitized, truncated preview): e.g., `sudo • sudo apt full-upgrade` or `polkit-1 • pkexec`, helping the user distinguish routine commands from unexpected privilege escalations before approving.
 
 ```mermaid
 flowchart TD
-    A[Server receives authentication request] --> B{Is user already logged in?}
-    B -- Yes --> C[Ignore request]
-    B -- No --> D[Prompt user for authentication]
-    D --> E{Does user grant authentication?}
-    E -- Yes --> F[Send authentication grant to client]
-    E -- No --> G[Send authentication denial to client]
+    A[Server receives, decrypts & verifies AuthenticationRequest] --> B{User approves biometric prompt?}
+    B -- Yes --> C[Sign AuthenticationGrant (challenge) -> Send & retransmit 500ms]
+    B -- No, Explicit Deny --> D[Sign AuthenticationDenial (challenge) -> Send & retransmit 500ms]
+    B -- Dismiss / Timeout --> E[End silently on timeout]
+    C --> F[Wait for verified GrantConfirmation (UDP Unicast / BLE Notify)]
 ```
 
-A user who declines is reported to the Client as an explicit denial (`AuthenticationDenial`, retransmitted like a grant), which the Client surfaces as its own "denied" outcome; only a timeout or error ends silently, with no message sent (`server-android/app/src/main/java/dev/rourunisen/tapauth/service/AuthenticationService.kt`, request callback `(approved, signedChallenge, explicitDenial)`).
+A user who explicitly declines is reported to the Client via `AuthenticationDenial` (bound to `challenge` and retransmitted every 500ms until confirmed by `GrantConfirmation`), which surfaces as an explicit denial on PAM (`PAM_PERM_DENIED` on GUI/PAM hosts). Timeouts end silently without sending a denial.
 
 ## User flow from receiving authentication request to being logged in on client
 
 ```mermaid
 flowchart TD
-    A[User starts their laptop, lands on login screen] --> B[User selects their account]
-    B --> C[A notification is received on their phone]
-    C --> D[User taps the notification]
-    D --> E[The authentication app opens, showing the request]
-    E --> F{Does user want to authenticate?}
-    F -- No --> G[User dismisses the request, it times out after a while]
-    F -- Yes --> H[User verifies their identity using biometric authentication]
-    H --> I[The app shows a success message]
-    I --> J[The laptop automatically logs in the user]
+    A[User runs sudo / hits lockscreen / triggers PolKit on Linux] --> B[tapauthd multicasts UDP & advertises BLE simultaneously]
+    B --> C[Phone receives request, verifies sig, displays prompt with username@host + command/service context]
+    C --> D{Does user authenticate?}
+    D -- Cancel locally on Linux --> E[tapauthd broadcasts/BLE-notifies signed AuthenticationCancel; phone dismisses prompt]
+    D -- Explicit Deny --> F[Phone sends AuthenticationDenial; Client sends GrantConfirmation & denies PAM]
+    D -- Approve via Biometrics --> G[Phone sends AuthenticationGrant; Client verifies allowed_users & sig, sends GrantConfirmation, unlocks]
 ```

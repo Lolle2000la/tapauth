@@ -17,12 +17,17 @@ pub struct PamConfig {
     /// (discovery, exchange and the phone tap included), default 120 s. Past
     /// the deadline it falls through to the next stack entry, typically the
     /// password. Must be at least the transport timeout, or the daemon can
-    /// never finish in time.
+    /// never finish in time, and at most `shared::config::MAX_PAM_TIMEOUT_SECS`,
+    /// which is the age at which the phone prunes the challenge this attempt is
+    /// retransmitting.
+    #[serde(deserialize_with = "shared::config::bounded_pam_timeout")]
     pub pam_operation_timeout_secs: u64,
     /// The wait cap for a sequential GUI host — one the rule table
     /// (`policy/table.rs`) does not classify as threaded — whose conversation is
     /// never driven, so no concurrent password entry exists. Default 30 s,
-    /// additionally clamped to `pam_operation_timeout_secs`.
+    /// additionally clamped to `pam_operation_timeout_secs` and bounded by the
+    /// same maximum.
+    #[serde(deserialize_with = "shared::config::bounded_pam_timeout")]
     pub pam_gui_timeout_secs: u64,
     /// Extra `pam.d` service names to refuse, *added* to the built-ins
     /// (`shared::config::DEFAULT_PAM_REFUSED_SERVICES`), never replacing them:
@@ -274,5 +279,38 @@ mod tests {
         let toml = "";
         let config: PamConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.pam_operation_timeout_secs, 120);
+    }
+
+    /// The module's own parser must refuse the same deadlines the daemon's does.
+    ///
+    /// The defect this catches: the ceiling applied only in `shared`'s
+    /// `TapAuthConfig`. The module reads the file with its own struct, so the
+    /// value that actually bounds the wait — and that is sent to the daemon as
+    /// `timeout_seconds` — would stay unbounded, and an attempt longer than the
+    /// phone's in-flight prune would be disconnected mid-prompt; the two parsers
+    /// would disagree about what a legal config is.
+    #[test]
+    fn an_overlong_deadline_is_refused_by_the_modules_own_parser() {
+        let toml = r#"
+            pam_operation_timeout_secs = 3600
+            pam_gui_timeout_secs = 3600
+        "#;
+        let config: PamConfig = toml::from_str(toml).unwrap();
+
+        assert_eq!(
+            config.pam_operation_timeout_secs,
+            shared::config::MAX_PAM_TIMEOUT_SECS
+        );
+        assert_eq!(
+            config.pam_gui_timeout_secs,
+            shared::config::MAX_PAM_TIMEOUT_SECS
+        );
+
+        // The clamped value is what reaches the wire: the deadline the module
+        // waits is the same one it asks the daemon for.
+        assert_eq!(
+            crate::plan::Deadline::Operation.resolve(&config),
+            u32::try_from(shared::config::MAX_PAM_TIMEOUT_SECS).unwrap()
+        );
     }
 }

@@ -1,0 +1,286 @@
+package dev.rourunisen.tapauth.network
+
+import java.io.File
+import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * The post-completion linger: the window in which a pairing that is already persisted still answers
+ * the desktop's `PairingConfirmClient` retransmissions.
+ *
+ * Everything is driven from a fake clock, so the 1.25 s window costs no wall time.
+ */
+class PairingCompletionTest {
+
+    /** A clock the test advances itself. */
+    private class FakeClock(var now: Long = 0L) {
+        fun advance(ms: Long) {
+            now += ms
+        }
+    }
+
+    /** The serialized `PairingConfirmServer`, built once. */
+    private val confirmation = byteArrayOf(0xC0.toByte(), 0x0F)
+
+    /** The desktop's verbatim retransmission of `PairingConfirmClient`. */
+    private val retransmit = byteArrayOf(0x7A)
+
+    /** An authenticated `PairingAbort`, which the linger must ignore. */
+    private val abort = byteArrayOf(0xAB.toByte())
+
+    private fun completion(clock: FakeClock) =
+        PairingCompletion(lingerMs = 1_250L, nowMs = { clock.now }, sliceMs = 100L)
+
+    @Test
+    fun theDefaultLingerCoversTheDesktopRetrySchedule() {
+        assertLingerCovers(daemonRetransmitIntervalMs())
+
+        // The cross-check above only ties the linger to the daemon's parsed interval, so a daemon
+        // trimmed to 400 ms would keep it passing. The window itself is a product decision, so its
+        // absolute floor stays pinned too: two 500 ms retries plus 200 ms of margin.
+        assertTrue(
+            "The linger must keep its margin past two 500 ms retries, got " +
+                PairingCompletion.DEFAULT_LINGER_MS,
+            PairingCompletion.DEFAULT_LINGER_MS >= 1_200L,
+        )
+    }
+
+    /**
+     * Proves the cross-check bites without touching the daemon.
+     *
+     * The linger covers the retry that arrives at `+2 * RETRANSMIT_INTERVAL`, so `2 * interval`
+     * must stay strictly inside it: 625 ms is the first interval at which `2 * interval` reaches
+     * the 1250 ms window, and a daemon retransmitting every 700 ms must fail. The defect this
+     * catches: a coverage check that only compares against a literal, which stays green after the
+     * daemon's interval is raised past what the linger can answer.
+     */
+    @Test
+    fun theLingerCoveragePredicateFailsPastTheRetransmitIntervalItCovers() {
+        assertThrows(AssertionError::class.java) { assertLingerCovers(700L) }
+        assertThrows(AssertionError::class.java) { assertLingerCovers(625L) }
+        // Just inside the window: the predicate must accept a schedule the linger really covers.
+        assertLingerCovers(624L)
+    }
+
+    /**
+     * Fails when [retransmitIntervalMs] puts the desktop's second retry outside the linger.
+     *
+     * `PairingCompletion.DEFAULT_LINGER_MS` documents the window as covering "two desktop retries
+     * (at +500 ms and +1000 ms from a lost burst) with margin", so the second retry — at `2 *
+     * retransmitIntervalMs` — must land strictly before the linger ends.
+     */
+    private fun assertLingerCovers(retransmitIntervalMs: Long) {
+        val lingerMs = PairingCompletion.DEFAULT_LINGER_MS
+        assertTrue(
+            "The ${lingerMs}ms linger must outlast the second of two " +
+                "${retransmitIntervalMs}ms retries (${2 * retransmitIntervalMs}ms): the desktop " +
+                "would retry into a closed socket",
+            lingerMs > 2 * retransmitIntervalMs,
+        )
+    }
+
+    /**
+     * `RETRANSMIT_INTERVAL` from `tapauthd/src/pairing.rs`, in milliseconds.
+     *
+     * The linger is the Kotlin half of a contract whose other half is the daemon's retransmit
+     * schedule, and the two live in different languages. Parsing the real file is what keeps them
+     * from drifting apart — the same approach `client-config-gui/src/ipc.rs:427-450` takes for the
+     * daemon's session deadline. Both a missing constant and an unreadable declaration fail loudly
+     * rather than skip: a silently skipped cross-check is the defect this test exists to prevent.
+     */
+    private fun daemonRetransmitIntervalMs(): Long {
+        val capture =
+            DAEMON_RETRANSMIT_INTERVAL.find(daemonPairingSource())?.groupValues?.get(1)
+                ?: throw AssertionError(
+                    "Could not parse `const RETRANSMIT_INTERVAL: Duration = " +
+                        "Duration::from_millis(<n>)` out of tapauthd/src/pairing.rs; re-read " +
+                        "that file and update this test",
+                )
+        return capture.toLong()
+    }
+
+    /** The daemon's pairing worker source, located by walking up from the test's directory. */
+    private fun daemonPairingSource(): String {
+        var directory: File? = File("").absoluteFile
+        while (directory != null) {
+            val source = File(directory, "tapauthd/src/pairing.rs")
+            if (source.isFile) return source.readText()
+            directory = directory.parentFile
+        }
+        throw AssertionError(
+            "tapauthd/src/pairing.rs was not found above ${File("").absolutePath}; the daemon's " +
+                "retransmit interval cannot be cross-checked from this working directory",
+        )
+    }
+
+    /**
+     * A burst that is entirely dropped is recovered by answering the retransmission: the phone must
+     * still answer at 700 ms, with the same bytes it sent in the burst, and the device must have
+     * been persisted exactly once before the first frame went out.
+     *
+     * The defect this catches: completing (and closing the socket) right after the burst, which
+     * leaves the desktop retrying into a closed port.
+     */
+    @Test
+    fun answersARetransmissionThatArrivesDuringTheLinger() = runBlocking {
+        val clock = FakeClock()
+        val events = mutableListOf<String>()
+        var answeredAt = -1L
+        var answeredWith: ByteArray? = null
+
+        val device =
+            completion(clock)
+                .confirm(
+                    burstDelaysMs = listOf(0L),
+                    buildConfirmation = {
+                        events.add("build")
+                        confirmation
+                    },
+                    persist = {
+                        events.add("persist")
+                        "paired-device"
+                    },
+                    send = { packet ->
+                        events.add("send@${clock.now}")
+                        if (clock.now > 0) {
+                            answeredAt = clock.now
+                            answeredWith = packet
+                        }
+                    },
+                    receive = { slice ->
+                        clock.advance(slice)
+                        if (clock.now >= 700 && answeredAt < 0) retransmit else null
+                    },
+                    isRetransmission = { it.contentEquals(retransmit) },
+                )
+
+        assertEquals("The persisted device must be returned", "paired-device", device)
+        assertEquals("The retransmission must be answered at 700 ms", 700L, answeredAt)
+        assertSame(
+            "The answer must re-send the exact PairingConfirmServer bytes, not a new proof",
+            confirmation,
+            answeredWith,
+        )
+        assertEquals(
+            "The device must be persisted exactly once, got $events",
+            1,
+            events.count { it == "persist" },
+        )
+        assertTrue(
+            "Persisting must precede the first send, got $events",
+            events.indexOf("persist") in 1 until events.indexOfFirst { it.startsWith("send") },
+        )
+    }
+
+    /**
+     * The window is bounded: a retransmission that only shows up after the linger is over must not
+     * be answered, and the receive loop must stop at the deadline rather than keep the link open.
+     *
+     * The defect this catches: an unbounded linger (`while (true)`) that answers forever.
+     */
+    @Test
+    fun stopsAnsweringOnceTheLingerEnds() = runBlocking {
+        val clock = FakeClock()
+        val sends = mutableListOf<Long>()
+        var lastReceiveAt = -1L
+
+        completion(clock)
+            .confirm(
+                burstDelaysMs = listOf(0L),
+                buildConfirmation = { confirmation },
+                persist = { "paired-device" },
+                send = { sends.add(clock.now) },
+                receive = { slice ->
+                    lastReceiveAt = clock.now
+                    clock.advance(slice)
+                    if (clock.now >= 1_300L) retransmit else null
+                },
+                isRetransmission = { it.contentEquals(retransmit) },
+            )
+
+        assertEquals("Only the burst may be sent, got sends at $sends", listOf(0L), sends)
+        assertTrue(
+            "The linger must not receive past its 1250 ms deadline, last receive at $lastReceiveAt",
+            lastReceiveAt <= 1_250L,
+        )
+    }
+
+    /**
+     * An authenticated abort during the linger must not resurrect a completed pairing: no answer,
+     * no second persist, no failure.
+     *
+     * The defect this catches: answering every frame that arrives during the linger, or treating an
+     * abort as a reason to re-run the completion.
+     */
+    @Test
+    fun anAbortDuringTheLingerIsNeitherAnsweredNorPersistedAgain() = runBlocking {
+        val clock = FakeClock()
+        val sends = mutableListOf<Long>()
+        var persists = 0
+
+        val device =
+            completion(clock)
+                .confirm(
+                    burstDelaysMs = listOf(0L),
+                    buildConfirmation = { confirmation },
+                    persist = {
+                        persists += 1
+                        "paired-device"
+                    },
+                    send = { sends.add(clock.now) },
+                    receive = { slice ->
+                        clock.advance(slice)
+                        if (clock.now in 300L..399L) abort else null
+                    },
+                    isRetransmission = { it.contentEquals(retransmit) },
+                )
+
+        assertEquals("paired-device", device)
+        assertEquals("The abort must not be answered, got sends at $sends", listOf(0L), sends)
+        assertEquals("The pairing must be persisted once", 1, persists)
+    }
+
+    /**
+     * Closing the session (the user leaves the pairing screen) ends the linger at once instead of
+     * holding the transport for the rest of the window.
+     *
+     * The defect this catches: a linger that only looks at its deadline, so a closed session keeps
+     * spinning its receive loop until 1.25 s have elapsed.
+     */
+    @Test
+    fun aClosedSessionEndsTheLingerImmediately() = runBlocking {
+        val clock = FakeClock()
+
+        completion(clock)
+            .confirm(
+                burstDelaysMs = listOf(0L),
+                buildConfirmation = { confirmation },
+                persist = { "paired-device" },
+                send = {},
+                receive = { slice ->
+                    clock.advance(slice)
+                    null
+                },
+                isRetransmission = { false },
+                isClosed = { clock.now >= 400L },
+            )
+
+        assertEquals("The linger must stop at the close, not the deadline", 400L, clock.now)
+    }
+
+    private companion object {
+        /**
+         * The daemon's `RETRANSMIT_INTERVAL` declaration, i.e. `const RETRANSMIT_INTERVAL: Duration
+         * = Duration::from_millis(<n>)` (`tapauthd/src/pairing.rs:113`).
+         *
+         * Deliberately literal: a rewrite this cannot read must fail the cross-check loudly rather
+         * than quietly pass it.
+         */
+        val DAEMON_RETRANSMIT_INTERVAL =
+            Regex("""const RETRANSMIT_INTERVAL\b[^;]*from_millis\(\s*(\d+)\s*\)""")
+    }
+}

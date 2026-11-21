@@ -1,7 +1,8 @@
 package dev.rourunisen.tapauth.service
 
 import android.util.Log
-import dev.rourunisen.tapauth.crypto.generateTemporalId
+import dev.rourunisen.tapauth.crypto.currentTimeWindow
+import dev.rourunisen.tapauth.crypto.generateTemporalIdentifier
 import dev.rourunisen.tapauth.data.DeviceRepository
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
@@ -19,6 +20,10 @@ import kotlinx.coroutines.launch
  * The precomputed ID set is refreshed when the 60s window rolls over (checked lazily on the first
  * packet of a new window, so a Doze-frozen coroutine loop can never leave it stale) and immediately
  * whenever the paired-device list changes.
+ *
+ * The window is [currentTimeWindow], not `System.currentTimeMillis()`: the identifiers are derived
+ * in Rust from `unix_seconds / 60`, and computing that split in two languages would let a rounding
+ * difference between them silently invalidate every identifier in the cache.
  */
 class TemporalIdCache(
     private val deviceRepository: DeviceRepository,
@@ -41,19 +46,38 @@ class TemporalIdCache(
      */
     @Volatile private var devicesLoaded = false
 
-    private data class CachedDevice(val deviceId: String, val csk: ByteArray)
+    /**
+     * One paired device, reduced to what the temporal-identifier computation needs.
+     *
+     * [csk] is the key itself, so [toString] is hand-written and redacts it: the compiler's derived
+     * form would print the bytes through `java.util.Arrays.toString` as `csk=[12, 255, …]`. Nothing
+     * logs this class today, and the override is what keeps a future log line from being the leak.
+     * `internal` rather than `private` so a JVM unit test can pin that rendering.
+     */
+    internal data class CachedDevice(
+        val deviceId: String,
+        val csk: ByteArray,
+        val hashAlgorithm: Int,
+    ) {
+        override fun toString(): String =
+            "CachedDevice(deviceId=$deviceId, csk=<redacted>, hashAlgorithm=$hashAlgorithm)"
+    }
+
+    /**
+     * Stable instance, so [stop] can unregister exactly this observer: the device-change registry
+     * holds one listener per transport and cannot be cleared wholesale from here.
+     */
+    private val devicesChangedListener: () -> Unit = { scope.launch { refreshDeviceList() } }
 
     fun start() {
         stop()
-        DeviceRepository.setOnDevicesChangedListener {
-            scope.launch { refreshDeviceList() }
-        }
+        DeviceRepository.addOnDevicesChangedListener(devicesChangedListener)
         scope.launch { refreshDeviceList() }
         Log.d(TAG, "Started temporal ID cache")
     }
 
     fun stop() {
-        DeviceRepository.setOnDevicesChangedListener(null)
+        DeviceRepository.removeOnDevicesChangedListener(devicesChangedListener)
         validIds.clear()
         cachedDevices = emptyList()
         lastComputedWindow = -1
@@ -88,8 +112,7 @@ class TemporalIdCache(
     }
 
     private fun ensureCacheIsCurrent() {
-        val now = System.currentTimeMillis()
-        val currentWindow = now / TIME_WINDOW_MS
+        val currentWindow = currentTimeWindow()
 
         if (currentWindow != lastComputedWindow || !devicesLoaded) {
             synchronized(this) {
@@ -109,7 +132,7 @@ class TemporalIdCache(
             // returns early without advancing lastComputedWindow so the next packet retries.
             devices =
                 deviceRepository.getAllPairedDevicesSync().map {
-                    CachedDevice(it.deviceId, it.csk)
+                    CachedDevice(it.deviceId, it.csk, it.hashAlgorithm)
                 }
             cachedDevices = devices
             devicesLoaded = true
@@ -126,11 +149,11 @@ class TemporalIdCache(
     suspend fun refreshDeviceList() {
         try {
             val pairedDevices = deviceRepository.getAllPairedDevices()
-            val mapped = pairedDevices.map { CachedDevice(it.deviceId, it.csk) }
+            val mapped = pairedDevices.map { CachedDevice(it.deviceId, it.csk, it.hashAlgorithm) }
             synchronized(this) {
                 cachedDevices = mapped
                 devicesLoaded = true
-                val currentWindow = System.currentTimeMillis() / TIME_WINDOW_MS
+                val currentWindow = currentTimeWindow()
                 validIds = computeValidIds(mapped, currentWindow)
                 lastComputedWindow = currentWindow
             }
@@ -152,11 +175,9 @@ class TemporalIdCache(
 
         for (device in devices) {
             try {
-                newIds[generateTemporalIdentifier(device.csk, currentWindow * TIME_WINDOW_MS)] =
-                    device.deviceId
+                newIds[temporalIdHex(device, currentWindow)] = device.deviceId
 
-                newIds[generateTemporalIdentifier(device.csk, previousWindow * TIME_WINDOW_MS)] =
-                    device.deviceId
+                newIds[temporalIdHex(device, previousWindow)] = device.deviceId
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to generate temporal IDs for device ${device.deviceId}", e)
             }
@@ -165,9 +186,20 @@ class TemporalIdCache(
         return newIds
     }
 
-    private fun generateTemporalIdentifier(csk: ByteArray, timestampMs: Long): String {
-        val timestampSeconds = timestampMs / 1000
-        return generateTemporalId(csk, timestampSeconds).toHex()
+    /**
+     * Hash one 60s window with the hash algorithm this pairing negotiated, so an id derived under a
+     * different hash can never match this device's entries.
+     *
+     * The negotiated id is passed straight into Rust (`generateTemporalIdentifier`) rather than
+     * hard-coding SHA-256: `SHA256` is the only algorithm this build implements, so an id it cannot
+     * derive (a tampered or unknown stored value) is rejected there instead of being answered with
+     * a SHA-256 id.
+     *
+     * `window` is the 60-second window (`unix_seconds / 60`), which is what the Rust derivation
+     * expects — not a unix timestamp.
+     */
+    private fun temporalIdHex(device: CachedDevice, window: Long): String {
+        return generateTemporalIdentifier(device.csk, window, device.hashAlgorithm).toHex()
     }
 
     private fun ByteArray.toHex(): String {
@@ -176,8 +208,5 @@ class TemporalIdCache(
 
     companion object {
         private const val TAG = "TemporalIdCache"
-
-        // Time window: 60 seconds (60,000 milliseconds)
-        private const val TIME_WINDOW_MS = 60_000L
     }
 }
