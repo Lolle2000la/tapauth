@@ -22,7 +22,7 @@ fluent.workspace = true
 unic-langid.workspace = true
 
 # QR code generation
-qrcode = "0.14"
+qrcode = "0.15"
 
 # Async runtime
 tokio.workspace = true
